@@ -1,0 +1,33 @@
+[package]
+name = "deploy-agent"
+description = "OpenWAF Deploy agent: runs on each server, dials the control plane and executes signed, typed commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "owdeploy-agent"
+path = "src/main.rs"
+
+[dependencies]
+deploy-proto.workspace = true
+tokio = { workspace = true, features = ["process"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tar = "0.4"
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bollard.workspace = true
+libc = "0.2"
+sha2.workspace = true
+bytes = "1"

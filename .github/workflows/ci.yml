@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Nothing private may land here: secrets (gitleaks over the whole history) and the leak guard. The guard's private
+  # denylist comes from the LEAK_DENYLIST secret, which pull requests from forks don't get (built-in rules only); a
+  # push to main without it fails.
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Secret scan (gitleaks, full history)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfLo /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks git --redact=100 --no-banner --config .gitleaks.toml .
+      - name: Leak guard
+        env:
+          LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ -z "$LEAK_DENYLIST" ]; then
+            if [ "$EVENT" = push ]; then echo "LEAK_DENYLIST secret missing" >&2; exit 1; fi
+            scripts/leak-guard.sh .
+          else
+            f=$(mktemp) && chmod 600 "$f"
+            printf '%s\n' "$LEAK_DENYLIST" >"$f"
+            LEAK_DENYLIST_FILE="$f" scripts/leak-guard.sh .
+            rm -f "$f"
+          fi
+
+  # Format, lints and unit tests with the toolchain of rust-toolchain.toml. The end-to-end tests (src/e2e.rs) need a
+  # Docker Engine they may rewrite and root for iptables: they skip themselves here (OWDEPLOY_TEST_DOCKER unset).
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: tests
+        run: cargo test --workspace --locked
+      - name: installer syntax
+        run: sh -n install.sh
+
+  # Known vulnerabilities (RustSec), licenses, duplicate and wildcard dependencies, crate sources (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked

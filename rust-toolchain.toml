@@ -1,0 +1,6 @@
+# The toolchain CI, the release build and verify.sh use: release binaries are reproducible only with this exact one.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

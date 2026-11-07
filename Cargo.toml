@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/deploy-proto", "crates/deploy-agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/openwaf-dev/deploy-agent"
+
+[workspace.dependencies]
+deploy-proto = { path = "crates/deploy-proto", version = "0.1.0" }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "fs", "io-util"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+sha2 = "0.11"
+base64 = "0.23"
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
+getrandom = { version = "0.4", features = ["std"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi", "env-filter"] }
+bollard = "0.21"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

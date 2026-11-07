@@ -1,0 +1,8 @@
+# gitleaks configuration: the default rules, plus the leak guard's own allowlist, whose patterns describe reviewed key
+# fixtures without key material (they are regular expressions, not keys).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Patterns of reviewed fixtures in the leak guard allowlist"
+paths = ['''(^|/)\.leak-guard-allow$''']

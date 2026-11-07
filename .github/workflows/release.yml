@@ -1,0 +1,124 @@
+name: release
+
+# A tag vX.Y.Z (the workspace version) publishes a GitHub release of owdeploy-agent:
+# - the static musl binaries for linux-amd64 and linux-arm64, built reproducibly by scripts/build-release.sh (pinned
+#   toolchain, zig and cargo-zigbuild; SOURCE_DATE_EPOCH from the tag's commit; paths remapped), and SHA256SUMS;
+# - a CycloneDX SBOM of each binary (cargo-cyclonedx);
+# - a keyless cosign signature bundle (*.sigstore.json) of each file, by this workflow's GitHub OIDC identity;
+# - GitHub artifact attestations (SLSA build provenance) of the binaries and SBOMs.
+# The build job has read-only permissions; only the publish job can sign, attest and write the release.
+# Anyone can rebuild a release and compare: verify.sh <tag> (README.md, «Verify a release»).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ZIG_VERSION: 0.17.0
+      ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      CARGO_ZIGBUILD_VERSION: 0.23.4
+      CARGO_CYCLONEDX_VERSION: 0.5.9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag names the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$TAG" || { echo "Cargo.toml is $version, tag is $TAG" >&2; exit 1; }
+          grep -Eq '^[0-9]+$' BUILD_ORDINAL || { echo "BUILD_ORDINAL is not a number" >&2; exit 1; }
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
+      - name: zig
+        run: |
+          curl -sSfLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig" && tar -xJf /tmp/zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >>"$GITHUB_PATH"
+      - name: cargo-zigbuild and cargo-cyclonedx
+        run: |
+          cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+          cargo install --locked cargo-cyclonedx --version "$CARGO_CYCLONEDX_VERSION"
+      - name: Build (reproducible)
+        run: scripts/build-release.sh dist
+      - name: SBOM (CycloneDX)
+        run: |
+          for pair in x86_64-unknown-linux-musl:linux-amd64 aarch64-unknown-linux-musl:linux-arm64; do
+            triple=${pair%%:*} name=${pair#*:}
+            cargo cyclonedx --manifest-path crates/deploy-agent/Cargo.toml --format json --spec-version 1.5 \
+              --describe binaries --target "$triple" --target-in-filename
+            mv "crates/deploy-agent/owdeploy-agent_bin_${triple}.cdx.json" "dist/owdeploy-agent-${name}.cdx.json"
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # the release
+      id-token: write # keyless cosign and attestations (GitHub OIDC)
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Sign (cosign keyless)
+        run: |
+          cd dist
+          for f in owdeploy-agent-linux-amd64 owdeploy-agent-linux-arm64 SHA256SUMS \
+            owdeploy-agent-linux-amd64.cdx.json owdeploy-agent-linux-arm64.cdx.json; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/owdeploy-agent-linux-amd64
+            dist/owdeploy-agent-linux-arm64
+            dist/owdeploy-agent-linux-amd64.cdx.json
+            dist/owdeploy-agent-linux-arm64.cdx.json
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat >notes.md <<EOF
+          owdeploy-agent ${TAG}: static Linux binaries (amd64, arm64), SHA256SUMS, CycloneDX SBOMs, keyless cosign
+          bundles and build provenance attestations.
+
+          Check the files, then rebuild them from source and compare (README.md, «Verify a release»):
+
+          \`\`\`sh
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json \\
+            --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+          sha256sum -c SHA256SUMS
+          gh attestation verify owdeploy-agent-linux-amd64 -R ${REPO}
+          ./verify.sh ${TAG}
+          \`\`\`
+
+          SHA256SUMS:
+
+          \`\`\`text
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          gh release create "$TAG" dist/* --repo "$REPO" --title "$TAG" --notes-file notes.md --verify-tag
