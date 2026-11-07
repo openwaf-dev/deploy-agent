@@ -56,6 +56,8 @@ use deploy_proto::msg::FirewallRules;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
+use crate::builder::BUILD_BRIDGE;
+
 pub const CHAIN: &str = "OWDEPLOY";
 pub const SOURCES: &str = "OWDEPLOY-SRC";
 pub const NAT: &str = "OWDEPLOY-NAT";
@@ -190,6 +192,34 @@ pub fn blocked(family: Family) -> Vec<String> {
             v
         }
     }
+}
+
+/// The ranges of [`blocked`] of both families, parsed once.
+static BLOCKED: std::sync::LazyLock<Vec<(IpAddr, u8)>> = std::sync::LazyLock::new(|| {
+    [Family::V4, Family::V6]
+        .into_iter()
+        .flat_map(blocked)
+        .map(|c| {
+            let (a, l) = c.split_once('/').expect("cidr");
+            (a.parse().expect("address"), l.parse().expect("prefix"))
+        })
+        .collect()
+});
+
+/// Whether `ip` is in a range every Deploy container is refused ([`blocked`]): what the build egress proxy never
+/// connects to ([`crate::proxy`]).
+pub fn is_blocked(ip: IpAddr) -> bool {
+    BLOCKED.iter().any(|(net, len)| match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(a)) => {
+            let mask = if *len == 0 { 0 } else { u32::MAX << (32 - u32::from(*len)) };
+            u32::from(a) & mask == u32::from(*n)
+        }
+        (IpAddr::V6(n), IpAddr::V6(a)) => {
+            let mask = if *len == 0 { 0 } else { u128::MAX << (128 - u32::from(*len)) };
+            u128::from(a) & mask == u128::from(*n)
+        }
+        _ => false,
+    })
 }
 
 /// Where the router listens without Docker publishing its ports: its address and listener ports.
@@ -375,6 +405,10 @@ pub fn filter_script(
     }
     // A published port or router listener: its source check above already decided.
     add(EGRESS, "-m conntrack --ctstate DNAT -j RETURN");
+    // The build network leaves through the build egress proxy only (on the same network): nothing of it is forwarded
+    // anywhere else, DNS included. Docker already gives that internal network no route out; this holds even if the
+    // network were not internal.
+    add(EGRESS, &format!("-i {BUILD_BRIDGE} {}", family.reject()));
     let len = if family == Family::V4 { 32 } else { 128 };
     let dns: Vec<String> =
         guard.nameservers.iter().filter(|ip| Family::of(ip) == family).map(|ip| format!("{ip}/{len}")).collect();
@@ -397,6 +431,7 @@ pub fn filter_script(
             add(INPUT, &format!("! -i lo -p tcp --dport {p} -j {SOURCES}"));
         }
     }
+    add(HOST, &format!("-i {BUILD_BRIDGE} {}", family.reject()));
     for ns in &dns {
         for proto in ["udp", "tcp"] {
             add(HOST, &format!("-d {ns} -p {proto} --dport 53 -j RETURN"));
@@ -1193,9 +1228,14 @@ mod tests {
         }
         assert!(!egress.iter().any(|r| r.contains("fd00::53")), "an IPv6 name server is not in the IPv4 rules");
         assert_eq!(egress.last().unwrap(), &format!("-d 240.0.0.0/4 {reject}"));
+        // The build network: nothing forwarded but to Deploy networks (its own: the build egress proxy), not even
+        // DNS to the server's name servers; nothing to the server.
+        let build = pos(&format!("-i {BUILD_BRIDGE} {reject}"));
+        assert!(pos("-o owd+ -j RETURN") < build && build < dns, "{egress:#?}");
         assert_eq!(
             chain(&s, HOST),
             [
+                format!("-i {BUILD_BRIDGE} {reject}"),
                 "-d 192.168.5.2/32 -p udp --dport 53 -j RETURN".to_string(),
                 "-d 192.168.5.2/32 -p tcp --dport 53 -j RETURN".to_string(),
                 reject.to_string(),
@@ -1243,9 +1283,11 @@ mod tests {
         }
         assert!(egress.contains(&"-d fd00::53/128 -p udp --dport 53 -j RETURN".into()));
         assert!(!egress.iter().any(|r| r.contains("192.168.5.2")));
+        assert!(egress.contains(&format!("-i {BUILD_BRIDGE} {reject}")));
         assert_eq!(
             chain(&s, HOST),
             [
+                format!("-i {BUILD_BRIDGE} {reject}"),
                 "-d fd00::53/128 -p udp --dport 53 -j RETURN".to_string(),
                 "-d fd00::53/128 -p tcp --dport 53 -j RETURN".to_string(),
                 "-p ipv6-icmp -j RETURN".to_string(),
@@ -1265,6 +1307,32 @@ mod tests {
             }
         }
         assert!(blocked(Family::V4).contains(&"169.254.0.0/16".to_string()));
+    }
+
+    /// What the build egress proxy never connects to: the same ranges, address by address.
+    #[test]
+    fn blocked_addresses_are_those_of_the_ranges() {
+        for ip in [
+            "10.1.2.3",
+            "169.254.169.254",
+            "127.0.0.1",
+            "100.64.0.1",
+            "172.31.255.255",
+            "192.168.100.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:192.0.2.1",
+            "64:ff9b::a9fe:a9fe",
+        ] {
+            assert!(is_blocked(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.0.2.1", "198.51.100.20", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "64:ff9b::c000:201"] {
+            assert!(!is_blocked(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[test]

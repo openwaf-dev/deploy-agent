@@ -2,7 +2,9 @@
 # OpenWAF Deploy agent installer, served by the control plane at /install.sh.
 #   curl -fsSL @PUBLIC_URL@/install.sh | sudo OWDEPLOY_TOKEN=owde_… sh
 # Optional: OWDEPLOY_NAME (server name shown in the dashboard; default: hostname).
-# Needs Linux with systemd and Docker Engine. Installs /usr/local/bin/owdeploy-agent and the owdeploy-agent service.
+# Needs Linux with systemd and Docker Engine. Installs /usr/local/bin/owdeploy-agent and two services: the broker
+# (owdeploy-agent-broker, root: keys, frame checks, Docker, firewall) and the relay (owdeploy-agent, the unprivileged
+# system user owdeploy: the control plane's connection), set up by `owdeploy-agent migrate-split`.
 set -eu
 
 URL="@PUBLIC_URL@"
@@ -15,6 +17,7 @@ fail() { echo "owdeploy: $*" >&2; exit 1; }
 [ "$(uname -s)" = Linux ] || fail "Linux only"
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required"
 command -v docker >/dev/null 2>&1 || fail "Docker Engine is required: https://docs.docker.com/engine/install/"
+command -v useradd >/dev/null 2>&1 || fail "useradd is required (it creates the relay's system user owdeploy)"
 docker info >/dev/null 2>&1 || fail "Docker Engine is installed but not running"
 [ -n "${OWDEPLOY_TOKEN:-}" ] || fail "OWDEPLOY_TOKEN is missing (create one in the dashboard: Deploy > Servers > Add)"
 [ -f "$STATE/identity.json" ] && fail "already enrolled ($STATE/identity.json); revoke it in the dashboard and remove $STATE to enroll again"
@@ -49,6 +52,17 @@ if [ -d /etc/csf ]; then
   "$BIN" csf-hook || echo "owdeploy: could not add the CSF post hook; the agent still repairs its rules every 30 s" >&2
 fi
 
+# Privileges separated: the broker (root) and the relay (user owdeploy, no home, no shell, not in the docker group,
+# no capabilities), whose units the agent writes and verifies, started once both are in place; it waits up to 120 s
+# for their first verified session with the control plane.
+if "$BIN" capabilities 2>/dev/null | grep -qx split-privileges; then
+  "$BIN" migrate-split
+  echo "owdeploy: agent installed and running (journalctl -u owdeploy-agent-broker -u owdeploy-agent)"
+  exit 0
+fi
+
+# A served binary from before privilege separation: one root process, as before; it can migrate once it updated
+# itself (owdeploy-agent migrate-split).
 cat > /etc/systemd/system/owdeploy-agent.service <<'UNIT'
 [Unit]
 Description=OpenWAF Deploy agent

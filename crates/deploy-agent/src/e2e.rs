@@ -3,12 +3,17 @@
 //! namespaces), so they only run when asked:
 //!
 //! - `OWDEPLOY_TEST_DOCKER=1`: deployments, rolling switch through the router, rollback on a failed health check,
-//!   cancel, logs, prune, Railpack and static builds, Compose, deploy keys, volumes, exec, previews. The agent must
-//!   reach container addresses and run in the host's PID namespace (run it on the Docker host, or in a container
-//!   with `--network host --pid host`), and `OWDEPLOY_AGENT_STATE` must name a directory at the same path on the
-//!   Docker host (file mounts are bind mounts of files in it).
+//!   cancel, logs, prune, Railpack and static builds, Compose (and a project deployed by Compose itself, as earlier
+//!   agents did), deploy keys, volumes, exec, previews, SBOMs; while builds run, no helper container may have the
+//!   Engine's socket or a host path. The agent must reach container addresses and run in the host's PID namespace
+//!   (run it on the Docker host, or in a container with `--network host --pid host`), and `OWDEPLOY_AGENT_STATE`
+//!   must name a directory at the same path on the Docker host (file mounts are bind mounts of files in it). Builds
+//!   go through the build egress proxy, which runs a static Linux build of the agent: `OWDEPLOY_BUILD_PROXY_BINARY`
+//!   names one (e.g. `cargo zigbuild --release -p deploy-agent --target aarch64-unknown-linux-musl`, mounted into
+//!   the runner). The build egress test needs the Internet (example.com, example.org, localtest.me).
 //! - `OWDEPLOY_TEST_CLASSIC_STORE=1`: the tests also check that the Engine runs the classic image store (no
-//!   containerd snapshotter), where its embedded BuildKit lacks what Railpack needs (see `builder`).
+//!   containerd snapshotter), which loads the agent's image archives through their `manifest.json` (the containerd
+//!   store through their `index.json`).
 //! - `OWDEPLOY_TEST_FIREWALL=1` as well: FirewallSync and the containers' egress guard for real, both families
 //!   (root, iptables, ip6tables, iproute2, curl and python3 on the host; the host's interfaces must not start with
 //!   `owd`, the prefix of Deploy's bridges). They rewrite the host's firewall: run them against a throwaway dockerd
@@ -43,15 +48,17 @@
 //!   -e OWDEPLOY_TEST_CLASSIC_STORE=1 <runner image> cargo test -p deploy-agent e2e -- --test-threads=1
 //! ```
 
+use std::collections::BTreeSet;
 use std::process::Command as Proc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use deploy_proto::msg::{
-    AppActionKind, AppDeploy, AppState, BuildPack, BuildSpec, ComposeDeploy, ComposeOutput, ComposeSource,
-    DeployOutput, Event, ExecOutput, ExecSpec, FileMount, FirewallRules, HealthCheck, LABEL_ENVIRONMENT, LogStream, Op,
-    Outcome, ResourceRoutes, Route, RouterConfig, RouterState, RunSpec, Source, SshAuth, Step, VolumeMount,
+    AppActionKind, AppDeploy, AppState, BuildEgress, BuildPack, BuildSpec, ComposeDeploy, ComposeOutput, ComposeSource,
+    DeployOutput, EgressDecision, EgressMode, Event, ExecOutput, ExecSpec, FileMount, FirewallRules, HealthCheck,
+    LABEL_ENVIRONMENT, LogStream, Op, Outcome, ResourceRoutes, Route, RouterConfig, RouterState, RunSpec, Source,
+    SshAuth, Step, VolumeMount,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -198,6 +205,7 @@ fn build(pack: BuildPack) -> BuildSpec {
         publish_dir: None,
         spa: false,
         untrusted: false,
+        egress: None,
     }
 }
 
@@ -262,10 +270,16 @@ async fn image_deploy_switch_rollback_and_logs() {
     }
     let app = "app_e2eimage";
     remove_app(app).await;
+    // Without SBOMs cached, so each source of a pulled image's SBOM is exercised below.
+    let cache = std::path::Path::new(&std::env::var("OWDEPLOY_AGENT_STATE").unwrap()).join("sbom");
+    let _ = std::fs::remove_dir_all(&cache);
 
     // First deployment: pulled image, published port (a router listener), health check.
     let first = run(deploy(app, "dep_E2EA0001", image("nginx:1.29-alpine"), 80, 28081, Some("/"))).await;
     let out1: DeployOutput = first.ok();
+    // A pulled image's SBOM: the registry's SPDX attestation (official images have one).
+    assert_sbom(&first, &out1.image_id, None);
+    assert!(first.log().iter().any(|l| l.contains("(registry attestation, ")), "{:?}", first.log());
     assert_eq!(first.steps(), [Step::Pulling, Step::Starting, Step::HealthCheck, Step::Switching, Step::Cleaning]);
     assert_eq!(out1.image, "owd/app_e2eimage:dep_e2ea0001");
     assert!(first.lines(Some(LogStream::System)).iter().any(|l| l.starts_with("Health check passed")));
@@ -281,10 +295,17 @@ async fn image_deploy_switch_rollback_and_logs() {
     // The container publishes nothing: the router serves the port (above).
     assert_eq!(docker_cli(&["port", &out1.container_id]), "");
 
-    // Redeploy: the new container replaces the old one, which is removed.
+    // Redeploy: the new container replaces the old one, which is removed. The image is the server's own: without a
+    // cached SBOM, syft generates it from the image the agent exports, in a helper without network.
+    let _ = std::fs::remove_dir_all(&cache);
+    let watch = HelperWatch::start();
     let second =
         run(deploy(app, "dep_E2EA0002", Source::Local { image: out1.image.clone() }, 80, 28081, Some("/"))).await;
+    watch.assert_socketless();
     let out2: DeployOutput = second.ok();
+    let doc = assert_sbom(&second, &out2.image_id, None);
+    assert!(second.log().iter().any(|l| l.contains("(syft 1.51.0, ")), "{:?}", second.log());
+    assert!(doc["packages"].as_array().unwrap().iter().any(|p| p["name"] == "nginx"), "the image's own packages");
     assert_ne!(out2.container_id, out1.container_id);
     assert!(second.log().iter().any(|l| l == "Draining the previous container for 1s"), "{:?}", second.log());
     let s = status(app).await;
@@ -504,22 +525,127 @@ fn leftovers() -> (String, usize) {
         .unwrap()
         .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("owdeploy-"))
         .count();
-    (helpers, temp)
+    // Image archives staged for a load go with it.
+    let staged = std::fs::read_dir(crate::oci::staging_root()).map_or(0, |d| d.count());
+    (helpers, temp + staged)
 }
 
 /// Builder `name` runs the pinned rootless image as an unprivileged user, on the build network, without privileges
-/// beyond its user namespace helpers and without any host path.
+/// beyond its user namespace helpers and without any host path: its state and its socket are volumes.
 fn assert_rootless_builder(name: &str) {
     let format = "{{.Config.Image}}|{{.Config.User}}|{{.State.Running}}|{{.HostConfig.Privileged}}|\
-        {{.HostConfig.NetworkMode}}|{{json .HostConfig.Binds}}|{{range .Mounts}}{{.Type}}:{{.Name}} {{end}}|\
+        {{.HostConfig.NetworkMode}}|{{json .HostConfig.Binds}}|\
         {{json .HostConfig.CapDrop}}{{json .HostConfig.CapAdd}}";
     assert_eq!(
         docker_cli(&["inspect", "-f", format, name]),
         format!(
-            "{}|1000:1000|true|false|owd-build|null|volume:{name}-state |[\"ALL\"][\"SETUID\",\"SETGID\"]",
+            "{}|1000:1000|true|false|owd-build-internal|null|[\"ALL\"][\"SETUID\",\"SETGID\"]",
             crate::builder::BUILDKIT_IMAGE
         )
     );
+    let mounts = docker_cli(&["inspect", "-f", "{{range .Mounts}}{{.Type}}:{{.Name}} {{end}}", name]);
+    let mut mounts: Vec<&str> = mounts.split_whitespace().collect();
+    mounts.sort_unstable();
+    assert_eq!(mounts, [format!("volume:{name}-sock"), format!("volume:{name}-state")]);
+    // Its network has no way out but the build egress proxy, which runs unprivileged on both networks.
+    assert_eq!(docker_cli(&["network", "inspect", "-f", "{{.Internal}}", crate::builder::BUILD_NETWORK]), "true");
+    let format = "{{.Config.User}}|{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|\
+        {{json .HostConfig.SecurityOpt}}|{{json .HostConfig.Binds}}|{{len .Mounts}}|{{.State.Running}}";
+    assert_eq!(
+        docker_cli(&["inspect", "-f", format, crate::egress::CONTAINER]),
+        "65534:65534|true|[\"ALL\"]|[\"no-new-privileges\"]|null|0|true"
+    );
+    let networks = docker_cli(&[
+        "inspect",
+        "-f",
+        "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}",
+        crate::egress::CONTAINER,
+    ]);
+    assert_eq!(networks, "owd-build-egress owd-build-internal");
+}
+
+/// Watches the helper containers of the agent while a deployment runs (every 100 ms): how many it saw, and the
+/// mounts of any that reached the Engine's socket or a path of the server.
+struct HelperWatch {
+    stop: Arc<AtomicBool>,
+    task: std::thread::JoinHandle<(BTreeSet<String>, Vec<String>)>,
+}
+
+impl HelperWatch {
+    fn start() -> HelperWatch {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let task = std::thread::spawn(move || {
+            let (mut seen, mut bad) = (BTreeSet::new(), Vec::new());
+            while !flag.load(Ordering::Relaxed) {
+                let ids = docker_cli(&["ps", "-q", "--no-trunc", "--filter", "label=dev.openwaf.deploy.helper"]);
+                for id in ids.lines().filter(|l| !l.is_empty()) {
+                    let format = "{{range .Mounts}}{{.Type}}:{{.Source}} {{end}}|{{json .HostConfig.Binds}}";
+                    let mounts = docker_cli(&["inspect", "-f", format, id]);
+                    if mounts.is_empty() {
+                        continue; // Already removed.
+                    }
+                    seen.insert(id.to_string());
+                    if mounts.contains("docker.sock") || mounts.contains("bind:") || !mounts.ends_with("|null") {
+                        bad.push(format!("{id}: {mounts}"));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            (seen, bad)
+        });
+        HelperWatch { stop, task }
+    }
+
+    /// Stops watching; asserts helpers were seen and none had the Engine's socket or a host path.
+    fn assert_socketless(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let (seen, bad) = self.task.join().unwrap();
+        assert!(!seen.is_empty(), "no helper container seen while the deployment ran");
+        assert!(bad.is_empty(), "helpers with the Engine's socket or a host path: {bad:?}");
+    }
+}
+
+/// The SBOMs a command sent: (image digest, service, SPDX document), parts put back together in order.
+fn sboms(r: &Run) -> Vec<(String, Option<String>, serde_json::Value)> {
+    use base64::Engine;
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut data = String::new();
+    let mut expected = 0;
+    for e in &r.events {
+        if let Event::Sbom { image_digest, service, part, last, data: d } = e {
+            assert_eq!(*part, expected, "parts in order");
+            data.push_str(d);
+            expected += 1;
+            if *last {
+                let gz = base64::engine::general_purpose::STANDARD.decode(std::mem::take(&mut data)).unwrap();
+                let mut doc = Vec::new();
+                flate2::read::GzDecoder::new(gz.as_slice()).read_to_end(&mut doc).unwrap();
+                out.push((image_digest.clone(), service.clone(), serde_json::from_slice(&doc).unwrap()));
+                expected = 0;
+            }
+        }
+    }
+    assert_eq!(expected, 0, "an SBOM without its last part");
+    out
+}
+
+/// The one SBOM sent for `image_id`, an SPDX 2.3 document with packages.
+fn assert_sbom(r: &Run, image_id: &str, service: Option<&str>) -> serde_json::Value {
+    let all = sboms(r);
+    let found: Vec<_> = all.iter().filter(|(d, s, _)| d == image_id && s.as_deref() == service).collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "SBOMs of {image_id} ({service:?}) among {:?}; log: {:?}",
+        all.iter().map(|x| (&x.0, &x.1)).collect::<Vec<_>>(),
+        r.log()
+    );
+    let doc = found[0].2.clone();
+    assert!(doc["spdxVersion"].as_str().unwrap().starts_with("SPDX-2."), "{doc}");
+    assert!(!doc["packages"].as_array().unwrap().is_empty(), "{doc}");
+    doc
 }
 
 #[tokio::test]
@@ -529,8 +655,17 @@ async fn git_deploy_builds_the_commit_and_cancel_cleans_up() {
     }
     let app = "app_e2egit";
     remove_app(app).await;
+    let watch = HelperWatch::start();
     let r = run(crccheck(app, "dep_E2EG0001")).await;
+    watch.assert_socketless();
     let out: DeployOutput = r.ok();
+    // The built image's SBOM, from BuildKit's attestation, for the image the deployment runs.
+    assert_sbom(&r, &out.image_id, None);
+    assert!(
+        r.log().iter().any(|l| l.starts_with("Checked and loaded owd/app_e2egit:dep_e2eg0001 (sha256:")),
+        "{:?}",
+        r.log()
+    );
     assert_eq!(
         r.steps(),
         [Step::Fetching, Step::Building, Step::Starting, Step::HealthCheck, Step::Switching, Step::Cleaning]
@@ -616,8 +751,14 @@ async fn railpack_builds_a_node_app() {
     });
     d.run.port = 3000;
     d.run.publish = Some(28084);
+    let watch = HelperWatch::start();
     let r = run(Op::DeployApp(d.clone())).await;
+    watch.assert_socketless();
     let out: DeployOutput = r.ok();
+    assert_sbom(&r, &out.image_id, None);
+    // Without a policy (an older control plane): open, through the build egress proxy (npm, mise, apt there).
+    assert_eq!(egress_report(&r).0, EgressMode::Open);
+    assert!(r.log().iter().any(|l| l.starts_with("Build egress (open): ")), "{:?}", r.log());
     assert_eq!(
         r.steps(),
         [Step::Fetching, Step::Building, Step::Starting, Step::HealthCheck, Step::Switching, Step::Cleaning]
@@ -693,6 +834,19 @@ printf 'FROM busybox:1.37\nARG GREETING\nRUN mkdir /www && cat /proc/self/uid_ma
 printf '[submodule "sub"]\n\tpath = sub\n\turl = https://127.0.0.1:1/nothing.git\n' > .gitmodules
 git add -A && git update-index --add --cacheinfo 160000,0123456789abcdef0123456789abcdef01234567,sub
 git commit -qm probe && git clone -q --bare . /srv/git/probe.git
+mkdir /tmp/egress && cd /tmp/egress && git init -q
+cat > Dockerfile <<'EOF'
+FROM curlimages/curl:8.17.0 AS probe
+ARG URLS
+USER root
+RUN mkdir /out && for u in $URLS; do curl -fsS --max-time 20 -o /dev/null "$u" || exit 1; done
+RUN rc=0; curl -sS --noproxy '*' --max-time 10 -o /dev/null http://192.0.2.1/ || rc=$?; echo "$rc" > /out/direct
+RUN if nslookup example.org >/dev/null 2>&1; then echo resolved; else echo refused; fi > /out/dns
+FROM busybox:1.37
+COPY --from=probe /out /www
+CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]
+EOF
+git add -A && git commit -qm egress && git clone -q --bare . /srv/git/egress.git
 "#;
     docker_ok(&["exec", "-u", "git", GIT_SERVER, "sh", "-c", script]);
     let ip = docker_cli(&["inspect", "-f", "{{.NetworkSettings.IPAddress}}", GIT_SERVER]);
@@ -764,6 +918,7 @@ async fn deploy_keys_clone_over_ssh_and_static_sites_build() {
     });
     let r = run(Op::DeployApp(d)).await;
     let out: DeployOutput = r.ok();
+    assert_sbom(&r, &out.image_id, None);
     assert!(r.log().iter().any(|l| l == "Packaging the static site from dist"), "{:?}", r.log());
     let (code, body) = http("http://127.0.0.1:28088/").await.unwrap();
     assert_eq!((code, body.trim()), (200, "<h1>built by railpack</h1>"));
@@ -837,6 +992,112 @@ async fn untrusted_builds_are_rootless_pinned_and_skip_submodules() {
     docker_cli(&["rm", "-f", GIT_SERVER]);
 }
 
+/// An `Event::Egress` entry as the tests compare it: (host, port, decision, reason).
+type Entry = (String, u16, EgressDecision, Option<String>);
+
+/// The `Event::Egress` a build sent: (mode, enforced, entries).
+fn egress_report(r: &Run) -> (EgressMode, bool, Vec<Entry>) {
+    let reports: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Egress { mode, enforced, entries, .. } => Some((
+                *mode,
+                *enforced,
+                entries.iter().map(|x| (x.host.clone(), x.port, x.decision, x.reason.clone())).collect(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reports.len(), 1, "one egress report per build: {:?}", r.log());
+    reports.into_iter().next().unwrap()
+}
+
+/// Build steps reach the Internet through the build egress proxy only: an allowlist lets its destinations through
+/// and fails the build on any other (reported as it happens and at the end), audit records every destination, open
+/// refuses private addresses; whatever the policy, a direct connection and an outside name lookup fail.
+#[tokio::test]
+async fn build_egress_policies_are_enforced_by_the_proxy() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let srv = git_server();
+    let app = "app_e2eegress";
+    remove_app(app).await;
+    let spec = |deployment: &str, urls: &str, egress: BuildEgress| {
+        let source = Source::Git {
+            url: format!("ssh://git@{}:22/srv/git/egress.git", srv.ip),
+            reference: "main".into(),
+            auth: None,
+            ssh: Some(SshAuth { private_key: srv.key.clone(), known_hosts: vec![srv.host_key.clone()] }),
+            commit: None,
+        };
+        let mut d = app_deploy(app, deployment, source, 8080, Some(28095), Some("/direct"));
+        d.build = Some(BuildSpec {
+            args: [("URLS".to_string(), urls.to_string())].into(),
+            no_cache: true,
+            egress: Some(egress),
+            ..build(BuildPack::Dockerfile)
+        });
+        Op::DeployApp(d)
+    };
+    let allowlist = BuildEgress { mode: EgressMode::Allowlist, allow: vec!["example.com".into()] };
+
+    // Allowlist: the allowed host over HTTPS (CONNECT) and plain HTTP.
+    let r = run(spec("dep_E2EX0001", "https://example.com/ http://example.com/", allowlist.clone())).await;
+    r.ok::<DeployOutput>();
+    assert!(
+        r.log().iter().any(|l| l == "Build egress: allowlist of 1 destinations, through the build egress proxy only")
+    );
+    let (mode, enforced, entries) = egress_report(&r);
+    assert_eq!((mode, enforced), (EgressMode::Allowlist, true));
+    for port in [443, 80] {
+        let e = ("example.com".to_string(), port, EgressDecision::Allowed, None);
+        assert!(entries.contains(&e), "{entries:?}");
+    }
+    // The step could neither connect directly (no route: curl's 7) nor resolve an outside name.
+    assert_eq!(http("http://127.0.0.1:28095/direct").await.unwrap().1.trim(), "7");
+    assert_eq!(http("http://127.0.0.1:28095/dns").await.unwrap().1.trim(), "refused");
+    assert!(r.log().iter().any(|l| l.starts_with("Build egress (allowlist): ")), "{:?}", r.log());
+
+    // Allowlist: any other host fails the build, denied as it happens and in the report.
+    let r = run(spec("dep_E2EX0002", "https://example.org/", allowlist.clone())).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    assert!(r.log().iter().any(|l| l == "Build egress denied: example.org:443 (not_allowed)"), "{:?}", r.log());
+    let (_, _, entries) = egress_report(&r);
+    assert!(entries.contains(&("example.org".into(), 443, EgressDecision::Denied, Some("not_allowed".into()))));
+    // An address instead of a name is refused in allowlist mode.
+    let r = run(spec("dep_E2EX0003", "https://203.0.113.10/", allowlist)).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    let literal = ("203.0.113.10".to_string(), 443, EgressDecision::Denied, Some("ip_literal".to_string()));
+    assert!(egress_report(&r).2.contains(&literal));
+
+    // Audit: every destination allowed and recorded.
+    let audit = BuildEgress { mode: EgressMode::Audit, allow: vec![] };
+    let r = run(spec("dep_E2EX0004", "https://example.com/ https://example.org/", audit)).await;
+    r.ok::<DeployOutput>();
+    let (mode, _, entries) = egress_report(&r);
+    assert_eq!(mode, EgressMode::Audit);
+    for host in ["example.com", "example.org"] {
+        assert!(entries.iter().any(|e| e.0 == host && e.1 == 443 && e.2 == EgressDecision::Allowed), "{entries:?}");
+    }
+
+    // Open: private addresses (cloud metadata) are still refused, after resolution too.
+    let r = run(spec("dep_E2EX0005", "http://169.254.169.254/", BuildEgress::OPEN)).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    let (mode, _, entries) = egress_report(&r);
+    assert_eq!(mode, EgressMode::Open);
+    assert_eq!(entries, [("169.254.169.254".to_string(), 80, EgressDecision::Denied, Some("private_address".into()))]);
+    // A public name resolving to loopback (DNS rebinding) is refused once the proxy resolved it.
+    let r = run(spec("dep_E2EX0006", "http://localhost.localtest.me/", BuildEgress::OPEN)).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    let denied = "Build egress denied: localhost.localtest.me:80 (private_address)";
+    assert!(r.log().iter().any(|l| l == denied), "{:?}", r.log());
+    assert_eq!(leftovers(), (String::new(), 0));
+    remove_app(app).await;
+    docker_cli(&["rm", "-f", GIT_SERVER]);
+}
+
 const COMPOSE: &str = r#"
 services:
   web:
@@ -885,9 +1146,40 @@ async fn compose_app_routes_one_of_two_services() {
             tls: false,
         }],
         no_cache: false,
+        egress: None,
     };
+    let watch = HelperWatch::start();
     let r = run(Op::DeployCompose(spec("dep_E2EC0001"))).await;
+    watch.assert_socketless();
     let out: ComposeOutput = r.ok();
+    assert_eq!(egress_report(&r).0, EgressMode::Open, "Compose builds go through the build egress proxy too");
+    // An SBOM for each service's image: built (api), pulled (web).
+    for s in &out.services {
+        let id = docker_cli(&["inspect", "-f", "{{.Image}}", &s.container_id]);
+        assert_sbom(&r, &id, Some(s.service.as_str()));
+    }
+    // Containers, networks and volumes carry Compose's labels (logs per service, removal, earlier agents).
+    let web = out.services.iter().find(|s| s.service == "web").unwrap();
+    assert_eq!(
+        docker_cli(&[
+            "inspect",
+            "-f",
+            "{{.Name}} {{index .Config.Labels \"com.docker.compose.project\"}} {{index .Config.Labels \"com.docker.compose.service\"}} {{.HostConfig.RestartPolicy.Name}}",
+            &web.container_id
+        ]),
+        "/owd-app_e2ecompose-web-1 owd-app_e2ecompose web unless-stopped"
+    );
+    assert_eq!(
+        docker_cli(&[
+            "network",
+            "ls",
+            "--format",
+            "{{.Name}}",
+            "--filter",
+            "label=com.docker.compose.project=owd-app_e2ecompose"
+        ]),
+        "owd-app_e2ecompose_default"
+    );
     assert_eq!(out.project, "owd-app_e2ecompose");
     let services: Vec<(&str, &str)> = out.services.iter().map(|s| (s.service.as_str(), s.state.as_str())).collect();
     assert_eq!(services, [("api", "running"), ("web", "running")]);
@@ -923,7 +1215,10 @@ async fn compose_app_routes_one_of_two_services() {
     .ok();
     assert_eq!((e.exit_code, e.output.trim()), (Some(0), "from-app"));
     // Redeploy: the services are recreated, the volume stays.
-    run(Op::DeployCompose(spec("dep_E2EC0002"))).await.ok::<ComposeOutput>();
+    // The pulled image's SBOM comes from the agent's cache the second time.
+    let again = run(Op::DeployCompose(spec("dep_E2EC0002"))).await;
+    again.ok::<ComposeOutput>();
+    assert!(again.log().iter().any(|l| l.contains("(already generated)")), "{:?}", again.log());
     let e: ExecOutput = run(Op::Exec(ExecSpec {
         resource: app.into(),
         service: Some("api".into()),
@@ -944,6 +1239,94 @@ async fn compose_app_routes_one_of_two_services() {
     );
     let v: serde_json::Value = run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok();
     assert_eq!(v["removed"], serde_json::json!(["owd-app_e2ecompose-data"]));
+}
+
+/// A Compose application deployed by an earlier agent (Compose itself, run in a helper with the Engine's socket, on
+/// the project the agent adapted) is updated in place by this one (same container name, same project network), and
+/// stays manageable: logs per service, stop and start, removal.
+#[tokio::test]
+async fn compose_apps_of_earlier_agents_are_updated_in_place() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2ecompat";
+    let project = "owd-app_e2ecompat";
+    remove_app(app).await;
+    let d = crate::docker::client().unwrap();
+    crate::deploy::ensure_network(&d, NETWORK, Some("e2e-env")).await.unwrap();
+    let site = |text: &str| format!("mkdir -p /www && echo {text} > /www/index.html && exec httpd -f -p 8080 -h /www");
+    let earlier = serde_json::json!({
+        "name": project,
+        "services": {"web": {
+            "image": "busybox:1.37",
+            "command": ["sh", "-c", site("earlier")],
+            "labels": {"dev.openwaf.deploy.resource": app, "dev.openwaf.deploy.deployment": "dep_E2EO0001"},
+            "restart": "unless-stopped",
+            "networks": {"default": null, "owd_environment": {"aliases": ["owd-app_e2ecompat-web"]}},
+        }},
+        "networks": {
+            "default": {"name": "owd-app_e2ecompat_default", "driver": "bridge", "enable_ipv6": false,
+                        "driver_opts": {crate::firewall::BRIDGE_OPTION: crate::firewall::bridge_name("owd-app_e2ecompat_default")}},
+            "owd_environment": {"name": NETWORK, "external": true},
+        },
+    });
+    let mut compose = Proc::new("docker")
+        .args(["run", "--rm", "-i", "-v", "/var/run/docker.sock:/var/run/docker.sock", "docker:29.9.3-cli"])
+        .args(["compose", "-p", project, "-f", "-", "up", "-d", "--wait"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    compose.stdin.take().unwrap().write_all(earlier.to_string().as_bytes()).unwrap();
+    let o = compose.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let earlier_id = docker_cli(&["inspect", "-f", "{{.Id}}", "owd-app_e2ecompat-web-1"]);
+    let network = docker_cli(&["network", "inspect", "-f", "{{.Id}}", "owd-app_e2ecompat_default"]);
+    let s = status(app).await;
+    assert_eq!(s.containers.len(), 1, "{s:?}");
+    assert_eq!(s.containers[0].deployment.as_deref(), Some("dep_E2EO0001"));
+
+    let content =
+        format!("services:\n  web:\n    image: busybox:1.37\n    command: [\"sh\", \"-c\", \"{}\"]\n", site("current"));
+    let spec = ComposeDeploy {
+        resource: app.into(),
+        deployment: "dep_E2EO0002".into(),
+        network: NETWORK.into(),
+        source: ComposeSource::Inline { content },
+        env: Default::default(),
+        volumes: vec![],
+        files: vec![],
+        labels: [(LABEL_ENVIRONMENT.to_string(), "e2e-env".to_string())].into(),
+        routes: vec![Route { listen: Some(28094), hosts: vec![], service: Some("web".into()), port: 8080, tls: false }],
+        no_cache: false,
+        egress: None,
+    };
+    let r = run(Op::DeployCompose(spec)).await;
+    let out: ComposeOutput = r.ok();
+    assert_eq!(out.services.len(), 1, "{:?}", out.services);
+    let web = &out.services[0];
+    assert_ne!(web.container_id, earlier_id, "recreated");
+    assert_eq!(docker_cli(&["inspect", "-f", "{{.Name}}", &web.container_id]), "/owd-app_e2ecompat-web-1");
+    assert_eq!(docker_cli(&["network", "inspect", "-f", "{{.Id}}", "owd-app_e2ecompat_default"]), network);
+    assert_eq!(http("http://127.0.0.1:28094/").await.unwrap().1.trim(), "current");
+    let s = status(app).await;
+    assert_eq!(s.containers.len(), 1, "{s:?}");
+    assert_eq!(s.containers[0].deployment.as_deref(), Some("dep_E2EO0002"));
+    run(Op::AppLogs { resource: app.into(), tail: 10, follow: false, since: None, service: Some("web".into()) })
+        .await
+        .ok::<serde_json::Value>();
+    let s: AppState = run(Op::AppAction { resource: app.into(), action: AppActionKind::Stop }).await.ok();
+    assert_eq!(s.containers[0].state, "exited");
+    let s: AppState = run(Op::AppAction { resource: app.into(), action: AppActionKind::Start }).await.ok();
+    assert_eq!(s.containers[0].state, "running");
+    let s: AppState = run(Op::AppAction { resource: app.into(), action: AppActionKind::Remove }).await.ok();
+    assert!(s.containers.is_empty());
+    assert_eq!(
+        docker_cli(&["network", "ls", "-q", "--filter", &format!("label=com.docker.compose.project={project}")]),
+        ""
+    );
 }
 
 #[tokio::test]
@@ -1372,6 +1755,35 @@ async fn firewall_guards_container_egress() {
     } else {
         eprintln!("no Internet access from the Docker host: Internet egress not checked");
     }
+
+    // The build network: no direct way out (no route, no outside name, nothing to the server), only the build
+    // egress proxy, which reaches the public address and refuses the private ones.
+    let (tx, mut rx) = mpsc::channel(1024);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let (ev, _batcher) = Events::start("e2e-build-egress".into(), tx);
+    let d = crate::docker::client().unwrap();
+    let session = crate::egress::Session::start(&d, "dep_E2EGB001", &BuildEgress::OPEN, &ev).await.unwrap();
+    let proxy = session.args().into_iter().find(|(k, _)| k == "HTTP_PROXY").unwrap().1;
+    let build_gateway =
+        docker_cli(&["network", "inspect", "-f", "{{(index .IPAM.Config 0).Gateway}}", crate::builder::BUILD_NETWORK]);
+    let on_build = |args: &[&str]| {
+        let mut cmd =
+            vec!["docker", "run", "--rm", "--network", crate::builder::BUILD_NETWORK, "curlimages/curl:8.17.0"];
+        cmd.extend_from_slice(args);
+        sh(&cmd)
+    };
+    let direct = |url: &str| on_build(&["-sf", "-o", "/dev/null", "--max-time", "5", url]);
+    let proxied = |url: &str| on_build(&["-sf", "-o", "/dev/null", "--max-time", "10", "-x", &proxy, url]);
+    assert!(!direct(control), "a build container reaches a public address without the proxy");
+    assert!(!direct(&format!("http://{build_gateway}:28199/")), "a build container reaches the server");
+    let nslookup = ["docker", "run", "--rm", "--network", crate::builder::BUILD_NETWORK, "--entrypoint", "nslookup"];
+    assert!(!sh(&[&nslookup[..], &["curlimages/curl:8.17.0", "example.com"]].concat()), "outside names resolve");
+    assert!(proxied(control), "the proxy does not reach a public address");
+    assert!(!proxied(private), "the proxy reaches a private address");
+    assert!(!proxied(metadata), "the proxy reaches cloud metadata");
+    let build_rule = format!("-A OWDEPLOY-EGRESS -i {} -j REJECT", crate::builder::BUILD_BRIDGE);
+    assert!(tables("iptables", &["-S", "OWDEPLOY-EGRESS"]).contains(&build_rule));
+    session.finish(&ev).await;
 
     // The control plane's denied destinations.
     let v: serde_json::Value =

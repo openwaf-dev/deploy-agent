@@ -1,7 +1,7 @@
 //! Git sources: the clone runs in a throwaway helper container (never on the host, never with the host's
 //! credentials). For Dockerfile builds the build context is then copied out of it, filtered by `.dockerignore`, the
-//! build arguments declared in every stage of the Dockerfile, and packed for the Engine's build API; other builds clone
-//! with the same script in the builder's source helper. Neither has the Engine's socket.
+//! build arguments declared in every stage of the Dockerfile, and packed for the build helper's bake; other builds
+//! clone with the same script in the builder's source helper. Neither has the Engine's socket.
 //!
 //! Credentials (a short-lived GitHub App installation token, or a deploy key) reach the helper only through its
 //! stdin, land in a 0600 file on a tmpfs that dies with the helper and are handed to git by a credential helper
@@ -436,8 +436,10 @@ pub async fn fetch(d: &Docker, f: Fetch<'_>, ev: &Events, cancel: &CancellationT
 }
 
 /// Removes helpers an earlier agent process left behind (it stopped in the middle of a clone or a build): clone,
-/// source and build helpers alike, which all carry [`LABEL_HELPER`].
+/// source, build and SBOM helpers alike, which all carry [`LABEL_HELPER`]; and the image archives it was staging
+/// for a load ([`crate::oci`]).
 pub async fn remove_leftover_helpers() -> Result<usize, String> {
+    crate::oci::remove_leftover_staging();
     let d = crate::docker::client()?;
     let filters = std::collections::HashMap::from([("label".to_string(), vec![LABEL_HELPER.to_string()])]);
     let opts = bollard::query_parameters::ListContainersOptionsBuilder::default().all(true).filters(&filters).build();

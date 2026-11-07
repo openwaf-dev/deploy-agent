@@ -94,6 +94,9 @@ fn validate(d: &AppDeploy) -> Result<(), String> {
         return Err("invalid port".into());
     }
     check_env(&d.run.env)?;
+    if let Some(b) = &d.build {
+        crate::egress::policy(b.egress.as_ref())?;
+    }
     if let Some(h) = &d.run.health
         && (!h.path.starts_with('/') || h.path.chars().any(|c| c.is_control() || c.is_whitespace()))
     {
@@ -133,6 +136,9 @@ pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resu
     let tag = &d.run.image_tag;
     let mut commit = None;
     let mut known_hosts = Vec::new();
+    // An image the deployment did not build gets its SBOM once it serves (generating one may take a while):
+    // (reference pulled, if pulled).
+    let mut sbom_later: Option<Option<String>> = None;
     match &d.source {
         Source::Git { url, reference, auth, ssh, commit: expected } => {
             let spec = d.build.clone().unwrap_or(BuildSpec {
@@ -148,6 +154,7 @@ pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resu
                 publish_dir: None,
                 spa: false,
                 untrusted: false,
+                egress: None,
             });
             let repo = Repo {
                 url,
@@ -171,21 +178,33 @@ pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resu
                     commit = Some(ctx.commit.clone());
                     known_hosts.clone_from(&ctx.known_hosts);
                     ev.step_after_fetch(Step::Building, ctx.info.clone()).await;
-                    crate::builder::build_dockerfile(&docker, &d.resource, &d.deployment, tag, &spec, &ctx, ev, cancel)
-                        .await?;
+                    let image = crate::builder::build_dockerfile(
+                        &docker,
+                        &d.resource,
+                        &d.deployment,
+                        tag,
+                        &spec,
+                        &ctx,
+                        ev,
+                        cancel,
+                    )
+                    .await?;
+                    crate::sbom::built(ev, &image, None).await;
                 }
                 BuildPack::Railpack | BuildPack::Static => {
                     let b = crate::builder::build(&docker, &d.resource, &d.deployment, tag, repo, &spec, ev, cancel)
                         .await?;
                     commit = Some(b.commit);
                     known_hosts = b.known_hosts;
+                    crate::sbom::built(ev, &b.image, None).await;
                 }
             }
         }
         Source::Image { image, auth } => {
             ev.step(Step::Pulling).await;
-            let reference = pull(&docker, image, auth.as_ref(), ev, cancel).await?;
+            let reference = pull(&docker, image, auth.as_ref(), None, ev, cancel).await?;
             tag_image(&docker, &reference, tag).await?;
+            sbom_later = Some(Some(reference));
         }
         Source::Local { image } => {
             ev.step(Step::Pulling).await;
@@ -197,6 +216,7 @@ pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resu
             if image != tag {
                 tag_image(&docker, image, tag).await?;
             }
+            sbom_later = Some(None);
         }
     }
     let image_id = docker.inspect_image(tag).await.map_err(|e| format!("inspect {tag}: {}", message(&e)))?.id;
@@ -282,6 +302,14 @@ pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resu
         ev.system(format!("Removed the previous container {}", short(id))).await;
     }
     volumes::prune_files(&d.resource, Some(&d.deployment));
+    if let Some(reference) = sbom_later {
+        let auth = match &d.source {
+            Source::Image { auth, .. } => auth.as_ref(),
+            _ => None,
+        };
+        let pulled = reference.as_deref().map(|reference| crate::sbom::Pulled { reference, auth });
+        crate::sbom::of_image(&docker, &d.resource, &image_id, tag, pulled, None, ev, cancel).await;
+    }
     Ok(DeployOutput { image: tag.clone(), image_id, container_id: new_id, commit, known_hosts })
 }
 
@@ -313,10 +341,13 @@ fn progress_line(id: Option<&str>, status: &str) -> String {
     }
 }
 
-async fn pull(
+/// Pulls `image` (for `platform`, when given), its progress in the deployment's log. Returns the reference pulled
+/// (with an explicit tag).
+pub async fn pull(
     d: &Docker,
     image: &str,
     auth: Option<&RegistryAuth>,
+    platform: Option<&str>,
     ev: &Events,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
@@ -328,7 +359,11 @@ async fn pull(
         serveraddress: Some(a.server.clone()),
         ..Default::default()
     });
-    let mut s = d.create_image(Some(CreateImageOptionsBuilder::default().from_image(&reference).build()), None, creds);
+    let mut opts = CreateImageOptionsBuilder::default().from_image(&reference);
+    if let Some(p) = platform {
+        opts = opts.platform(p);
+    }
+    let mut s = d.create_image(Some(opts.build()), None, creds);
     loop {
         let item = tokio::select! {
             biased;

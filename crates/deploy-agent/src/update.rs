@@ -8,6 +8,11 @@
 //! `<binary>.prev`, the new one renamed over it, and the agent exits with [`RESTART_EXIT`] for systemd
 //! (`Restart=always`) to start the new binary.
 //!
+//! With privileges separated ([`Fetcher::Relay`]) the broker, which holds no network connection of its own, has the
+//! relay download the binary into the relay's staging file; it then copies that file into `<binary>.new` itself and
+//! checks the copy as above (SHA-256 against the signed one, then that it runs), and also that the new binary can
+//! run privilege-separated, so an update can never leave the two units with a binary that does not know them.
+//!
 //! Before the swap a marker (`update.json` in the state directory) records both binaries. A new binary that finds it
 //! is on probation: once its first control frame verifies it clears the marker; if [`CONFIRM_WITHIN`] passes first it
 //! renames `.prev` back over itself and exits. The previous binary, started again, finds the marker naming it as the
@@ -297,12 +302,21 @@ pub fn base_url(connect_url: &str) -> Result<String, String> {
     Ok(u.as_str().trim_end_matches('/').to_string())
 }
 
+/// Where the control plane serves the binary of `target`.
+pub fn binary_url(base: &str, target: &str) -> String {
+    format!("{base}/v1/agent/binary/{target}")
+}
+
 /// Downloads the offered binary to `bin.staged()`, checks its SHA-256 and that it runs.
 pub async fn fetch(base: &str, bin: &Binary, u: &AgentUpdate) -> Result<(), String> {
     let staged = bin.staged();
-    let r = download(base, &staged, u).await;
+    let r = download(&binary_url(base, &u.target), &staged, &u.sha256, 0o700).await;
     let r = match r {
-        Ok(()) => preflight(&staged, &u.version).await,
+        Ok(()) => executable(&staged).await,
+        e => e,
+    };
+    let r = match r {
+        Ok(()) => preflight(&staged, &u.version, false).await,
         e => e,
     };
     if r.is_err() {
@@ -311,48 +325,134 @@ pub async fn fetch(base: &str, bin: &Binary, u: &AgentUpdate) -> Result<(), Stri
     r
 }
 
-async fn download(base: &str, staged: &Path, u: &AgentUpdate) -> Result<(), String> {
-    let url = format!("{base}/v1/agent/binary/{}", u.target);
+/// Copies the relay's download `from` (a file of the unprivileged relay) into `bin.staged()` and checks the copy: the
+/// signed SHA-256, that it runs and that it runs privilege-separated. Only the copy is judged and installed, so
+/// nothing the relay does to its file afterwards matters; `from` is opened without following a symbolic link and must
+/// be a regular file (not a FIFO that would block the broker).
+pub async fn import(from: &Path, bin: &Binary, u: &AgentUpdate) -> Result<(), String> {
+    let staged = bin.staged();
+    let r = copy_checked(from, &staged, &u.sha256).await;
+    let r = match r {
+        Ok(()) => executable(&staged).await,
+        e => e,
+    };
+    let r = match r {
+        Ok(()) => preflight(&staged, &u.version, true).await,
+        e => e,
+    };
+    if r.is_err() {
+        let _ = tokio::fs::remove_file(&staged).await;
+    }
+    let _ = tokio::fs::remove_file(from).await;
+    r
+}
+
+async fn copy_checked(from: &Path, staged: &Path, sha256: &str) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    let mut o = tokio::fs::OpenOptions::new();
+    o.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut src = o.open(from).await.map_err(|e| format!("{}: {e}", from.display()))?;
+    let meta = src.metadata().await.map_err(|e| format!("{}: {e}", from.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", from.display()));
+    }
+    if meta.len() > MAX_BINARY_BYTES {
+        return Err("the binary is too large".into());
+    }
+    let mut w = StagedWriter::create(staged, 0o700).await?;
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = src.read(&mut buf).await.map_err(|e| format!("{}: {e}", from.display()))?;
+        if n == 0 {
+            break;
+        }
+        w.write(&buf[..n]).await?;
+    }
+    w.finish(sha256).await
+}
+
+/// A binary being written, hashed and bounded as it is written.
+pub struct StagedWriter {
+    path: PathBuf,
+    file: tokio::fs::File,
+    hash: Sha256,
+    len: u64,
+}
+
+impl StagedWriter {
+    /// Creates (or truncates) `path` with `mode`.
+    pub async fn create(path: &Path, mode: u32) -> Result<StagedWriter, String> {
+        let mut o = tokio::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true).mode(mode);
+        let file = o.open(path).await.map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(StagedWriter { path: path.to_path_buf(), file, hash: Sha256::new(), len: 0 })
+    }
+
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.len += chunk.len() as u64;
+        if self.len > MAX_BINARY_BYTES {
+            return Err("the binary is too large".into());
+        }
+        self.hash.update(chunk);
+        self.file.write_all(chunk).await.map_err(|e| format!("{}: {e}", self.path.display()))
+    }
+
+    /// Syncs the file and checks that its SHA-256 is `sha256`.
+    pub async fn finish(self, sha256: &str) -> Result<(), String> {
+        self.file.sync_all().await.map_err(|e| format!("{}: {e}", self.path.display()))?;
+        let got = hex::encode(self.hash.finalize());
+        if got != sha256 {
+            return Err(format!("SHA-256 mismatch: got {got}, signed {sha256}"));
+        }
+        Ok(())
+    }
+}
+
+/// Downloads `url` into `path` (created with `mode`), at most [`MAX_BINARY_BYTES`], whose SHA-256 must be `sha256`.
+pub async fn download(url: &str, path: &Path, sha256: &str, mode: u32) -> Result<(), String> {
     let mut resp = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("download: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("download: HTTP {}", resp.status()));
     }
-    let mut o = tokio::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true).mode(0o700);
-    let mut f = o.open(staged).await.map_err(|e| format!("{}: {e}", staged.display()))?;
-    let mut h = Sha256::new();
-    let mut len = 0u64;
+    let mut w = StagedWriter::create(path, mode).await?;
     while let Some(chunk) = resp.chunk().await.map_err(|e| format!("download: {e}"))? {
-        len += chunk.len() as u64;
-        if len > MAX_BINARY_BYTES {
-            return Err("download: the binary is too large".into());
-        }
-        h.update(&chunk);
-        f.write_all(&chunk).await.map_err(|e| format!("{}: {e}", staged.display()))?;
+        w.write(&chunk).await.map_err(|e| format!("download: {e}"))?;
     }
-    f.sync_all().await.map_err(|e| format!("{}: {e}", staged.display()))?;
-    drop(f);
-    let got = hex::encode(h.finalize());
-    if got != u.sha256 {
-        return Err(format!("SHA-256 mismatch: got {got}, signed {}", u.sha256));
-    }
+    w.finish(sha256).await
+}
+
+async fn executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    tokio::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o755))
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .await
-        .map_err(|e| format!("{}: {e}", staged.display()))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The end of a download started by [`Updater::offer`].
 pub struct Fetched {
-    update: AgentUpdate,
-    result: Result<(), String>,
+    pub update: AgentUpdate,
+    pub result: Result<(), String>,
+}
+
+impl Fetched {
+    pub fn new(update: AgentUpdate, result: Result<(), String>) -> Fetched {
+        Fetched { update, result }
+    }
+}
+
+/// Who downloads offered binaries.
+pub enum Fetcher {
+    /// This process (the single-process agent).
+    Direct,
+    /// The relay, into its staging file, from which the broker imports it ([`import`]).
+    Relay(crate::broker::Staging),
 }
 
 /// What [`Updater::poll`] asks of the session.
@@ -377,6 +477,7 @@ pub struct Updater {
     trust: Trust,
     base: Result<String, String>,
     tx: tokio::sync::mpsc::Sender<Fetched>,
+    fetcher: Fetcher,
     fetching: Option<String>,
     staged: Option<AgentUpdate>,
     deferred_told: bool,
@@ -391,6 +492,7 @@ impl Updater {
         trust: Trust,
         connect_url: &str,
         tx: tokio::sync::mpsc::Sender<Fetched>,
+        fetcher: Fetcher,
     ) -> Updater {
         Updater {
             dir,
@@ -398,6 +500,7 @@ impl Updater {
             trust,
             base: base_url(connect_url),
             tx,
+            fetcher,
             fetching: None,
             staged: None,
             deferred_told: false,
@@ -464,15 +567,25 @@ impl Updater {
             Err(e) => return Some(status(&u, UpdateState::Failed, Some(e.clone()))),
         };
         tracing::info!("downloading agent {} ({})", u.version, u.sha256);
+        let st = status(&u, UpdateState::Downloading, None);
+        match &self.fetcher {
+            Fetcher::Direct => {
+                let tx = self.tx.clone();
+                let u = u.clone();
+                tokio::spawn(async move {
+                    let result = fetch(&base, &bin, &u).await;
+                    let _ = tx.send(Fetched { update: u, result }).await;
+                });
+            }
+            Fetcher::Relay(staging) => {
+                if let Err(e) = staging.request(binary_url(&base, &u.target), bin, u.clone(), self.tx.clone()) {
+                    return Some(status(&u, UpdateState::Failed, Some(e)));
+                }
+            }
+        }
         self.staged = None;
         self.deferred_told = false;
         self.fetching = Some(u.sha256.clone());
-        let st = status(&u, UpdateState::Downloading, None);
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let result = fetch(&base, &bin, &u).await;
-            let _ = tx.send(Fetched { update: u, result }).await;
-        });
         Some(st)
     }
 
@@ -514,8 +627,22 @@ impl Updater {
     }
 }
 
-/// The new binary must at least start and name itself (wrong architecture, truncated file).
-async fn preflight(staged: &Path, version: &str) -> Result<(), String> {
+/// The new binary must at least start and name itself (wrong architecture, truncated file); with `split`, it must also
+/// run privilege-separated (`capabilities` lists [`crate::split::CAPABILITY`]): a binary from before privilege
+/// separation installed under the two units would neither start the broker nor read the state as the relay.
+async fn preflight(staged: &Path, version: &str, split: bool) -> Result<(), String> {
+    if split {
+        let mut c = tokio::process::Command::new(staged);
+        c.arg("capabilities").kill_on_drop(true).stdin(std::process::Stdio::null());
+        let out = tokio::time::timeout(Duration::from_secs(10), c.output())
+            .await
+            .map_err(|_| "the new binary did not answer `capabilities`".to_string())?
+            .map_err(|e| format!("the new binary does not run: {e}"))?;
+        if !out.status.success() || !String::from_utf8_lossy(&out.stdout).lines().any(|l| l == crate::split::CAPABILITY)
+        {
+            return Err("the new binary cannot run privilege-separated: refused on this server".into());
+        }
+    }
     let mut c = tokio::process::Command::new(staged);
     c.arg("version").kill_on_drop(true).stdin(std::process::Stdio::null());
     let out = tokio::time::timeout(Duration::from_secs(10), c.output())
@@ -738,7 +865,8 @@ mod tests {
         let (k, u) = offer(b"new", false);
         std::fs::write(bin.staged(), b"new").unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut up = Updater::new(state.clone(), Some(bin), trust(&k), "wss://d.example/v1/agent/connect", tx);
+        let connect = "wss://d.example/v1/agent/connect";
+        let mut up = Updater::new(state.clone(), Some(bin), trust(&k), connect, tx, Fetcher::Direct);
         assert_eq!(up.poll(false, 1000), Poll::Idle, "nothing downloaded");
         assert_eq!(up.fetched(Fetched { update: u.clone(), result: Ok(()) }), None);
 
@@ -751,6 +879,52 @@ mod tests {
         let Poll::Restart(st) = up.poll(false, 1002) else { panic!("not installed") };
         assert_eq!((st.state, st.sha256), (UpdateState::Restarting, u.sha256));
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A binary the relay downloaded is installed only from the broker's own copy, and only when that copy has the
+    /// signed SHA-256, runs and runs privilege-separated; a symbolic link or a FIFO in the relay's place is refused
+    /// without being followed or blocking.
+    #[tokio::test]
+    async fn relay_downloads_are_imported_only_when_checked() {
+        let d = temp("import");
+        let bin = Binary { path: d.join("bin/owdeploy-agent"), sha256: sha(b"old") };
+        let relay = d.join("agent.new");
+        let script = |capabilities: &str| {
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  version) echo 'owdeploy-agent 0.2.0+new (protocol x)' ;;\n  \
+                 capabilities) echo '{capabilities}' ;;\n  *) exit 2 ;;\nesac\n"
+            )
+        };
+        let split = script(crate::split::CAPABILITY);
+        let (_, u) = offer(split.as_bytes(), false);
+
+        std::fs::write(&relay, "#!/bin/sh\necho tampered\n").unwrap();
+        assert!(import(&relay, &bin, &u).await.unwrap_err().contains("SHA-256 mismatch"));
+        assert!(!bin.staged().exists() && !relay.exists(), "the copy and the relay's file are removed");
+
+        let target = d.join("elsewhere");
+        std::fs::write(&target, &split).unwrap();
+        std::os::unix::fs::symlink(&target, &relay).unwrap();
+        assert!(import(&relay, &bin, &u).await.is_err(), "a symbolic link is not followed");
+        assert!(!bin.staged().exists());
+
+        let c = std::ffi::CString::new(relay.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = tokio::time::timeout(Duration::from_secs(5), import(&relay, &bin, &u)).await.expect("no blocking");
+        assert!(e.unwrap_err().contains("not a regular file"));
+
+        let single = script("");
+        let (_, u_single) = offer(single.as_bytes(), false);
+        std::fs::write(&relay, &single).unwrap();
+        assert!(import(&relay, &bin, &u_single).await.unwrap_err().contains("cannot run privilege-separated"));
+        assert!(!bin.staged().exists());
+
+        std::fs::write(&relay, &split).unwrap();
+        import(&relay, &bin, &u).await.unwrap();
+        assert_eq!(std::fs::read_to_string(bin.staged()).unwrap(), split);
+        assert!(!relay.exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

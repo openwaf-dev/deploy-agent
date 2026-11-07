@@ -1,357 +1,56 @@
-//! `DeployCompose`: a Docker Compose application, run by `docker compose -p owd-<resource>` in the builder helper.
+//! `DeployCompose`: a Docker Compose application, project `owd-<resource>`, applied by the agent through the Engine
+//! API. No Compose client runs next to the Engine.
 //!
-//! The agent never edits the user's file. It asks Compose for the resolved project (`config --format json`:
-//! interpolated with the application's variables, `env_file`s and overrides merged, paths absolute) and adapts that:
-//! every service gets the resource and deployment labels, the application's variables, its volumes and files, and
-//! joins the environment network as `owd-<resource>-<service>` (the router's upstream); host `ports:` are dropped,
-//! so traffic only arrives through the router. That adapted project is what `docker compose up` runs.
-//!
-//! The clone and `config` run in a source helper without the Engine's socket; the build helper, which holds it, only
-//! gets the cloned tree and the adapted project.
+//! The agent never edits the user's file. A source helper asks Compose for the resolved project (`config --format
+//! json`: interpolated with the application's variables, `env_file`s and overrides merged, paths absolute); the
+//! agent turns that into a [`Plan`] (the adaptation and what is refused: [`crate::project`]). The services with a
+//! `build:` are built from the plan's bake file in a build helper on the rootless builder, each exported as an OCI
+//! image layout the agent checks and loads ([`crate::oci`]). The agent then applies the plan as `docker compose up
+//! --remove-orphans --wait` did: networks and volumes with Compose's labels, images pulled per `pull_policy`,
+//! containers of removed services removed, every service in dependency order (each waiting for its
+//! `depends_on` conditions: started, healthy, completed successfully), a service whose configuration changed
+//! (any new deployment) recreated, then every service running, and healthy when it has a health check, within
+//! [`WAIT_SECS`]. Containers are named and labelled as Compose names and labels them, so a project deployed by
+//! an earlier agent (through Compose) is updated in place, and the logs, exec, stop and removal of services keep
+//! working.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use bollard::Docker;
+use bollard::models::{ContainerSummary, EndpointSettings, NetworkConnectRequest, NetworkCreateRequest};
+use bollard::query_parameters::{CreateContainerOptionsBuilder, LogsOptionsBuilder};
 use deploy_proto::msg::{
     ComposeDeploy, ComposeOutput, ComposeService, ComposeSource, FileMount, LABEL_DEPLOYMENT, LABEL_ENVIRONMENT,
-    LABEL_RESOURCE, Step,
+    LogStream, Step,
 };
-use serde_json::{Map, Value, json};
+use futures_util::StreamExt;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::builder::Helper;
-use crate::docker::{COMPOSE_PROJECT, COMPOSE_SERVICE, File, client, labelled, valid_id};
-use crate::events::Events;
+use crate::builder::{Builder, Helper};
+use crate::docker::{
+    COMPOSE_PROJECT, COMPOSE_SERVICE, File, check_container, client, is_not_found, is_running, labelled, message,
+    remove_container, valid_id,
+};
+use crate::events::{Events, Lines};
 use crate::git::{self, Credentials, Repo};
-use crate::router::{self, Upstream, service_alias};
-use crate::volumes::{self, volume_name};
+use crate::oci::{Expect, Loaded};
+use crate::project::{
+    COMPOSE_HASH, COMPOSE_NUMBER, COMPOSE_ONEOFF, Condition, Network, Plan, Pull, Service, Volume, project,
+};
+use crate::router::{self, Upstream};
+use crate::volumes;
 
 /// Largest resolved Compose project read back from the helper.
 const MAX_CONFIG_BYTES: usize = 4 << 20;
-/// How long `up --wait` waits for the services to run (or be healthy).
-const WAIT_SECS: u32 = 300;
-
-pub fn project(resource: &str) -> String {
-    format!("owd-{}", resource.to_ascii_lowercase())
-}
-
-/// Key of the environment network in the adapted project.
-const ENV_NETWORK: &str = "owd_environment";
-
-/// Builds the services with a `build:` on the rootless builder (see [`crate::builder`]).
-const BUILD_SCRIPT: &str = r#"set -eu
-if [ "$OWD_NO_CACHE" = 1 ]; then set -- --no-cache; else set --; fi
-docker compose -p "$OWD_PROJECT" -f /owd/compose.json --progress plain build --builder "$OWD_BUILDER" "$@"
-"#;
-
-const UP_SCRIPT: &str = r#"set -eu
-docker compose -p "$OWD_PROJECT" -f /owd/compose.json --progress plain up -d --no-build --remove-orphans \
-  --wait --wait-timeout "$OWD_WAIT"
-"#;
-
-/// Adapts the resolved project. Returns it with its service names. What would take a service out of the
-/// firewall's reach or into the server's is refused first ([`refuse_escapes`]).
-pub fn adapt(
-    mut model: Value,
-    c: &ComposeDeploy,
-    files: &[(PathBuf, &FileMount)],
-) -> Result<(Value, BTreeSet<String>), String> {
-    let project = project(&c.resource);
-    refuse_escapes(&model, &c.resource)?;
-    let root = model.as_object_mut().ok_or("the Compose project is not an object")?;
-    root.insert("name".into(), json!(project));
-    let services = root.get_mut("services").and_then(Value::as_object_mut).ok_or("the Compose file has no services")?;
-    let names: BTreeSet<String> = services.keys().cloned().collect();
-    for n in &names {
-        if !valid_id(n) {
-            return Err(format!("service name {n:?}: use letters, digits, '-' and '_'"));
-        }
-    }
-    let mut joined = BTreeSet::new();
-    let mut referenced = BTreeSet::new();
-    for (name, svc) in services.iter_mut() {
-        let svc = svc.as_object_mut().ok_or_else(|| format!("service {name} is not an object"))?;
-        // Traffic arrives through the router only.
-        svc.remove("ports");
-        let labels = object(svc, "labels")?;
-        for (k, v) in &c.labels {
-            labels.insert(k.clone(), json!(v));
-        }
-        labels.insert(LABEL_RESOURCE.into(), json!(c.resource));
-        labels.insert(LABEL_DEPLOYMENT.into(), json!(c.deployment));
-        let env = object(svc, "environment")?;
-        for (k, v) in &c.env {
-            env.insert(k.clone(), json!(v));
-        }
-        svc.entry("restart").or_insert(json!("unless-stopped"));
-        svc.entry("logging").or_insert(json!({"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}}));
-        if let Some(build) = svc.get_mut("build").and_then(Value::as_object_mut) {
-            let l = build.entry("labels").or_insert(json!({}));
-            if let Some(l) = l.as_object_mut() {
-                l.insert(LABEL_RESOURCE.into(), json!(c.resource));
-                l.insert(LABEL_DEPLOYMENT.into(), json!(c.deployment));
-            }
-            // Built images live in the application's repository, like a Dockerfile application's (prune, remove),
-            // whatever the file names them: a build never replaces an image of someone else.
-            svc.insert(
-                "image".into(),
-                json!(format!(
-                    "owd/{}:{}-{}",
-                    c.resource.to_ascii_lowercase(),
-                    c.deployment.to_ascii_lowercase(),
-                    name.to_ascii_lowercase()
-                )),
-            );
-        }
-        // Docker's default bridge is not a Deploy network: such a service joins the application's networks.
-        if svc.get("network_mode").and_then(Value::as_str) == Some("bridge") {
-            svc.remove("network_mode");
-        }
-        // A service sharing another's network stack (or none) cannot join a network.
-        let own_network = svc.get("network_mode").is_none_or(Value::is_null);
-        if own_network {
-            let nets = match svc.remove("networks") {
-                None | Some(Value::Null) => json!({"default": null}),
-                Some(Value::Array(list)) => Value::Object(
-                    list.into_iter().filter_map(|n| Some((n.as_str()?.to_string(), Value::Null))).collect(),
-                ),
-                Some(v) => v,
-            };
-            let mut nets = match nets {
-                Value::Object(m) => m,
-                _ => return Err(format!("service {name}: invalid networks")),
-            };
-            for key in nets.keys() {
-                referenced.insert(key.clone());
-            }
-            nets.insert(ENV_NETWORK.into(), json!({"aliases": [service_alias(&c.resource, name)]}));
-            svc.insert("networks".into(), Value::Object(nets));
-            joined.insert(name.clone());
-        }
-        let mounts = svc.entry("volumes").or_insert(json!([]));
-        let mounts = mounts.as_array_mut().ok_or_else(|| format!("service {name}: invalid volumes"))?;
-        for v in c.volumes.iter().filter(|v| v.service.as_deref() == Some(name)) {
-            mounts.push(json!({"type": "volume", "source": volume_name(&c.resource, &v.name), "target": v.path}));
-        }
-        for (p, f) in files.iter().filter(|(_, f)| f.service.as_deref() == Some(name)) {
-            mounts.push(json!({"type": "bind", "source": p.to_string_lossy(), "target": f.path, "read_only": true}));
-        }
-    }
-    for m in
-        c.volumes.iter().filter_map(|v| v.service.as_ref()).chain(c.files.iter().filter_map(|f| f.service.as_ref()))
-    {
-        if !names.contains(m) {
-            return Err(format!("a mount names the service {m}, which the Compose file does not have"));
-        }
-    }
-    for r in &c.routes {
-        let s = r.service.as_deref().ok_or("each route of a Compose application names its service")?;
-        if !joined.contains(s) {
-            return Err(format!("the route to {s}: no such service with its own network"));
-        }
-    }
-    let nets = object(root, "networks")?;
-    // The project's own networks (those Compose creates): bridges named for the firewall's `owd+` guard from
-    // their creation on, without IPv6.
-    for key in referenced {
-        nets.entry(key.clone()).or_insert_with(|| json!({}));
-    }
-    for (key, n) in nets.iter_mut() {
-        if n.is_null() {
-            *n = json!({});
-        }
-        let n = n.as_object_mut().ok_or_else(|| format!("network {key} is not a map"))?;
-        if is_external(n.get("external")) {
-            continue;
-        }
-        let name = n.get("name").and_then(Value::as_str).map_or_else(|| format!("{project}_{key}"), str::to_string);
-        let opts = object(n, "driver_opts")?;
-        opts.insert(crate::firewall::BRIDGE_OPTION.into(), json!(crate::firewall::bridge_name(&name)));
-        n.insert("name".into(), json!(name));
-        n.insert("driver".into(), json!("bridge"));
-        n.insert("enable_ipv6".into(), json!(false));
-    }
-    nets.insert(ENV_NETWORK.into(), json!({"name": c.network, "external": true}));
-    let vols = object(root, "volumes")?;
-    for v in &c.volumes {
-        let n = volume_name(&c.resource, &v.name);
-        vols.insert(n.clone(), json!({"name": n, "external": true}));
-    }
-    Ok((model, names))
-}
-
-/// The map at `key` (created empty when missing or null).
-fn object<'a>(m: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut Map<String, Value>, String> {
-    let v = m.entry(key).or_insert(json!({}));
-    if v.is_null() {
-        *v = json!({});
-    }
-    v.as_object_mut().ok_or_else(|| format!("{key} is not a map"))
-}
-
-/// `external: true` (or the older `external: {name: …}`).
-fn is_external(v: Option<&Value>) -> bool {
-    matches!(v, Some(Value::Bool(true)) | Some(Value::Object(_)))
-}
-
-/// Capabilities that reach beyond the container (Docker's default set stays available).
-const REFUSED_CAPS: [&str; 13] = [
-    "ALL",
-    "SYS_ADMIN",
-    "NET_ADMIN",
-    "SYS_MODULE",
-    "SYS_RAWIO",
-    "SYS_PTRACE",
-    "SYS_BOOT",
-    "SYS_TIME",
-    "DAC_READ_SEARCH",
-    "MAC_ADMIN",
-    "MAC_OVERRIDE",
-    "BPF",
-    "PERFMON",
-];
-/// Network driver options a Compose file may set; the others change how the network is reached (published
-/// ports without NAT, other host addresses) or what the firewall sees.
-const NETWORK_OPTIONS: [&str; 2] = ["com.docker.network.driver.mtu", "com.docker.network.bridge.enable_icc"];
-
-/// What a Compose project may not ask for: anything that leaves the Deploy networks (and so the firewall's egress
-/// guard) or reaches into the server: the host's or another container's namespaces, networks that are not the
-/// application's (or not bridges, or with IPv6), privileged mode and capabilities beyond the container, devices,
-/// unconfined security profiles, files of the server (bind mounts, local volumes over a host path, file secrets
-/// and configs), volumes of other applications, and builds with the host's network or extra privileges.
-fn refuse_escapes(model: &Value, resource: &str) -> Result<(), String> {
-    let project = project(resource);
-    let own = format!("{project}_");
-    let empty = Map::new();
-    let map = |v: &Value, key: &str| v.get(key).and_then(Value::as_object).unwrap_or(&empty).clone();
-    let strings = |v: Option<&Value>| -> Vec<String> {
-        v.and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string)).collect()
-    };
-    for (key, n) in &map(model, "networks") {
-        let name = n.get("name").and_then(Value::as_str);
-        if is_external(n.get("external")) {
-            let name = name.unwrap_or(key);
-            if !name.starts_with(crate::firewall::NETWORK_PREFIX) {
-                return Err(format!("network {key}: the external network {name} is not a Deploy network (owd-…)"));
-            }
-            continue;
-        }
-        if let Some(name) = name.filter(|n| !n.starts_with(&own)) {
-            return Err(format!("network {key}: its name {name} is refused (an application's networks are {own}…)"));
-        }
-        match n.get("driver").and_then(Value::as_str) {
-            None | Some("bridge") => {}
-            Some(d) => return Err(format!("network {key}: the {d} driver is refused (Deploy networks are bridges)")),
-        }
-        if n.get("enable_ipv6") == Some(&Value::Bool(true)) {
-            return Err(format!("network {key}: IPv6 is disabled on Deploy networks"));
-        }
-        if let Some(o) = map(n, "driver_opts").keys().find(|o| !NETWORK_OPTIONS.contains(&o.as_str())) {
-            return Err(format!("network {key}: the driver option {o} is refused"));
-        }
-    }
-    let volumes = map(model, "volumes");
-    for (key, v) in &volumes {
-        let name = v.get("name").and_then(Value::as_str).unwrap_or(key);
-        if is_external(v.get("external")) {
-            if !name.starts_with(&format!("{project}-")) && !name.starts_with(&own) {
-                return Err(format!("volume {key}: the external volume {name} is not a volume of this application"));
-            }
-            continue;
-        }
-        if !name.starts_with(&own) {
-            return Err(format!("volume {key}: its name {name} is refused (an application's volumes are {own}…)"));
-        }
-        if let Some(d) = v.get("driver").and_then(Value::as_str).filter(|d| *d != "local") {
-            return Err(format!("volume {key}: the {d} driver is refused"));
-        }
-        let opts = map(v, "driver_opts");
-        let opt = |k: &str| opts.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-        let host_path = opt("o").split(',').any(|o| matches!(o.trim(), "bind" | "rbind"))
-            || matches!(opt("type").as_str(), "none" | "bind")
-            || opt("device").starts_with('/');
-        if host_path {
-            return Err(format!("volume {key}: a volume over a path of the server is refused"));
-        }
-    }
-    for kind in ["secrets", "configs"] {
-        if let Some((key, _)) = map(model, kind).iter().find(|(_, s)| s.get("file").is_some()) {
-            return Err(format!(
-                "{kind} {key}: a file of the server cannot be mounted (use `environment` or `content`, or a file \
-                 mount of the application)"
-            ));
-        }
-    }
-    let services = map(model, "services");
-    for (name, svc) in &services {
-        let refused = |what: String| Err(format!("service {name}: {what} is refused"));
-        if svc.get("privileged") == Some(&Value::Bool(true)) {
-            return refused("privileged mode".into());
-        }
-        for cap in strings(svc.get("cap_add")) {
-            let c = cap.to_ascii_uppercase();
-            if REFUSED_CAPS.contains(&c.strip_prefix("CAP_").unwrap_or(&c)) {
-                return refused(format!("cap_add {cap}"));
-            }
-        }
-        for key in ["pid", "ipc", "uts", "userns_mode", "cgroup"] {
-            if let Some(m) =
-                svc.get(key).and_then(Value::as_str).filter(|m| *m == "host" || m.starts_with("container:"))
-            {
-                return refused(format!("{key}: {m}"));
-            }
-        }
-        match svc.get("network_mode").and_then(Value::as_str) {
-            None | Some("none" | "bridge") => {}
-            Some(m) if m.strip_prefix("service:").is_some_and(|s| services.contains_key(s)) => {}
-            Some(m) => return refused(format!("network_mode {m} (services join the application's networks)")),
-        }
-        for key in ["devices", "device_cgroup_rules"] {
-            if svc.get(key).and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
-                return refused(key.into());
-            }
-        }
-        if let Some(o) = strings(svc.get("security_opt")).into_iter().find(|o| {
-            let o = o.replace(':', "=");
-            o.contains("unconfined") || o == "label=disable"
-        }) {
-            return refused(format!("security_opt {o}"));
-        }
-        if let Some(f) = strings(svc.get("volumes_from")).into_iter().find(|f| f.starts_with("container:")) {
-            return refused(format!("volumes_from {f}"));
-        }
-        for m in svc.get("volumes").and_then(Value::as_array).into_iter().flatten() {
-            let source = m.get("source").and_then(Value::as_str);
-            match m.get("type").and_then(Value::as_str) {
-                Some("bind") => {
-                    return refused(format!(
-                        "the bind mount of {} (files of the server; use a volume or a file mount of the application)",
-                        source.unwrap_or_default()
-                    ));
-                }
-                Some("volume") => {
-                    if let Some(s) = source.filter(|s| !volumes.contains_key(*s)) {
-                        return refused(format!("the volume {s}, not declared by the file"));
-                    }
-                }
-                Some("tmpfs" | "image") => {}
-                t => return refused(format!("a mount of type {}", t.unwrap_or("(none)"))),
-            }
-        }
-        if let Some(b) = svc.get("build").and_then(Value::as_object) {
-            if let Some(n) = b.get("network").and_then(Value::as_str).filter(|n| !matches!(*n, "default" | "none")) {
-                return refused(format!("build network {n}"));
-            }
-            if b.get("privileged") == Some(&Value::Bool(true)) {
-                return refused("a privileged build".into());
-            }
-            if let Some(e) = strings(b.get("entitlements")).first() {
-                return refused(format!("the build entitlement {e}"));
-            }
-        }
-    }
-    Ok(())
-}
+/// How long the services have to run (or be healthy), dependencies included.
+const WAIT_SECS: u64 = 300;
+/// How often a container's state is read while waiting for it.
+const POLL: Duration = Duration::from_secs(1);
+/// Lines of a failed container's log copied into the deployment's log.
+const TAIL_LINES: &str = "20";
 
 fn validate(c: &ComposeDeploy) -> Result<(), String> {
     if !valid_id(&c.resource) || !valid_id(&c.deployment) {
@@ -362,6 +61,7 @@ fn validate(c: &ComposeDeploy) -> Result<(), String> {
     }
     crate::deploy::check_network_name(&c.network)?;
     crate::deploy::check_env(&c.env)?;
+    crate::egress::policy(c.egress.as_ref())?;
     router::normalize(&c.routes)?;
     volumes::validate(&c.volumes, &c.files, true)
 }
@@ -378,27 +78,8 @@ pub async fn deploy(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) 
         .and_then(|x| x.labels.as_ref()?.get(LABEL_DEPLOYMENT).cloned());
     let files = volumes::write_files(&c.resource, &c.deployment, &c.files)?;
     ev.step(Step::Fetching).await;
-    // Repository content and the Compose file are handled in a helper without the Engine's socket; the helper with
-    // it only gets the cloned tree and the project the agent checked.
-    let src = match Helper::source(&d, &c.resource, ev).await {
-        Ok(s) => s,
-        Err(e) => {
-            volumes::prune_files(&c.resource, previous.as_deref());
-            return Err(e);
-        }
-    };
-    let h = match Helper::start(&d, &c.resource, ev).await {
-        Ok(h) => h,
-        Err(e) => {
-            src.remove().await;
-            volumes::prune_files(&c.resource, previous.as_deref());
-            return Err(e);
-        }
-    };
-    let r = run(&src, &h, c, &project, &files, ev, cancel).await;
-    src.remove().await;
-    h.remove().await;
-    let (commit, known_hosts) = match r {
+    let r = run(&d, c, &files, ev, cancel).await;
+    let (commit, known_hosts, plan) = match r {
         Ok(x) => x,
         Err(e) => {
             // The services that run still use the previous deployment's files.
@@ -410,6 +91,7 @@ pub async fn deploy(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) 
     router::switch(&d, &c.resource, &c.network, Upstream::Compose, c.routes.clone(), Some(ev)).await?;
     ev.step(Step::Cleaning).await;
     volumes::prune_files(&c.resource, Some(&c.deployment));
+    pulled_sboms(&d, c, &plan, ev, cancel).await;
     let mut services: Vec<ComposeService> = labelled(&d, COMPOSE_PROJECT, &project)
         .await?
         .into_iter()
@@ -427,16 +109,45 @@ pub async fn deploy(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) 
     Ok(ComposeOutput { project, services, commit, known_hosts })
 }
 
+/// Resolves the file in a source helper, builds what it builds, and applies the plan.
 async fn run(
-    src: &Helper,
-    h: &Helper,
+    d: &Docker,
     c: &ComposeDeploy,
-    project: &str,
     files: &[(PathBuf, &FileMount)],
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(Option<String>, Vec<String>), String> {
-    let (file, dir, fetched, known_hosts) = match &c.source {
+) -> Result<(Option<String>, Vec<String>, Plan), String> {
+    // Repository content and the Compose file are handled in a helper without the Engine; only the agent's plan
+    // reaches the Engine, and only the tree and the plan's bake file reach a build helper.
+    let src = Helper::source(d, &c.resource, ev).await?;
+    let resolved = resolve(&src, c, files, ev, cancel).await;
+    let (plan, commit, known_hosts, inline) = match resolved {
+        Ok(x) => x,
+        Err(e) => {
+            src.remove().await;
+            return Err(e);
+        }
+    };
+    let list: Vec<&str> = plan.services.iter().map(|s| s.name.as_str()).collect();
+    ev.system(format!("Services: {}", list.join(", "))).await;
+    let built = build(d, &src, c, &plan, inline.as_deref(), ev, cancel).await;
+    src.remove().await;
+    let built = built?;
+    ev.step(Step::Starting).await;
+    apply(d, &plan, &c.resource, &built, ev, cancel).await?;
+    Ok((commit, known_hosts, plan))
+}
+
+/// The plan of the project, the commit and new host keys, and the inline file (written into the build helper too:
+/// its directory is where relative build contexts resolve).
+async fn resolve(
+    src: &Helper,
+    c: &ComposeDeploy,
+    files: &[(PathBuf, &FileMount)],
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<(Plan, Option<String>, Vec<String>, Option<String>), String> {
+    let (file, dir, fetched, known_hosts, inline) = match &c.source {
         ComposeSource::Git { url, reference, auth, ssh, file } => {
             let path = git::inside(file, "Compose file")?;
             if path.is_empty() {
@@ -454,14 +165,12 @@ async fn run(
                 Some((d, _)) => format!("/src/{d}"),
                 None => "/src".to_string(),
             };
-            (format!("/src/{path}"), dir, Some(cloned.info()), cloned.known_hosts)
+            (format!("/src/{path}"), dir, Some(cloned.info()), cloned.known_hosts, None)
         }
         ComposeSource::Inline { content } => {
-            let file = [File { path: "project/compose.yaml", data: content.as_bytes(), mode: 0o600 }];
-            src.put(&file).await?;
-            // The project's directory, which relative build contexts (`dockerfile_inline`) resolve to.
-            h.put(&file).await?;
-            ("/owd/project/compose.yaml".to_string(), "/owd/project".to_string(), None, Vec::new())
+            src.put(&[File { path: "project/compose.yaml", data: content.as_bytes(), mode: 0o600 }]).await?;
+            let (f, d) = ("/owd/project/compose.yaml".to_string(), "/owd/project".to_string());
+            (f, d, None, Vec::new(), Some(content.clone()))
         }
     };
     let commit = fetched.as_ref().map(|i| i.sha.clone());
@@ -469,219 +178,451 @@ async fn run(
         Some(info) => ev.step_after_fetch(Step::Building, info).await,
         None => ev.step(Step::Building).await,
     }
+    let project = project(&c.resource);
     let cmd: Vec<String> =
-        ["docker", "compose", "-p", project, "-f", &file, "--project-directory", &dir, "config", "--format", "json"]
+        ["docker", "compose", "-p", &project, "-f", &file, "--project-directory", &dir, "config", "--format", "json"]
             .iter()
             .map(|s| s.to_string())
             .collect();
     // The application's variables interpolate the file; they reach Compose as its environment, not argv.
     let env: Vec<String> = c.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let (code, out) = src.output(cmd, env, MAX_CONFIG_BYTES, ev, cancel).await?;
+    let (code, out) = src.output(cmd, env, None, MAX_CONFIG_BYTES, ev, cancel).await?;
     if code != 0 {
         return Err(format!("the Compose file is invalid (exit code {code})"));
     }
     let model: Value = serde_json::from_slice(&out).map_err(|e| format!("docker compose config: {e}"))?;
-    let (model, services) = adapt(model, c, files)?;
-    if matches!(c.source, ComposeSource::Git { .. }) {
-        // Build contexts and Dockerfiles of the services are files of the repository.
-        h.copy_from(src, "/src", cancel).await?;
-    }
-    src.remove().await;
-    let list: Vec<&str> = services.iter().map(String::as_str).collect();
-    ev.system(format!("Services: {}", list.join(", "))).await;
-    let text = serde_json::to_vec_pretty(&model).expect("project");
-    h.put(&[File { path: "compose.json", data: &text, mode: 0o600 }]).await?;
-    let base = vec![format!("OWD_PROJECT={project}"), format!("OWD_NO_CACHE={}", u8::from(c.no_cache))];
-    if model["services"].as_object().is_some_and(|s| s.values().any(|s| s.get("build").is_some())) {
-        let builder = crate::builder::Builder::Trusted;
-        crate::builder::ensure_builder(h, builder, ev, cancel).await?;
+    let plan = Plan::new(model, c, files)?;
+    Ok((plan, commit, known_hosts, inline))
+}
+
+/// Builds the services with a `build:` and loads their images (with their SBOMs sent). Returns them by service.
+async fn build(
+    d: &Docker,
+    src: &Helper,
+    c: &ComposeDeploy,
+    plan: &Plan,
+    inline: Option<&str>,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<BTreeMap<String, Loaded>, String> {
+    let Some((file, targets)) = plan.bake_file() else { return Ok(BTreeMap::new()) };
+    let policy = crate::egress::policy(c.egress.as_ref())?;
+    let builder = Builder::Trusted;
+    let h = Helper::build(d, &c.resource, builder, ev, cancel).await?;
+    let r = async {
+        match inline {
+            // Build contexts and Dockerfiles of the services are files of the repository.
+            None => h.copy_from(src, "/src", cancel).await?,
+            Some(content) => {
+                h.put(&[File { path: "project/compose.yaml", data: content.as_bytes(), mode: 0o600 }]).await?;
+            }
+        }
         ev.system(format!("Building on the rootless BuildKit builder {}", builder.name())).await;
-        let mut env = base.clone();
-        env.push(format!("OWD_BUILDER={}", builder.name()));
-        let code = h.sh(BUILD_SCRIPT, env, ev, cancel, &mut |_, _| true).await?;
-        crate::builder::prune_cache(h, builder, ev, cancel).await;
-        if code != 0 {
-            return Err(format!("docker compose build failed (exit code {code})"));
+        let names: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let egress = crate::egress::Session::start(d, &c.deployment, &policy, ev).await?;
+        let built = crate::builder::bake(&h, builder, file, &names, &names, Vec::new(), &egress, ev, cancel).await;
+        egress.finish(ev).await;
+        if let Err(code) = built? {
+            return Err(format!("the build failed (exit code {code})"));
+        }
+        let mut built = BTreeMap::new();
+        for s in plan.services.iter().filter(|s| s.build.is_some()) {
+            let expect = Expect { resource: &c.resource, deployment: &c.deployment };
+            let loaded = h.load(&s.name, expect, &s.image, ev, cancel).await?;
+            crate::sbom::built(ev, &loaded, Some(&s.name)).await;
+            built.insert(s.name.clone(), loaded);
+        }
+        Ok(built)
+    }
+    .await;
+    h.remove().await;
+    r
+}
+
+/// Sends the SBOMs of the images the services pulled (best effort; after the switch, so it never delays it).
+async fn pulled_sboms(d: &Docker, c: &ComposeDeploy, plan: &Plan, ev: &Events, cancel: &CancellationToken) {
+    for s in plan.services.iter().filter(|s| s.build.is_none() && s.replicas > 0) {
+        let Ok(image) = d.inspect_image(&s.image).await else { continue };
+        let Some(id) = image.id else { continue };
+        let pulled = crate::sbom::Pulled { reference: &s.image, auth: None };
+        crate::sbom::of_image(d, &c.resource, &id, &s.image, Some(pulled), Some(&s.name), ev, cancel).await;
+    }
+}
+
+/// Resolves when `cancel` fires, as an error, or after `t`.
+async fn pause(t: Duration, cancel: &CancellationToken) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(crate::CANCELLED.into()),
+        _ = tokio::time::sleep(t) => Ok(()),
+    }
+}
+
+/// Applies `plan` (see the module documentation).
+async fn apply(
+    d: &Docker,
+    plan: &Plan,
+    resource: &str,
+    built: &BTreeMap<String, Loaded>,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+    // The networks the services join (`default` only exists when used, as with Compose).
+    let used: BTreeSet<String> =
+        plan.services.iter().flat_map(|s| s.endpoints(&plan.project, 1)).map(|e| e.network).collect();
+    for n in plan.networks.iter().filter(|n| used.contains(n.name.as_str())) {
+        ensure_network(d, &plan.project, n).await?;
+    }
+    for v in &plan.volumes {
+        ensure_volume(d, &plan.project, v).await?;
+    }
+    for s in plan.services.iter().filter(|s| s.build.is_none() && s.replicas > 0) {
+        pull(d, s, ev, cancel).await?;
+    }
+    // Every container of the project must be the application's before any changes.
+    let existing = labelled(d, COMPOSE_PROJECT, &plan.project).await?;
+    for c in &existing {
+        check_container(resource, c.names.as_deref().unwrap_or_default(), c.labels.as_ref())?;
+    }
+    let label = |c: &ContainerSummary, k: &str| c.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_default();
+    for c in &existing {
+        let service = label(c, COMPOSE_SERVICE);
+        let oneoff = label(c, COMPOSE_ONEOFF) == "True";
+        if oneoff || !plan.services.iter().any(|s| s.name == service) {
+            ev.system(format!("Removing {}, of no service of the file", name_of(c))).await;
+            stop_and_remove(d, c.id.as_deref().unwrap_or_default()).await?;
         }
     }
-    ev.step(Step::Starting).await;
-    let mut env = base;
-    env.push(format!("OWD_WAIT={WAIT_SECS}"));
-    let code = h.sh(UP_SCRIPT, env, ev, cancel, &mut |_, _| true).await?;
-    if code != 0 {
-        return Err(format!("docker compose up failed (exit code {code})"));
+    let mut ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut recreated: BTreeSet<String> = BTreeSet::new();
+    for s in &plan.services {
+        wait_dependencies(d, s, &ids, deadline, ev, cancel).await?;
+        let hash = s.hash();
+        // A service whose containers use another's (network stack, volumes, IPC) follows it when it is recreated.
+        let follows = s.depends_on.iter().any(|x| recreated.contains(&x.service))
+            || matches!(&s.network, crate::project::NetworkMode::Service(x) if recreated.contains(x))
+            || s.volumes_from.iter().any(|(x, _)| recreated.contains(x));
+        let mut keep: BTreeMap<u64, String> = BTreeMap::new();
+        let mine =
+            existing.iter().filter(|c| label(c, COMPOSE_SERVICE) == s.name && label(c, COMPOSE_ONEOFF) != "True");
+        for c in mine {
+            let id = c.id.clone().unwrap_or_default();
+            let number: u64 = label(c, COMPOSE_NUMBER).parse().unwrap_or(0);
+            let same = !follows
+                && label(c, COMPOSE_HASH) == hash
+                && (1..=s.replicas).contains(&number)
+                && name_of(c) == s.container(&plan.project, number)
+                && is_running(c)
+                && !keep.contains_key(&number)
+                && built.get(&s.name).is_none_or(|b| c.image_id.as_deref() == Some(b.id.as_str()));
+            if same {
+                keep.insert(number, id);
+            } else {
+                stop_and_remove(d, &id).await?;
+                ev.system(format!("{}: removed", name_of(c))).await;
+            }
+        }
+        let mut created = false;
+        for number in 1..=s.replicas {
+            if keep.contains_key(&number) {
+                continue;
+            }
+            let id = create(d, plan, s, number, &hash, &ids, cancel).await?;
+            ev.system(format!("{}: started", s.container(&plan.project, number))).await;
+            keep.insert(number, id);
+            created = true;
+        }
+        if created {
+            recreated.insert(s.name.clone());
+        }
+        ids.insert(s.name.clone(), keep.into_values().collect());
     }
-    Ok((commit, known_hosts))
+    wait_ready(d, plan, &ids, deadline, ev, cancel).await
+}
+
+fn name_of(c: &ContainerSummary) -> String {
+    c.names.iter().flatten().next().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default()
+}
+
+/// Creates the project network `n` unless it exists: a bridge named for the firewall's guard, with Compose's
+/// labels. An existing one must be the project's. External ones must exist.
+async fn ensure_network(d: &Docker, project: &str, n: &Network) -> Result<(), String> {
+    match d.inspect_network(&n.name, None).await {
+        Ok(_) if n.external => return Ok(()),
+        Ok(x) => {
+            let labels = x.labels.unwrap_or_default();
+            return match labels.get(COMPOSE_PROJECT).map(String::as_str) == Some(project) {
+                true => Ok(()),
+                false => Err(format!("network {} exists and is not of the project {project}: refused", n.name)),
+            };
+        }
+        Err(e) if is_not_found(&e) && n.external => {
+            return Err(format!("the external network {} does not exist", n.name));
+        }
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => return Err(format!("inspect network {}: {}", n.name, message(&e))),
+    }
+    let req = NetworkCreateRequest {
+        name: n.name.clone(),
+        driver: Some("bridge".into()),
+        internal: Some(n.internal),
+        enable_ipv6: Some(false),
+        options: Some(n.options.clone().into_iter().collect()),
+        labels: Some(n.labels.clone().into_iter().collect()),
+        ..Default::default()
+    };
+    match d.create_network(req).await {
+        Ok(_) => {}
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => {}
+        Err(e) => return Err(format!("create network {}: {}", n.name, message(&e))),
+    }
+    crate::firewall::guard_new_network().await
+}
+
+/// Creates the project volume `v` unless it exists (an existing one is used, as Compose does); external ones must
+/// exist.
+async fn ensure_volume(d: &Docker, _project: &str, v: &Volume) -> Result<(), String> {
+    match d.inspect_volume(&v.name).await {
+        Ok(_) => return Ok(()),
+        Err(e) if is_not_found(&e) && v.external => {
+            return Err(format!("the external volume {} does not exist", v.name));
+        }
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => return Err(format!("inspect volume {}: {}", v.name, message(&e))),
+    }
+    let req = bollard::models::VolumeCreateRequest {
+        name: Some(v.name.clone()),
+        driver: Some("local".into()),
+        driver_opts: Some(v.options.clone().into_iter().collect()),
+        labels: Some(v.labels.clone().into_iter().collect()),
+        ..Default::default()
+    };
+    d.create_volume(req).await.map(|_| ()).map_err(|e| format!("create volume {}: {}", v.name, message(&e)))
+}
+
+/// The image of a service without a build, per its pull policy.
+async fn pull(d: &Docker, s: &Service, ev: &Events, cancel: &CancellationToken) -> Result<(), String> {
+    let present = d.inspect_image(&s.image).await.is_ok();
+    match s.pull {
+        Pull::Missing if present => Ok(()),
+        Pull::Never if present => Ok(()),
+        Pull::Never => {
+            Err(format!("service {}: the image {} is not on this server (pull_policy: never)", s.name, s.image))
+        }
+        Pull::Missing | Pull::Always => {
+            crate::deploy::pull(d, &s.image, None, s.platform.as_deref(), ev, cancel).await.map(|_| ())
+        }
+    }
+}
+
+async fn stop_and_remove(d: &Docker, id: &str) -> Result<(), String> {
+    // The container's own stop signal and grace period.
+    match d.stop_container(id, None::<bollard::query_parameters::StopContainerOptions>).await {
+        Ok(()) => {}
+        Err(e) if is_not_found(&e) => return Ok(()),
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
+        Err(e) => return Err(format!("stop {id}: {}", message(&e))),
+    }
+    remove_container(d, id).await
+}
+
+/// Creates and starts container `number` of `s`: on its first network, connected to the others, with its secrets
+/// and configs written in. `ids`: the containers of the services already applied.
+async fn create(
+    d: &Docker,
+    plan: &Plan,
+    s: &Service,
+    number: u64,
+    hash: &str,
+    ids: &BTreeMap<String, Vec<String>>,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    if cancel.is_cancelled() {
+        return Err(crate::CANCELLED.into());
+    }
+    let name = s.container(&plan.project, number);
+    let body = s.container_body(&plan.project, number, hash, &|svc| ids.get(svc).and_then(|v| v.first().cloned()))?;
+    let mut opts = CreateContainerOptionsBuilder::default().name(&name);
+    if let Some(p) = &s.platform {
+        opts = opts.platform(p);
+    }
+    let id =
+        d.create_container(Some(opts.build()), body).await.map_err(|e| format!("create {name}: {}", message(&e)))?.id;
+    for e in s.endpoints(&plan.project, number).iter().skip(1) {
+        let req = NetworkConnectRequest {
+            container: id.clone(),
+            endpoint_config: Some(EndpointSettings { aliases: Some(e.aliases.clone()), ..Default::default() }),
+        };
+        d.connect_network(&e.network, req)
+            .await
+            .map_err(|err| format!("connect {name} to {}: {}", e.network, message(&err)))?;
+    }
+    if !s.files.is_empty() {
+        let mut b = tar::Builder::new(Vec::new());
+        for f in &s.files {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(f.content.len() as u64);
+            h.set_mode(f.mode);
+            h.set_uid(f.uid);
+            h.set_gid(f.gid);
+            b.append_data(&mut h, f.target.trim_start_matches('/'), f.content.as_bytes())
+                .map_err(|e| format!("{name}: {} {e}", f.target))?;
+        }
+        let body = b.into_inner().map_err(|e| e.to_string())?;
+        let opts = bollard::query_parameters::UploadToContainerOptionsBuilder::default().path("/").build();
+        d.upload_to_container(&id, Some(opts), bollard::body_full(body.into()))
+            .await
+            .map_err(|e| format!("write the secrets and configs of {name}: {}", message(&e)))?;
+    }
+    d.start_container(&id, None).await.map_err(|e| format!("start {name}: {}", message(&e)))?;
+    Ok(id)
+}
+
+/// The state of a container, as a waiting step sees it.
+enum State {
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+/// Where container `id` stands: running (and healthy, when it has a health check), still starting, or failed.
+async fn state(d: &Docker, id: &str, completes: bool) -> Result<State, String> {
+    let c = d.inspect_container(id, None).await.map_err(|e| format!("inspect {id}: {}", message(&e)))?;
+    let s = c.state.unwrap_or_default();
+    let name = c.name.unwrap_or_default().trim_start_matches('/').to_string();
+    let running = s.running.unwrap_or(false);
+    let code = s.exit_code.unwrap_or(-1);
+    if completes {
+        return Ok(match (running, code, s.status.map(|x| x.to_string())) {
+            (true, _, _) => State::Starting,
+            (false, _, Some(st)) if st == "created" => State::Starting,
+            (false, 0, _) => State::Ready,
+            (false, code, _) => State::Failed(format!("{name} exited with code {code}")),
+        });
+    }
+    if !running {
+        let restarting = s.restarting.unwrap_or(false);
+        return Ok(match restarting {
+            true => State::Starting,
+            false => State::Failed(format!("{name} exited with code {code}")),
+        });
+    }
+    Ok(match s.health.and_then(|h| h.status).map(|h| h.to_string()).as_deref() {
+        None | Some("" | "none" | "healthy") => State::Ready,
+        Some("unhealthy") => State::Failed(format!("{name} is unhealthy")),
+        Some(_) => State::Starting,
+    })
+}
+
+/// Waits until every container of `ids` is ready, or one fails, or the deadline passes. `completes`: they must
+/// exit with code 0 (`service_completed_successfully`).
+async fn wait_for(
+    d: &Docker,
+    what: &str,
+    ids: &[String],
+    completes: bool,
+    deadline: Instant,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    for id in ids {
+        loop {
+            match state(d, id, completes).await? {
+                State::Ready => break,
+                State::Failed(m) => {
+                    tail(d, id, ev).await;
+                    return Err(format!("{what}: {m}"));
+                }
+                State::Starting if Instant::now() >= deadline => {
+                    tail(d, id, ev).await;
+                    return Err(format!("{what}: not ready after {WAIT_SECS} s"));
+                }
+                State::Starting => pause(POLL, cancel).await?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Waits for the `depends_on` conditions of `s`.
+async fn wait_dependencies(
+    d: &Docker,
+    s: &Service,
+    ids: &BTreeMap<String, Vec<String>>,
+    deadline: Instant,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    for dep in &s.depends_on {
+        let list = ids.get(&dep.service).map(Vec::as_slice).unwrap_or_default();
+        let what = format!("{} (needed by {})", dep.service, s.name);
+        match dep.condition {
+            Condition::Started => {}
+            Condition::Healthy => {
+                for id in list {
+                    let c =
+                        d.inspect_container(id, None).await.map_err(|e| format!("inspect {id}: {}", message(&e)))?;
+                    if c.state.and_then(|st| st.health).is_none() {
+                        return Err(format!("{what}: the service has no health check to wait for"));
+                    }
+                }
+                ev.system(format!("Waiting for {} to be healthy", dep.service)).await;
+                wait_for(d, &what, list, false, deadline, ev, cancel).await?;
+            }
+            Condition::CompletedSuccessfully => {
+                ev.system(format!("Waiting for {} to complete", dep.service)).await;
+                wait_for(d, &what, list, true, deadline, ev, cancel).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Waits until every service runs (healthy when it has a health check), but those others wait to complete.
+async fn wait_ready(
+    d: &Docker,
+    plan: &Plan,
+    ids: &BTreeMap<String, Vec<String>>,
+    deadline: Instant,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let completes: BTreeSet<&str> = plan
+        .services
+        .iter()
+        .flat_map(|s| &s.depends_on)
+        .filter(|x| x.condition == Condition::CompletedSuccessfully)
+        .map(|x| x.service.as_str())
+        .collect();
+    for s in &plan.services {
+        let list = ids.get(&s.name).map(Vec::as_slice).unwrap_or_default();
+        let done = completes.contains(s.name.as_str());
+        wait_for(d, &format!("service {}", s.name), list, done, deadline, ev, cancel).await?;
+    }
+    Ok(())
+}
+
+/// Copies the last lines of a container's log into the deployment's log (why it failed).
+async fn tail(d: &Docker, id: &str, ev: &Events) {
+    let opts = LogsOptionsBuilder::default().stdout(true).stderr(true).tail(TAIL_LINES).build();
+    let mut s = d.logs(id, Some(opts));
+    let (mut out, mut err) = (Lines::default(), Lines::default());
+    while let Some(Ok(o)) = s.next().await {
+        use bollard::container::LogOutput::*;
+        let (stream, buf, chunk) = match o {
+            StdErr { message } => (LogStream::Stderr, &mut err, message),
+            StdOut { message } | Console { message } => (LogStream::Stdout, &mut out, message),
+            StdIn { .. } => continue,
+        };
+        for l in buf.push(&chunk) {
+            ev.line(stream, l).await;
+        }
+    }
 }
 
 /// Services of a Compose application by container, for logs and exec (`service` label).
 pub fn service_of(c: &bollard::models::ContainerSummary) -> Option<&str> {
     c.labels.as_ref()?.get(COMPOSE_SERVICE).map(String::as_str)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use deploy_proto::msg::{Route, VolumeMount};
-    use std::collections::BTreeMap;
-
-    fn spec() -> ComposeDeploy {
-        ComposeDeploy {
-            resource: "app_01C".into(),
-            deployment: "dep_01X".into(),
-            network: "owd-env".into(),
-            source: ComposeSource::Inline { content: String::new() },
-            env: BTreeMap::from([("GREETING".to_string(), "hi".to_string())]),
-            volumes: vec![VolumeMount { name: "data".into(), path: "/data".into(), service: Some("db".into()) }],
-            files: vec![],
-            labels: BTreeMap::from([(LABEL_ENVIRONMENT.to_string(), "env".to_string())]),
-            routes: vec![Route {
-                listen: Some(20001),
-                hosts: vec!["a.com".into()],
-                service: Some("web".into()),
-                port: 80,
-                tls: false,
-            }],
-            no_cache: false,
-        }
-    }
-
-    #[test]
-    fn adapt_routes_through_the_environment_network_without_host_ports() {
-        let model = json!({
-            "name": "x",
-            "services": {
-                "web": {"image": "nginx", "ports": [{"target": 80, "published": "8080"}], "environment": {"GREETING": "file"},
-                        "networks": {"default": null}},
-                "db": {"build": {"context": "/src/db"}, "image": "postgres:17", "restart": "always",
-                       "networks": ["default", "back"]},
-                "side": {"image": "busybox", "network_mode": "service:web"},
-                "worker": {"image": "busybox", "network_mode": "bridge"}
-            },
-            "networks": {"default": {"name": "owd-app_01c_default"}, "back": {}}
-        });
-        let (m, names) = adapt(model, &spec(), &[]).unwrap();
-        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["db", "side", "web", "worker"]);
-        assert_eq!(m["name"], "owd-app_01c");
-        let web = &m["services"]["web"];
-        assert!(web.get("ports").is_none());
-        assert_eq!(web["environment"]["GREETING"], "hi", "the application's variables win");
-        assert_eq!(web["labels"][LABEL_RESOURCE], "app_01C");
-        assert_eq!(web["labels"][LABEL_ENVIRONMENT], "env");
-        assert_eq!(web["networks"][ENV_NETWORK]["aliases"], json!(["owd-app_01c-web"]));
-        assert!(web["networks"].as_object().unwrap().contains_key("default"));
-        assert_eq!(web["restart"], "unless-stopped");
-        let db = &m["services"]["db"];
-        assert_eq!(db["restart"], "always");
-        assert_eq!(db["image"], "owd/app_01c:dep_01x-db", "a build never replaces another image");
-        assert_eq!(db["build"]["labels"][LABEL_RESOURCE], "app_01C");
-        assert!(db["networks"].as_object().unwrap().contains_key("back"));
-        assert_eq!(db["volumes"], json!([{"type": "volume", "source": "owd-app_01c-data", "target": "/data"}]));
-        assert!(m["services"]["side"].get("networks").is_none(), "shares web's network stack");
-        let worker = &m["services"]["worker"];
-        assert!(worker.get("network_mode").is_none(), "Docker's default bridge is not a Deploy network");
-        assert!(worker["networks"].as_object().unwrap().contains_key("default"));
-        assert_eq!(m["networks"][ENV_NETWORK], json!({"name": "owd-env", "external": true}));
-        assert_eq!(m["volumes"]["owd-app_01c-data"], json!({"name": "owd-app_01c-data", "external": true}));
-        // The project's networks get bridges the firewall's `owd+` rules cover, and no IPv6.
-        for (key, name) in [("default", "owd-app_01c_default"), ("back", "owd-app_01c_back")] {
-            let n = &m["networks"][key];
-            assert_eq!(n["name"], name);
-            assert_eq!(n["enable_ipv6"], false);
-            assert_eq!(n["driver"], "bridge");
-            assert_eq!(n["driver_opts"][crate::firewall::BRIDGE_OPTION], crate::firewall::bridge_name(name));
-        }
-    }
-
-    /// A Compose file cannot take a service off the Deploy networks, into the server's namespaces or files, or
-    /// to another application's volumes.
-    #[test]
-    fn adapt_refuses_escapes() {
-        let mut c = spec();
-        c.volumes.clear();
-        let with = |svc: Value, root: Value| {
-            let mut m = json!({"services": {"web": {"image": "nginx"}, "db": svc}});
-            for (k, v) in root.as_object().unwrap() {
-                m[k] = v.clone();
-            }
-            adapt(m, &c, &[])
-        };
-        let ok = |svc: Value, root: Value| with(svc, root).map(|_| ()).map_err(|e| e.to_string());
-        let refused = |svc: Value, root: Value, needle: &str| {
-            let e = with(svc.clone(), root.clone()).err().unwrap_or_else(|| panic!("accepted: {svc} {root}"));
-            assert!(e.contains(needle), "{e} (wanted {needle})");
-        };
-        let none = json!({});
-        assert_eq!(ok(json!({"image": "postgres"}), none.clone()), Ok(()));
-        refused(json!({"image": "x", "network_mode": "host"}), none.clone(), "network_mode host");
-        refused(json!({"image": "x", "network_mode": "container:owd-router"}), none.clone(), "container:owd-router");
-        refused(json!({"image": "x", "network_mode": "service:nope"}), none.clone(), "service:nope");
-        assert_eq!(ok(json!({"image": "x", "network_mode": "service:web"}), none.clone()), Ok(()));
-        refused(json!({"image": "x", "privileged": true}), none.clone(), "privileged");
-        for cap in ["SYS_ADMIN", "cap_net_admin", "ALL"] {
-            refused(json!({"image": "x", "cap_add": [cap]}), none.clone(), "cap_add");
-        }
-        assert_eq!(ok(json!({"image": "x", "cap_add": ["NET_BIND_SERVICE"]}), none.clone()), Ok(()));
-        refused(json!({"image": "x", "pid": "host"}), none.clone(), "pid: host");
-        refused(json!({"image": "x", "ipc": "host"}), none.clone(), "ipc: host");
-        refused(json!({"image": "x", "userns_mode": "host"}), none.clone(), "userns_mode");
-        refused(
-            json!({"image": "x", "devices": [{"source": "/dev/kvm", "target": "/dev/kvm"}]}),
-            none.clone(),
-            "devices",
-        );
-        refused(json!({"image": "x", "security_opt": ["seccomp:unconfined"]}), none.clone(), "security_opt");
-        refused(json!({"image": "x", "security_opt": ["label=disable"]}), none.clone(), "security_opt");
-        refused(json!({"image": "x", "volumes_from": ["container:other"]}), none.clone(), "volumes_from");
-        let bind = json!({"type": "bind", "source": "/var/run/docker.sock", "target": "/var/run/docker.sock"});
-        refused(json!({"image": "x", "volumes": [bind]}), none.clone(), "/var/run/docker.sock");
-        refused(json!({"image": "x", "build": {"context": "/src", "network": "host"}}), none.clone(), "build network");
-        refused(
-            json!({"image": "x", "build": {"context": "/src", "entitlements": ["network.host"]}}),
-            none.clone(),
-            "entitlement",
-        );
-        // Networks: the application's own bridges, or Deploy networks.
-        let uses = |net: &str| json!({"image": "x", "networks": {net: null}});
-        refused(uses("lan"), json!({"networks": {"lan": {"driver": "macvlan"}}}), "macvlan");
-        refused(uses("lan"), json!({"networks": {"lan": {"name": "shared"}}}), "shared");
-        refused(
-            uses("lan"),
-            json!({"networks": {"lan": {"external": true, "name": "bridge"}}}),
-            "not a Deploy network",
-        );
-        refused(uses("lan"), json!({"networks": {"lan": {"enable_ipv6": true}}}), "IPv6");
-        let routed =
-            json!({"networks": {"lan": {"driver_opts": {"com.docker.network.bridge.gateway_mode_ipv4": "routed"}}}});
-        refused(uses("lan"), routed, "gateway_mode_ipv4");
-        assert_eq!(
-            ok(uses("lan"), json!({"networks": {"lan": {"external": true, "name": "owd-0a1b2c3d4e5f"}}})),
-            Ok(())
-        );
-        // Volumes: the project's own, or the application's.
-        let mounts = |src: &str| json!({"image": "x", "volumes": [{"type": "volume", "source": src, "target": "/d"}]});
-        assert_eq!(ok(mounts("pg"), json!({"volumes": {"pg": {"name": "owd-app_01c_pg"}}})), Ok(()));
-        refused(mounts("pg"), json!({"volumes": {"pg": {"name": "owd-router"}}}), "owd-router");
-        refused(
-            mounts("pg"),
-            json!({"volumes": {"pg": {"external": true, "name": "owd-app_02-data"}}}),
-            "not a volume of",
-        );
-        let host = json!({"volumes": {"pg": {"name": "owd-app_01c_pg", "driver_opts": {"type": "none", "o": "bind", "device": "/etc"}}}});
-        refused(mounts("pg"), host, "path of the server");
-        refused(json!({"image": "x"}), json!({"secrets": {"s": {"file": "/etc/shadow"}}}), "secrets s");
-        assert_eq!(ok(json!({"image": "x"}), json!({"configs": {"c": {"content": "x"}}})), Ok(()));
-    }
-
-    #[test]
-    fn adapt_refuses_routes_and_mounts_to_unknown_services() {
-        let model = json!({"services": {"web": {"image": "nginx"}}});
-        let mut c = spec();
-        assert!(adapt(model.clone(), &c, &[]).unwrap_err().contains("service db"));
-        c.volumes.clear();
-        c.routes[0].service = Some("api".into());
-        assert!(adapt(model.clone(), &c, &[]).unwrap_err().contains("api"));
-        c.routes[0].service = Some("web".into());
-        assert!(adapt(model, &c, &[]).is_ok());
-    }
 }
