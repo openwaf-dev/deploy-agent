@@ -1,11 +1,14 @@
 # Reviewed false positives of scripts/leak-guard.sh: path<TAB>ERE matched against the flagged line (for addresses and
 # e-mail addresses, the match alone).
 # The egress guard's refused ranges (RFC 1918, CGNAT, link-local, reserved) and the addresses of its tests.
-crates/deploy-agent/src/firewall.rs	^(0\.0\.0\.0|1\.2\.3\.4|10\.0\.0\.[02]|10\.1\.2\.3|100\.64\.0\.0|169\.254\.(0\.0|169\.254)|172\.16\.0\.0|172\.18\.0\.2|192\.0\.0\.0|192\.168\.(0\.0|5\.2)|198\.18\.0\.0|224\.0\.0\.0|240\.0\.0\.0)$
+crates/deploy-agent/src/firewall.rs	^(0\.0\.0\.0|1\.2\.3\.4|10\.0\.0\.[02]|10\.1\.2\.3|100\.64\.0\.[01]|100\.128\.0\.1|169\.254\.(0\.0|169\.254)|172\.16\.0\.0|172\.18\.0\.2|172\.31\.255\.255|172\.32\.0\.1|192\.0\.0\.0|192\.168\.(0\.0|5\.2|100\.1)|198\.18\.0\.0|224\.0\.0\.[01]|240\.0\.0\.0|255\.255\.255\.255)$
+# The build egress proxy's refusals of private, loopback and metadata addresses, in its tests.
+crates/deploy-agent/src/proxy.rs	^(10\.0\.0\.[15]|10\.1\.1\.1|127\.0\.0\.1|169\.254\.169\.254)$
 # Throwaway network namespaces of the end-to-end firewall test (private and cloud metadata addresses).
 crates/deploy-agent/src/e2e.rs	^(10\.23[123]\.0\.[0-2]|169\.254\.169\.(1|254))$
-# A made-up address in a test.
+# A made-up address in a test, and an example of the address forms resolvers accept.
 crates/deploy-proto/src/lib.rs	^1\.2\.3\.4$
+crates/deploy-proto/src/msg.rs	^1\.2\.3\.4$
 # Key fixtures without key material: tests that keys never reach logs, argv or the environment.
 crates/deploy-agent/src/git.rs	"-----BEGIN OPENSSH PRIVATE KEY-----(\\nx\\n)?"
 crates/deploy-agent/src/router.rs	"-----BEGIN PRIVATE KEY-----\\nAA==\\n-----END PRIVATE KEY-----"

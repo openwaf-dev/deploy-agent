@@ -9,6 +9,9 @@
 //! - The release key is offline (the operator's machine): it signs each released binary when it is built. Pinned at
 //!   enrollment (or by hand), never from the control plane's channel, so a control plane holding every online key
 //!   still cannot make this agent install a binary that was not released. Without one, offers are not checked for it.
+//! - The protocol: once a control plane answered with a protocol 2 handshake signed by a pinned control key (or said
+//!   at enrollment that it speaks protocol 2), the agent records it and refuses protocol 1 sessions from then on, so
+//!   stripping the v2 headers in transit cannot downgrade it.
 //!
 //! Every change is written to `identity.json` before it takes effect. `owdeploy-agent pin-keys` replaces the keys by
 //! hand (root on the server), the recovery when a key is lost or leaked (README.md).
@@ -18,9 +21,11 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use deploy_proto::msg::{ControlKeyRotate, PinnedKeys, UpdateKey};
-use deploy_proto::{Direction, Frame, Opener};
+use deploy_proto::session::{Exchange, ExchangeKey, Keys, Session, Transcript};
+use deploy_proto::{Direction, Frame, Opener, connect};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use tokio_tungstenite::tungstenite::http::HeaderMap;
 
 use crate::update::Trust;
 
@@ -42,6 +47,11 @@ pub struct Identity {
     /// The offline release key every installed binary must be signed by. None: release signatures are not required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_public_key: Option<String>,
+    /// The highest protocol a session with the control plane used, or that it announced at enrollment: sessions of
+    /// an older protocol are refused. None: 1 (an agent enrolled before protocol 2 that has not completed a v2
+    /// session yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
 }
 
 impl Identity {
@@ -106,6 +116,11 @@ impl Identity {
         Ok(Trust { control: self.control_key()?, update: self.update_key()?, release: self.release_key()? })
     }
 
+    /// The oldest protocol this agent still accepts from the control plane.
+    pub fn min_protocol(&self) -> u32 {
+        self.protocol.unwrap_or(1)
+    }
+
     pub fn pinned(&self, message: Option<String>) -> PinnedKeys {
         PinnedKeys {
             control: self.control_public_key.clone(),
@@ -128,9 +143,91 @@ impl KeyRing {
         Ok(KeyRing { id: Identity::load(dir)?, dir: dir.to_path_buf() })
     }
 
-    /// An opener for a new session's control frames.
-    pub fn opener(&self) -> Result<Opener, String> {
-        Ok(Opener::with_keys(self.id.frame_keys()?, Direction::ControlToAgent))
+    /// An opener for a new session's control frames: of the v2 session of `keys`, or v1 frames when None.
+    pub fn opener(&self, keys: Option<&Keys>) -> Result<Opener, String> {
+        let o = Opener::with_keys(self.id.frame_keys()?, Direction::ControlToAgent);
+        Ok(match keys {
+            Some(k) => o.in_session(k),
+            None => o,
+        })
+    }
+
+    /// The headers of the connect request that ask for a v2 session: the protocol, the control keys this agent
+    /// accepts (the control plane signs the handshake with one of them) and the connection's exchange key.
+    pub fn session_request(&self, exchange: &ExchangeKey) -> [(&'static str, String); 3] {
+        let keys: Vec<&str> = std::iter::once(&self.id.control_public_key)
+            .chain(&self.id.control_next_public_key)
+            .map(|k| k.as_str())
+            .collect();
+        [
+            (connect::HDR_PROTOCOL, deploy_proto::PROTOCOL_VERSION.to_string()),
+            (connect::HDR_CONTROL_KEYS, keys.join(",")),
+            (connect::HDR_EXCHANGE_KEY, deploy_proto::session::encode_exchange_key(exchange)),
+        ]
+    }
+
+    /// The control plane's answer to the connect request whose nonce was `agent_nonce` and exchange key `exchange`'s.
+    /// A v2 answer is accepted only when a pinned control key signed its transcript, which names both exchange keys;
+    /// its session keys are derived, its protocol recorded (saved before it is used) and protocol 1 refused from then
+    /// on. An answer without the v2 headers is a v1 session: refused once this agent used v2, since a control plane
+    /// that did will not stop (a man in the middle removing the headers would).
+    pub fn accept_session(
+        &mut self,
+        agent_nonce: &str,
+        exchange: Exchange,
+        answer: &HeaderMap,
+    ) -> Result<Option<Session>, String> {
+        let get = |name: &str| answer.get(name).and_then(|v| v.to_str().ok());
+        let protocol = match get(connect::HDR_PROTOCOL) {
+            None => 1,
+            Some(p) => {
+                p.parse::<u32>().ok().filter(|p| (1..=deploy_proto::PROTOCOL_VERSION).contains(p)).ok_or_else(|| {
+                    format!("the control plane answered with protocol {p:?}, which this agent did not offer")
+                })?
+            }
+        };
+        if protocol < self.id.min_protocol() {
+            return Err(format!(
+                "the control plane answered with protocol {protocol}, but this agent already used protocol {} with \
+                 it: refused (a downgrade)",
+                self.id.min_protocol()
+            ));
+        }
+        if protocol == 1 {
+            return Ok(None);
+        }
+        let refused = |why: &str| format!("protocol {protocol} handshake refused: {why}");
+        let control_nonce =
+            get(connect::HDR_CONTROL_NONCE).filter(|n| connect::valid_nonce(n)).ok_or_else(|| refused("no nonce"))?;
+        let control_key = get(connect::HDR_CONTROL_KEY)
+            .and_then(deploy_proto::decode_key)
+            .filter(|k| self.id.frame_keys().is_ok_and(|pinned| pinned.contains(k)))
+            .ok_or_else(|| refused("not signed by a pinned control key"))?;
+        let sig = get(connect::HDR_CONTROL_SIGNATURE)
+            .and_then(deploy_proto::decode_signature)
+            .ok_or_else(|| refused("no signature"))?;
+        let control_exchange = get(connect::HDR_CONTROL_EXCHANGE_KEY)
+            .and_then(deploy_proto::session::decode_exchange_key)
+            .ok_or_else(|| refused("no exchange key"))?;
+        let t = Transcript {
+            protocol,
+            server_id: self.id.server_id.clone(),
+            agent_nonce: agent_nonce.to_string(),
+            control_nonce: control_nonce.to_string(),
+            control_key,
+            agent_exchange: exchange.public_key(),
+            control_exchange,
+        };
+        if !t.verify(&control_key, Direction::ControlToAgent, &sig) {
+            return Err(refused("the signature does not verify"));
+        }
+        let keys = exchange.finish(&t, Direction::AgentToControl).map_err(|e| refused(&e.to_string()))?;
+        if self.id.min_protocol() < protocol {
+            let next = Identity { protocol: Some(protocol), ..self.id.clone() };
+            self.commit(next).map_err(|e| format!("protocol {protocol} not recorded: {e}"))?;
+            tracing::info!("protocol {protocol} recorded: older sessions are refused from now on");
+        }
+        Ok(Some(Session { transcript: t, keys }))
     }
 
     /// Saves `next` and makes it the identity; the in-memory identity is unchanged when saving fails.
@@ -267,6 +364,7 @@ mod tests {
             control_next_public_key: None,
             update_public_key: None,
             release_public_key: None,
+            protocol: None,
         };
         id.save(&dir).unwrap();
         KeyRing::load(&dir).unwrap()
@@ -282,7 +380,7 @@ mod tests {
     fn control_key_rotation_needs_the_current_key_and_completes_on_the_next_key() {
         let (old, new, stranger) = (generate_key(), generate_key(), generate_key());
         let mut r = ring("rotate", &old);
-        let mut o = r.opener().unwrap();
+        let mut o = r.opener(None).unwrap();
         let rotate = ControlKeyRotate { next_public_key: encode_key(&new.verifying_key()) };
 
         // Signed by any other key (here the very key it announces): refused before it is read.
@@ -316,7 +414,7 @@ mod tests {
             s_old.seal(&Ping { nonce: 0 }, 100);
         }
         assert!(r.open(&mut o, &raw(&mut s_old, &Ping { nonce: 3 }), 100).is_err(), "the old key is dropped");
-        assert_eq!(r.opener().unwrap().open_keyed(&raw(&mut s, &Ping { nonce: 4 }), 100).unwrap().1, 0);
+        assert_eq!(r.opener(None).unwrap().open_keyed(&raw(&mut s, &Ping { nonce: 4 }), 100).unwrap().1, 0);
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 
@@ -356,6 +454,108 @@ mod tests {
         let id = pin_by_hand(&r.dir, None, None, Some(&rel)).unwrap();
         assert_eq!((id.control_public_key, id.update_public_key, id.release_public_key), (c, Some(u), Some(rel)));
         assert!(Identity::load(&r.dir).unwrap().trust().unwrap().release.is_some(), "saved and trusted");
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+
+    /// The answer of a control plane signing the v2 handshake of `agent_nonce` and the agent's exchange key `agent`
+    /// with `key`, naming `named` as its key, and the control plane's session keys.
+    fn v2_answer(
+        r: &KeyRing,
+        key: &SigningKey,
+        named: &VerifyingKey,
+        agent_nonce: &str,
+        agent: ExchangeKey,
+    ) -> (HeaderMap, Keys) {
+        let exchange = Exchange::generate();
+        let t = Transcript {
+            protocol: 2,
+            server_id: r.id.server_id.clone(),
+            agent_nonce: agent_nonce.into(),
+            control_nonce: deploy_proto::session::nonce(),
+            control_key: *named,
+            agent_exchange: agent,
+            control_exchange: exchange.public_key(),
+        };
+        let mut h = HeaderMap::new();
+        h.insert(connect::HDR_PROTOCOL, "2".parse().unwrap());
+        h.insert(connect::HDR_CONTROL_NONCE, t.control_nonce.parse().unwrap());
+        h.insert(connect::HDR_CONTROL_KEY, encode_key(named).parse().unwrap());
+        let sig = deploy_proto::encode_signature(&t.sign(key, Direction::ControlToAgent));
+        h.insert(connect::HDR_CONTROL_SIGNATURE, sig.parse().unwrap());
+        let x = deploy_proto::session::encode_exchange_key(&t.control_exchange);
+        h.insert(connect::HDR_CONTROL_EXCHANGE_KEY, x.parse().unwrap());
+        (h, exchange.finish(&t, Direction::ControlToAgent).unwrap())
+    }
+
+    /// A v1 answer is a v1 session until a pinned control key signed a v2 handshake: that records protocol 2 (saved),
+    /// and from then on a v1 answer (what stripping the v2 headers in transit produces) is refused, after a restart
+    /// too. v2 answers not signed by a pinned key, made for another connection's nonce or exchange key, or whose
+    /// exchange key was swapped in transit, record nothing.
+    #[test]
+    fn v1_sessions_are_refused_once_v2_was_used() {
+        let (control, stranger) = (generate_key(), generate_key());
+        let mut r = ring("protocol", &control);
+        let pinned = control.verifying_key();
+        let x = Exchange::generate();
+        assert_eq!(
+            r.session_request(&x.public_key()),
+            [
+                (connect::HDR_PROTOCOL, "2".to_string()),
+                (connect::HDR_CONTROL_KEYS, encode_key(&pinned)),
+                (connect::HDR_EXCHANGE_KEY, deploy_proto::session::encode_exchange_key(&x.public_key()))
+            ]
+        );
+        let nonce = deploy_proto::session::nonce();
+        assert!(matches!(r.accept_session(&nonce, x, &HeaderMap::new()), Ok(None)), "a control plane that speaks v1");
+
+        let mitm = Exchange::generate().public_key();
+        type Answer<'a> = &'a dyn Fn(&KeyRing, ExchangeKey, &str) -> HeaderMap;
+        let answers: [(&str, Answer); 6] = [
+            ("a stranger's key", &|r, x, n| v2_answer(r, &stranger, &stranger.verifying_key(), n, x).0),
+            ("signed by a stranger", &|r, x, n| v2_answer(r, &stranger, &pinned, n, x).0),
+            ("another nonce", &|r, x, _| v2_answer(r, &control, &pinned, &deploy_proto::session::nonce(), x).0),
+            ("the agent's key swapped in the request", &|r, _, n| v2_answer(r, &control, &pinned, n, mitm).0),
+            ("the control plane's key swapped in the answer", &|r, x, n| {
+                let mut h = v2_answer(r, &control, &pinned, n, x).0;
+                let swapped = deploy_proto::session::encode_exchange_key(&mitm);
+                h.insert(connect::HDR_CONTROL_EXCHANGE_KEY, swapped.parse().unwrap());
+                h
+            }),
+            ("no exchange key", &|r, x, n| {
+                let mut h = v2_answer(r, &control, &pinned, n, x).0;
+                h.remove(connect::HDR_CONTROL_EXCHANGE_KEY);
+                h
+            }),
+        ];
+        for (what, answer) in answers {
+            let x = Exchange::generate();
+            let h = answer(&r, x.public_key(), &nonce);
+            assert!(r.accept_session(&nonce, x, &h).is_err(), "{what}");
+        }
+        let x = Exchange::generate();
+        let (mut unknown, _) = v2_answer(&r, &control, &pinned, &nonce, x.public_key());
+        unknown.insert(connect::HDR_PROTOCOL, "3".parse().unwrap());
+        assert!(r.accept_session(&nonce, x, &unknown).is_err(), "a version the agent did not offer");
+        assert_eq!((r.id.protocol, Identity::load(&r.dir).unwrap().protocol), (None, None), "nothing recorded");
+
+        let x = Exchange::generate();
+        let (h, control_keys) = v2_answer(&r, &control, &pinned, &nonce, x.public_key());
+        let s = r.accept_session(&nonce, x, &h).unwrap().expect("a v2 session");
+        assert_eq!((s.transcript.protocol, s.transcript.control_key), (2, pinned));
+        assert_eq!(s.keys.id(), control_keys.id());
+        assert_eq!(Identity::load(&r.dir).unwrap().protocol, Some(2), "saved");
+        let mut sealer = Sealer::new(control.clone(), Direction::ControlToAgent).in_session(&control_keys);
+        let frame = raw(&mut sealer, &Ping { nonce: 1 });
+        assert_eq!(r.opener(Some(&s.keys)).unwrap().open(&frame, 100).unwrap().decode::<Ping>().unwrap().nonce, 1);
+        assert!(r.opener(None).unwrap().open(&frame, 100).is_err(), "v2 frames are no v1 frames");
+
+        let e = r.accept_session(&nonce, Exchange::generate(), &HeaderMap::new()).unwrap_err();
+        assert!(e.contains("downgrade"), "{e}");
+        let mut restarted = KeyRing::load(&r.dir).unwrap();
+        assert!(restarted.accept_session(&nonce, Exchange::generate(), &HeaderMap::new()).is_err(), "after a restart");
+        let (n2, x) = (deploy_proto::session::nonce(), Exchange::generate());
+        let (h, _) = v2_answer(&r, &control, &pinned, &n2, x.public_key());
+        assert!(restarted.accept_session(&n2, x, &h).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&r.dir);
     }
 }

@@ -18,7 +18,7 @@ macro_rules! kind {
     };
 }
 
-/// First frame of the agent after connecting.
+/// The agent's first frame after connecting in v1; its second in v2, after [`SessionProof`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     pub agent_version: String,
@@ -39,6 +39,24 @@ pub struct Hello {
     /// The keys the agent pinned. None from agents before [`feature::UPDATE_KEY`].
     #[serde(default)]
     pub keys: Option<PinnedKeys>,
+    /// How the agent's processes are privileged. None from agents before privilege separation, which all run as one
+    /// root process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privileges: Option<Privileges>,
+}
+
+/// How an agent's processes are privileged, as reported in [`Hello::privileges`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Privileges {
+    /// Privilege-separated: an unprivileged relay carries the connection (TLS, WebSocket, the control plane's
+    /// input) and holds no secret; a root broker holds the keys, checks every frame and executes.
+    Split,
+    /// One root process does everything (servers installed before privilege separation that have not migrated).
+    Legacy,
+    /// A value of a newer agent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Features of a phase-3 agent, as announced in [`Hello::features`].
@@ -67,7 +85,13 @@ pub mod feature {
     pub const EDGE_TLS: &str = "edge_tls";
     /// Builds run on rootless BuildKit builders (`BuildSpec::untrusted`, `Source::Git::commit`).
     pub const ISOLATED_BUILDS: &str = "isolated_builds";
-    pub const ALL: [&str; 11] = [
+    /// `Event::Sbom`: the agent sends the software bill of materials of each image it deploys.
+    pub const SBOM: &str = "sbom";
+    /// `BuildSpec::egress`, `ComposeDeploy::egress` and `Event::Egress`: build steps reach the Internet only through
+    /// the agent's build egress proxy, which applies the deployment's [`super::BuildEgress`] policy and reports the
+    /// destinations.
+    pub const BUILD_EGRESS: &str = "build_egress";
+    pub const ALL: [&str; 13] = [
         ROUTER,
         BUILD_PACKS,
         COMPOSE,
@@ -79,9 +103,20 @@ pub mod feature {
         CONTROL_KEY_ROTATION,
         EDGE_TLS,
         ISOLATED_BUILDS,
+        SBOM,
+        BUILD_EGRESS,
     ];
 }
 kind!(Hello, "hello");
+
+/// Agent → control, the agent's first frame of a v2 session ([`crate::session`]): its key's signature (base64) of the
+/// handshake transcript as `agent-to-control`. The control plane closes a v2 session whose first frame is anything
+/// else or does not verify. v1 sessions never carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProof {
+    pub signature: String,
+}
+kind!(SessionProof, "session_proof");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DockerInfo {
@@ -263,8 +298,9 @@ pub enum Op {
     FirewallSync(FirewallRules),
     /// Replaces the configuration of the per-server router (output: [`RouterState`]).
     RouterSync(RouterConfig),
-    /// A Docker Compose application: fetch (Git) or take the inline file, build and `docker compose up` it in a
-    /// helper container, then route its domains. Streams like `DeployApp`; output: [`ComposeOutput`]. Cancellable.
+    /// A Docker Compose application: fetch (Git) or take the inline file, resolve it in a helper container, build its
+    /// images on the rootless builder, apply it through the Engine API, then route its domains. Streams like
+    /// `DeployApp`; output: [`ComposeOutput`]. Cancellable.
     DeployCompose(ComposeDeploy),
     /// Runs a command in an application's current container, or a service of a Compose application (scheduled
     /// tasks). Output lines are streamed as `CommandEvent::Log`; result: [`ExecOutput`]. Cancellable (the command is
@@ -406,6 +442,145 @@ pub struct BuildSpec {
     /// other builds), cloned without submodules. Agents with [`feature::ISOLATED_BUILDS`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub untrusted: bool,
+    /// What the build steps may reach on the Internet ([`feature::BUILD_EGRESS`]). None (older control planes):
+    /// `open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<BuildEgress>,
+}
+
+/// The egress policy of a deployment's build steps ([`feature::BUILD_EGRESS`]). Whatever the mode, build steps
+/// reach the Internet only through the agent's build egress proxy, never private, loopback, link-local or reserved
+/// addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildEgress {
+    pub mode: EgressMode,
+    /// `allowlist`: the destinations allowed ([`EgressRule`] syntax), at most [`MAX_EGRESS_ALLOW`]. Ignored in the
+    /// other modes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+/// Most entries of [`BuildEgress::allow`].
+pub const MAX_EGRESS_ALLOW: usize = 100;
+
+impl BuildEgress {
+    pub const OPEN: BuildEgress = BuildEgress { mode: EgressMode::Open, allow: Vec::new() };
+
+    /// The allowlist's rules; Err names the first invalid entry (or an unknown mode, too many entries).
+    pub fn rules(&self) -> Result<Vec<EgressRule>, String> {
+        if self.mode == EgressMode::Unknown {
+            return Err("unknown build egress mode".into());
+        }
+        if self.allow.len() > MAX_EGRESS_ALLOW {
+            return Err(format!("more than {MAX_EGRESS_ALLOW} allowed destinations"));
+        }
+        self.allow.iter().map(|a| EgressRule::parse(a)).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressMode {
+    /// Every public destination; only denials are reported in the log (the behaviour before policies existed).
+    Open,
+    /// Every public destination, each recorded.
+    Audit,
+    /// Only the destinations of [`BuildEgress::allow`], each attempt recorded.
+    Allowlist,
+    /// A mode of a newer control plane: the agent refuses the build rather than guess.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One allowed destination: `host` (exactly that name), or `*.domain` (any name below `domain`, not `domain`
+/// itself), each with an optional `:port` (any port without). Names are ASCII (IDNs in their `xn--` form), compared
+/// without case and without a trailing dot; IP addresses are not names and never match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressRule {
+    /// Lowercase, without `*.`.
+    pub host: String,
+    pub wildcard: bool,
+    pub port: Option<u16>,
+}
+
+impl EgressRule {
+    pub fn parse(s: &str) -> Result<EgressRule, String> {
+        let bad = |why: &str| format!("invalid allowed destination {s:?}: {why}");
+        let t = s.trim();
+        let (name, port) = match t.rsplit_once(':') {
+            Some((n, p)) => {
+                let p: u16 = p.parse().ok().filter(|p| *p > 0).ok_or_else(|| bad("the port is not 1 to 65535"))?;
+                (n, Some(p))
+            }
+            None => (t, None),
+        };
+        let (wildcard, name) = match name.strip_prefix("*.") {
+            Some(n) => (true, n),
+            None => (false, name),
+        };
+        let host = canonical_host(name).ok_or_else(|| bad("not a host name, `*.domain` or either with `:port`"))?;
+        if ip_like(&host) {
+            return Err(bad("IP addresses cannot be allowed, only names"));
+        }
+        if wildcard && !host.contains('.') {
+            return Err(bad("a wildcard needs a domain of at least two labels"));
+        }
+        Ok(EgressRule { host, wildcard, port })
+    }
+
+    /// Whether `host` (as [`canonical_host`] makes it) on `port` is allowed.
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        if self.port.is_some_and(|p| p != port) {
+            return false;
+        }
+        match self.wildcard {
+            false => host == self.host,
+            true => {
+                host.len() > self.host.len() + 1
+                    && host.ends_with(self.host.as_str())
+                    && host.as_bytes()[host.len() - self.host.len() - 1] == b'.'
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for EgressRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.wildcard {
+            f.write_str("*.")?;
+        }
+        f.write_str(&self.host)?;
+        match self.port {
+            Some(p) => write!(f, ":{p}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A DNS host name as compared: ASCII letters, digits, hyphens and underscores in labels of 1 to 63 characters,
+/// not starting or ending with a hyphen, at most 253 characters; lowercased, without the trailing dot. None for
+/// anything else (IPv6 literals included).
+pub fn canonical_host(s: &str) -> Option<String> {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    if s.is_empty() || s.len() > 253 {
+        return None;
+    }
+    let ok = s.split('.').all(|l| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
+    ok.then(|| s.to_ascii_lowercase())
+}
+
+/// Whether a canonical host reads as an IPv4 address in any of the forms resolvers accept (`1.2.3.4`, `127.1`,
+/// `0x7f.1`, `2130706433`): its last label is numeric. No top-level domain is.
+pub fn ip_like(host: &str) -> bool {
+    let last = host.rsplit('.').next().unwrap_or_default();
+    last.bytes().all(|b| b.is_ascii_digit())
+        || (last.len() > 2 && last[..2].eq_ignore_ascii_case("0x") && last[2..].bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Build pack of a Git source. Compose applications use `DeployCompose` instead.
@@ -624,6 +799,10 @@ pub struct ComposeDeploy {
     pub routes: Vec<Route>,
     #[serde(default)]
     pub no_cache: bool,
+    /// What the build steps of the services may reach on the Internet ([`feature::BUILD_EGRESS`]). None (older
+    /// control planes): `open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<BuildEgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -755,6 +934,68 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         commit: Option<CommitInfo>,
     },
+    /// Software bill of materials of an image the deployment runs ([`feature::SBOM`]): an SPDX 2.3 JSON document,
+    /// gzip-compressed then base64-encoded, sent in parts of at most [`MAX_SBOM_PART_BYTES`] characters of base64.
+    /// `part` counts from 0; the last part has `last: true`; at most [`MAX_SBOM_PARTS`] parts per image.
+    Sbom {
+        /// The image's content digest (`sha256:…`, the image ID the Engine reports).
+        image_digest: String,
+        /// The Compose service that runs the image; None for a single-container application.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+        part: u32,
+        last: bool,
+        data: String,
+    },
+    /// The destinations the build steps asked the build egress proxy for ([`feature::BUILD_EGRESS`]), sent once
+    /// at the end of the build (failed or not): every one in `audit` and `allowlist` mode, the denied ones in `open`
+    /// mode. At most [`MAX_EGRESS_ENTRIES`] entries, most attempted first; `truncated` when there were more.
+    Egress {
+        mode: EgressMode,
+        /// Whether direct connections from the builders were refused by the server's firewall, so the proxy was
+        /// the only way out (false: Docker without its iptables integration).
+        enforced: bool,
+        entries: Vec<EgressEntry>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+}
+
+/// Largest `Event::Sbom::data`, in characters of base64.
+pub const MAX_SBOM_PART_BYTES: usize = 512 * 1024;
+/// Most parts of one image's SBOM (16 MiB of base64).
+pub const MAX_SBOM_PARTS: u32 = 32;
+/// Most entries of one `Event::Egress`.
+pub const MAX_EGRESS_ENTRIES: usize = 500;
+
+/// Connections to one destination through the build egress proxy, with one decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressEntry {
+    /// The host name asked for (canonical, see [`canonical_host`]), or the IP address when one was asked for; at
+    /// most 253 characters.
+    pub host: String,
+    pub port: u16,
+    pub decision: EgressDecision,
+    /// Why it was denied (denied entries only): `not_allowed` (not in the allowlist), `ip_literal` (an address
+    /// instead of a name, in allowlist mode), `private_address` (the name resolves to a private, loopback,
+    /// link-local or reserved address), `unresolved` (the name does not resolve), `invalid` (not a host name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Connections (CONNECT tunnels and plain HTTP requests).
+    pub count: u64,
+    /// Bytes sent to the destination and received from it (allowed entries).
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressDecision {
+    Allowed,
+    Denied,
+    /// A decision of a newer agent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What the agent read from a fetched commit: its author and the subject of its message.
@@ -883,6 +1124,7 @@ mod tests {
                 publish_dir: None,
                 spa: false,
                 untrusted: true,
+                egress: Some(BuildEgress { mode: EgressMode::Allowlist, allow: vec!["*.npmjs.org:443".into()] }),
             }),
             run: RunSpec {
                 image_tag: "owd/app_01:dep_01".into(),
@@ -944,6 +1186,18 @@ mod tests {
         }))
         .unwrap();
         assert!(hello.features.is_empty());
+        assert_eq!(hello.privileges, None, "an agent from before privilege separation");
+        let with = |p: &str| {
+            serde_json::from_value::<Hello>(serde_json::json!({
+                "agent_version": "0.3.0", "hostname": "h", "os": "linux", "arch": "x86_64", "kernel": "6",
+                "docker": null, "privileges": p
+            }))
+            .unwrap()
+            .privileges
+        };
+        assert_eq!(with("split"), Some(Privileges::Split));
+        assert_eq!(with("legacy"), Some(Privileges::Legacy));
+        assert_eq!(with("sandboxed"), Some(Privileges::Unknown), "a newer agent's value still reads");
         // And a phase-2 agent reads what a phase-3 agent reports.
         let out = DeployOutput {
             image: "i".into(),
@@ -990,5 +1244,86 @@ mod tests {
         let v = serde_json::to_value(&tls).unwrap();
         assert_eq!(serde_json::from_value::<RouterConfig>(v).unwrap(), tls);
         assert!(!format!("{tls:?}").contains("secret-key"));
+    }
+
+    /// Allowlist entries: exact names, wildcards below a domain (not the domain itself), optional ports; IP
+    /// addresses and malformed names refused.
+    #[test]
+    fn egress_rules_parse_and_match() {
+        let r = |s: &str| EgressRule::parse(s).unwrap();
+        let exact = r("Registry.NPMjs.org.");
+        assert_eq!(exact.to_string(), "registry.npmjs.org");
+        assert!(exact.matches("registry.npmjs.org", 443) && exact.matches("registry.npmjs.org", 80));
+        assert!(!exact.matches("x.registry.npmjs.org", 443) && !exact.matches("npmjs.org", 443));
+        let wild = r("*.github.com:443");
+        assert_eq!(wild.to_string(), "*.github.com:443");
+        assert!(wild.matches("api.github.com", 443) && wild.matches("a.b.github.com", 443));
+        assert!(!wild.matches("github.com", 443), "a wildcard does not cover the domain itself");
+        assert!(!wild.matches("api.github.com", 80), "only its port");
+        assert!(!wild.matches("evilgithub.com", 443) && !wild.matches("github.com.evil.io", 443));
+        for bad in [
+            "",
+            "*",
+            "*.com",
+            "1.2.3.4",
+            "127.1",
+            "0x7f.1",
+            "2130706433",
+            "[::1]",
+            "::1",
+            "a..b",
+            "-a.com",
+            "a-.com",
+            "a.com:0",
+            "a.com:65536",
+            "a.com:x",
+            "a b.com",
+            "*.*.a.com",
+            "a.*.com",
+            "http://a.com",
+            "a.com/path",
+            &"a".repeat(64),
+            &format!("{}com", "a.".repeat(126)),
+        ] {
+            assert!(EgressRule::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+        let policy = |allow: Vec<&str>| BuildEgress {
+            mode: EgressMode::Allowlist,
+            allow: allow.into_iter().map(str::to_string).collect(),
+        };
+        assert_eq!(policy(vec!["a.com", "*.b.com:8443"]).rules().unwrap().len(), 2);
+        assert!(policy(vec!["a.com"; MAX_EGRESS_ALLOW + 1]).rules().is_err());
+        assert!(policy(vec!["a.com", "192.0.2.1"]).rules().unwrap_err().contains("192.0.2.1"));
+        let unknown: BuildEgress = serde_json::from_value(serde_json::json!({"mode": "strict"})).unwrap();
+        assert_eq!(unknown.mode, EgressMode::Unknown);
+        assert!(unknown.rules().is_err(), "an unknown mode is refused, not read as open");
+    }
+
+    /// Without a policy a build spec and a Compose deployment are written exactly as before; an older agent's
+    /// events still decode and an `egress` event round-trips.
+    #[test]
+    fn egress_fields_are_additive() {
+        let v = serde_json::json!({"context": ".", "dockerfile": "Dockerfile", "args": {}, "target": null});
+        let spec: BuildSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(spec.egress, None);
+        assert!(serde_json::to_value(&spec).unwrap().get("egress").is_none());
+        let e = Event::Egress {
+            mode: EgressMode::Audit,
+            enforced: true,
+            entries: vec![EgressEntry {
+                host: "registry.npmjs.org".into(),
+                port: 443,
+                decision: EgressDecision::Allowed,
+                reason: None,
+                count: 3,
+                bytes_out: 10,
+                bytes_in: 2000,
+            }],
+            truncated: false,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["type"], "egress");
+        assert!(v.get("truncated").is_none() && v["entries"][0].get("reason").is_none());
+        assert_eq!(serde_json::from_value::<Event>(v).unwrap(), e);
     }
 }

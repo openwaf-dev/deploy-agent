@@ -3,14 +3,14 @@ resolver = "3"
 members = ["crates/deploy-proto", "crates/deploy-agent"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/openwaf-dev/deploy-agent"
 
 [workspace.dependencies]
-deploy-proto = { path = "crates/deploy-proto", version = "0.1.0" }
+deploy-proto = { path = "crates/deploy-proto", version = "0.2.0" }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "fs", "io-util"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
@@ -27,6 +27,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi", "env-filter"] }
 bollard = "0.21"
 hex = "0.4"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+# Protocol 2 frame encryption (deploy-proto::session): ephemeral X25519 per session, HKDF-SHA256 to per-direction keys.
+x25519-dalek = { version = "3", features = ["getrandom"] }
+hkdf = "0.13"
+# Only for its `zeroize` feature: HKDF's HMAC state (the session's pseudorandom key) is wiped on drop.
+hmac = { version = "0.13", features = ["zeroize"] }
+zeroize = "1"
+parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3

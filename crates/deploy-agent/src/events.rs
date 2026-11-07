@@ -22,6 +22,8 @@ pub enum Outgoing {
 enum Item {
     Line(LogStream, String),
     Step(Step, Option<CommitInfo>),
+    /// An event sent as is, after the lines buffered before it (an SBOM part).
+    Event(Event),
 }
 
 /// Handle a command uses to report progress. Cheap to clone; the batcher ends once every clone is dropped.
@@ -54,6 +56,12 @@ impl Events {
     /// The agent's own message about the command.
     pub async fn system(&self, line: impl Into<String>) {
         self.line(LogStream::System, line).await;
+    }
+
+    /// Sends `event` in a `CommandEvent` of its own, after every line reported before it (SBOM parts:
+    /// [`crate::sbom`]).
+    pub async fn event(&self, event: Event) {
+        let _ = self.tx.send(Item::Event(event)).await;
     }
 }
 
@@ -101,6 +109,12 @@ async fn batch(id: String, mut rx: mpsc::Receiver<Item>, out: mpsc::Sender<Outgo
                     }
                     step = Some(next);
                     let event = Event::Step { step: next, commit };
+                    let _ = out.send(Outgoing::Event(CommandEvent { id: id.clone(), event })).await;
+                }
+                Some(Item::Event(event)) => {
+                    if let Some(e) = flush(stream, step, &mut lines) {
+                        let _ = out.send(e).await;
+                    }
                     let _ = out.send(Outgoing::Event(CommandEvent { id: id.clone(), event })).await;
                 }
                 None => {
@@ -177,6 +191,7 @@ mod tests {
             .map(|e| match e {
                 Event::Log { stream, lines, step } => (format!("{stream:?}"), lines.len(), *step),
                 Event::Step { step, .. } => (format!("{step:?}"), 0, None),
+                Event::Sbom { .. } | Event::Egress { .. } => unreachable!("no SBOM or egress report here"),
             })
             .collect();
         assert_eq!(

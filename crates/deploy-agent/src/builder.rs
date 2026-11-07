@@ -1,31 +1,37 @@
-//! The builder helpers: throwaway containers with the Docker CLI (BuildKit through buildx, Compose) and Railpack, for
-//! builds the Engine API alone cannot run (the helper-container model). The server needs no build tool: the agent
-//! builds the helper image itself, once, from pinned and checksummed releases.
+//! The builder helpers: throwaway containers with the Docker CLI (BuildKit through buildx, Compose's resolution),
+//! Railpack and syft, for builds the Engine API alone cannot run (the helper-container model). The server needs no
+//! build tool: the agent builds the helper image itself, once, from pinned and checksummed releases.
 //!
 //! Helpers live for one deployment: created idle, the agent runs each step in them with `docker exec` and removes
 //! them at the end, on failure and on cancel alike. Removing one kills the step running in it, which closes its
-//! BuildKit session and stops the build. Repository content is handled first in a source helper ([`Role::Source`]:
-//! no Engine socket, no capability, `no-new-privileges`): the clone, Railpack's plan, Compose's resolution. Its
-//! /src (and the plan) is then copied, Engine to Engine, into the build helper ([`Role::Docker`]), which holds the
-//! Engine's socket and only runs `docker buildx` and `docker compose` on that, and the source helper is removed.
+//! BuildKit session and stops the build. No helper has the Engine's socket: only the agent process talks to the
+//! Engine. Repository content is handled first in a source helper ([`Role::Source`]: no capability,
+//! `no-new-privileges`): the clone, Railpack's plan, Compose's resolution. Its /src (and the plan) is then copied,
+//! Engine to Engine, into a build helper ([`Role::Build`]), which reaches one builder's BuildKit and nothing else,
+//! and the source helper is removed. Builds export OCI image layouts into the build helper, which the agent checks
+//! and loads into the Engine itself ([`crate::oci`]).
 //!
 //! Resources are bounded ([`Limits`], from the agent's environment): `OWDEPLOY_BUILD_CPUS` (default 2),
 //! `OWDEPLOY_BUILD_MEMORY_MB` (4096, no swap on top) and `OWDEPLOY_BUILD_PIDS` (2048) for each builder and each
 //! helper; `OWDEPLOY_BUILD_CACHE_GB` (10) and `OWDEPLOY_BUILD_CACHE_MAX_AGE_HOURS` (168) for each builder's cache,
 //! which its daemon garbage-collects and the agent prunes after every build.
 //!
-//! Every build that runs code of the repository (Dockerfile, Compose, Railpack) runs on a rootless BuildKit daemon,
-//! never on the Engine's builder: [`BUILDKIT_IMAGE`] (pinned by digest) in an agent-owned container, without host
-//! mounts (its state is a named volume), without privileges (only `SETUID`/`SETGID` for its user namespace helpers;
-//! seccomp and AppArmor unconfined, and an unmasked /proc, which BuildKit's own sandbox needs), as an unprivileged
-//! user: build steps are root only inside a user namespace mapped to unprivileged host ids. buildx reaches it with
-//! its `remote` driver through `docker exec` (no listening socket), and the result is loaded into the Engine. The
-//! builders sit on their own network, [`BUILD_NETWORK`] (bridge `owd-build0`): build steps share the builder's
-//! network namespace, so the agent's firewall keeps builds off private ranges, cloud metadata and the host, like
-//! every `owd*` bridge, while the public internet (package registries) stays reachable. Untrusted code (pull
-//! requests from forks) builds on a second builder with its own state, so it never shares a cache (cache mounts
-//! included) with the application's own builds. Static sites are packaged on the Engine: their Dockerfile is the
-//! agent's and runs nothing from the repository.
+//! Every build (Dockerfile, Compose, Railpack, static sites) runs on a rootless BuildKit daemon, never on the
+//! Engine's builder: [`BUILDKIT_IMAGE`] (pinned by digest) in an agent-owned container, without host mounts (its
+//! state is a named volume), without privileges (only `SETUID`/`SETGID` for its user namespace helpers; seccomp and
+//! AppArmor unconfined, and an unmasked /proc, which BuildKit's own sandbox needs), as an unprivileged user: build
+//! steps are root only inside a user namespace mapped to unprivileged host ids. It listens on a unix socket in a
+//! memory-backed volume of its own ([`Builder::socket_volume`]), mounted only into the builder and the build helpers
+//! that use it (which join the socket's group, the image's unprivileged user's); buildx reaches it with its `remote`
+//! driver. The builders and build helpers sit on their own network, [`BUILD_NETWORK`] (bridge [`BUILD_BRIDGE`]),
+//! which is internal: build steps share the builder's network namespace and have no way out but the build egress
+//! proxy on the same network ([`crate::egress`]), which applies the deployment's egress policy and never connects to
+//! private ranges, cloud metadata or the server. Untrusted code (pull requests from forks) builds on a second
+//! builder with its own state and socket, so it never shares a cache (cache mounts included) with the application's
+//! own builds.
+//!
+//! Every image built gets an SPDX SBOM attestation from BuildKit's generator ([`SBOM_SCANNER`], pinned by digest),
+//! which the agent sends with the deployment ([`crate::sbom`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,37 +42,56 @@ use bollard::query_parameters::{
     BuildImageOptionsBuilder, CreateContainerOptionsBuilder, DownloadFromContainerOptionsBuilder,
     UploadToContainerOptionsBuilder,
 };
-use deploy_proto::msg::{BuildPack, BuildSpec, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, Step};
+use deploy_proto::msg::{BuildEgress, BuildPack, BuildSpec, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, Step};
 use futures_util::StreamExt;
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::docker::{LABEL_HELPER, ensure_image, message, remove_container, upload};
+use crate::docker::{File, LABEL_HELPER, ensure_image, message, remove_container, upload};
 use crate::events::Events;
 use crate::exec;
 use crate::git::{self, Cloned, Repo, SECRETS_TMPFS};
+use crate::oci::{self, Expect, Loaded};
 
 const DOCKER_CLI_IMAGE: &str = "docker:29.9.3-cli";
 const RAILPACK_VERSION: &str = "0.43.0";
 /// The mise release Railpack 0.43.0 pins (core/mise/version.txt); installed where Railpack looks for it, so a
 /// build never downloads it.
 const MISE_VERSION: &str = "2026.10.14";
+/// The SBOM generator for images without an SBOM attestation (pulled ones): the release BuildKit's generator
+/// [`SBOM_SCANNER`] embeds.
+pub const SYFT_VERSION: &str = "1.51.0";
 /// BuildKit frontend that turns a Railpack plan into an image, same version as the CLI that wrote the plan.
 pub const RAILPACK_FRONTEND: &str = "ghcr.io/railwayapp/railpack-frontend:v0.43.0";
 /// Static sites are served by the router's Caddy, so a server keeps one web server image.
 pub const STATIC_SERVER_IMAGE: &str = crate::router::IMAGE;
 /// Tag of the helper image: changes with any pinned version, so an upgraded agent builds its own.
-pub const IMAGE: &str = "owd/helper:1-docker29.9.3-railpack0.43.0";
+pub const IMAGE: &str = "owd/helper:2-docker29.9.3-railpack0.43.0-syft1.51.0";
 /// Label on the helper image, so it is never mistaken for an application's.
 const LABEL_HELPER_IMAGE: &str = "dev.openwaf.deploy.helper-image";
-/// The Engine's socket on the server, given to the helper.
-const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 /// The rootless BuildKit daemon of every build, pinned by digest (the multi-platform index of the tag).
 pub const BUILDKIT_IMAGE: &str =
     "moby/buildkit:v0.34.2-rootless@sha256:c8252268760e1baba80780d63d738ef9f260fb7c7c0973c78494cb9ddd99eda1";
-/// Network of the builders; build traffic leaves through its bridge, [`BUILD_BRIDGE`].
-pub const BUILD_NETWORK: &str = "owd-build";
-pub const BUILD_BRIDGE: &str = "owd-build0";
+/// BuildKit's SBOM generator for `--sbom` attestations, pinned by digest (the multi-platform index of `stable-1`).
+pub const SBOM_SCANNER: &str =
+    "docker/buildkit-syft-scanner:stable-1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315";
+/// Where a builder's socket volume is mounted, in the builder and in its build helpers.
+const BUILDKIT_SOCKET_DIR: &str = "/run/owd-buildkit";
+/// The address BuildKit listens on, in [`BUILDKIT_SOCKET_DIR`].
+const BUILDKIT_ADDR: &str = "unix:///run/owd-buildkit/buildkitd.sock";
+/// User and group ids of the rootless BuildKit image's user: the socket's owner and group (mode 0660, in a
+/// directory of mode 0750). Build helpers join the group; nothing else on the server can reach the socket.
+const BUILDKIT_ID: &str = "1000";
+/// Where builds write the OCI image layouts the agent loads, in the build helper.
+const OUT: &str = "/owd/out";
+/// Network of the builders, the build helpers and the build egress proxy: internal (no route out, no outside name
+/// resolved for its containers), so the proxy is the only way out ([`crate::egress`]). The firewall also refuses
+/// anything its bridge, [`BUILD_BRIDGE`], would forward or send to the server.
+pub const BUILD_NETWORK: &str = "owd-build-internal";
+pub const BUILD_BRIDGE: &str = "owd-buildi0";
+/// The builders' network of earlier agents (not internal), removed once no container uses it.
+const LEGACY_BUILD_NETWORK: &str = "owd-build";
 /// Label on a builder container: its configuration revision (a builder of another revision is replaced).
 const LABEL_BUILDER: &str = "dev.openwaf.deploy.builder";
 const BUILDER_REVISION: &str = "rootless-1";
@@ -179,10 +204,10 @@ pub fn limits() -> &'static Limits {
     &LIMITS
 }
 
-/// Host configuration of a container that handles repository content without the Engine's socket (the clone,
-/// Railpack's plan, Compose's resolution): the secrets tmpfs of [`git::SCRIPT`], no capability (root in it is
-/// an ordinary user towards files it does not own, and cannot gain any privilege back through setuid binaries),
-/// and the build [`limits`].
+/// Host configuration of a container that handles repository content (the clone, Railpack's plan, Compose's
+/// resolution, builds) or images (the SBOM generator): the secrets tmpfs of [`git::SCRIPT`], no capability (root in
+/// it is an ordinary user towards files it does not own, and cannot gain any privilege back through setuid
+/// binaries), and the build [`limits`].
 pub fn source_host_config() -> HostConfig {
     let mut h = HostConfig {
         tmpfs: Some([(SECRETS_TMPFS.0.to_string(), SECRETS_TMPFS.1.to_string())].into()),
@@ -194,7 +219,8 @@ pub fn source_host_config() -> HostConfig {
     h
 }
 
-/// A rootless BuildKit builder: the container (also its buildx builder name) and its state volume.
+/// A rootless BuildKit builder: the container (also its buildx builder name), its state volume and its socket
+/// volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builder {
     /// The application's own builds.
@@ -221,30 +247,48 @@ impl Builder {
             Builder::Untrusted => "owd-buildkit-untrusted-state",
         }
     }
+
+    /// The volume holding the builder's socket: memory (tmpfs), owned by the image's user, shared with the build
+    /// helpers of this builder only.
+    pub fn socket_volume(self) -> &'static str {
+        match self {
+            Builder::Trusted => "owd-buildkit-sock",
+            Builder::Untrusted => "owd-buildkit-untrusted-sock",
+        }
+    }
 }
 
-/// Registers a builder in a helper (buildx keeps builders in the client's configuration, which dies with each
-/// helper) and waits until it answers.
+/// Registers a builder in a build helper (buildx keeps builders in the client's configuration, which dies with each
+/// helper) and waits until its daemon answers on its socket (it may have just started).
 const BUILDER_SCRIPT: &str = r#"set -eu
-docker buildx inspect "$OWD_BUILDER" >/dev/null 2>&1 || \
-  docker buildx create --name "$OWD_BUILDER" --driver remote "docker-container://$OWD_BUILDER" >/dev/null
-docker buildx inspect --bootstrap "$OWD_BUILDER" >/dev/null
+docker buildx create --name "$OWD_BUILDER" --driver remote "$OWD_ADDR" >/dev/null
+i=0
+until docker buildx inspect --bootstrap "$OWD_BUILDER" >/dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "$i" -ge 30 ]; then exec docker buildx inspect --bootstrap "$OWD_BUILDER" >/dev/null; fi
+  sleep 1
+done
 "#;
 
-/// Release assets per architecture of the Docker host: (Railpack archive, SHA-256), (mise archive, SHA-256).
-fn assets(arch: &str) -> Result<[(String, &'static str); 2], String> {
-    let (rp, rp_sum, mise, mise_sum) = match arch {
+/// Release assets per architecture of the Docker host: (Railpack archive, SHA-256), (mise archive, SHA-256), (syft
+/// archive, SHA-256).
+fn assets(arch: &str) -> Result<[(String, &'static str); 3], String> {
+    let (rp, rp_sum, mise, mise_sum, syft, syft_sum) = match arch {
         "aarch64" | "arm64" => (
             "arm64-unknown-linux-musl",
             "732ece14eb4f4676a43ebba19431f954edf7b130acb76159ef0f2ff86ac42ac9",
             "linux-arm64-musl",
             "2b661edd0ba55d4f9fac940d0e108c79893bb30642ac5b532a677b49fa7cb8b3",
+            "linux_arm64",
+            "6c0466811541ea03add5213a60a1562f0851e4c0b0ecfdee1a694a9455285900",
         ),
         "x86_64" | "amd64" => (
             "x86_64-unknown-linux-musl",
             "248a8f60f36854aabed6124113631078a802de3461660855fc4de9c26065c1fb",
             "linux-x64-musl",
             "d2ce450af6abc290d153723f790546d836428aa60f8b61d4a3d2c1dacde5d6c5",
+            "linux_amd64",
+            "2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f",
         ),
         a => return Err(format!("no build helper for the {a} architecture")),
     };
@@ -259,12 +303,19 @@ fn assets(arch: &str) -> Result<[(String, &'static str); 2], String> {
             format!("https://github.com/jdx/mise/releases/download/v{MISE_VERSION}/mise-v{MISE_VERSION}-{mise}.tar.xz"),
             mise_sum,
         ),
+        (
+            format!(
+                "https://github.com/anchore/syft/releases/download/v{SYFT_VERSION}/syft_{SYFT_VERSION}_{syft}.tar.gz"
+            ),
+            syft_sum,
+        ),
     ])
 }
 
-/// The helper image's Dockerfile: the Docker CLI image plus Railpack and mise, each checked against its SHA-256.
+/// The helper image's Dockerfile: the Docker CLI image plus Railpack, mise and syft, each checked against its
+/// SHA-256.
 fn dockerfile(arch: &str) -> Result<String, String> {
-    let [(rp, rp_sum), (mise, mise_sum)] = assets(arch)?;
+    let [(rp, rp_sum), (mise, mise_sum), (syft, syft_sum)] = assets(arch)?;
     Ok(format!(
         "FROM {DOCKER_CLI_IMAGE}\n\
          RUN set -eu; \\\n  \
@@ -276,8 +327,12 @@ fn dockerfile(arch: &str) -> Result<String, String> {
            mkdir -p /tmp/railpack/mise /tmp/mise; \\\n  \
            tar -xJf /tmp/mise.txz -C /tmp/mise; \\\n  \
            mv /tmp/mise/mise/bin/mise /tmp/railpack/mise/mise-{MISE_VERSION}; \\\n  \
-           rm -rf /tmp/railpack.tgz /tmp/mise.txz /tmp/mise; \\\n  \
-           railpack --version\n\
+           wget -q -O /tmp/syft.tgz '{syft}'; \\\n  \
+           echo '{syft_sum}  /tmp/syft.tgz' | sha256sum -c -; \\\n  \
+           tar -xzf /tmp/syft.tgz -C /usr/local/bin syft; \\\n  \
+           rm -rf /tmp/railpack.tgz /tmp/mise.txz /tmp/mise /tmp/syft.tgz; \\\n  \
+           railpack --version; \\\n  \
+           syft version\n\
          LABEL {LABEL_HELPER_IMAGE}=1\n"
     ))
 }
@@ -309,37 +364,56 @@ async fn ensure_image_built(d: &Docker, ev: &Events) -> Result<(), String> {
             return Err(format!("build helper image: {}", e.message.unwrap_or_default().trim()));
         }
     }
+    // Helper images of earlier agents go (one still used by a helper stays until the next build).
+    let filters = HashMap::from([("label".to_string(), vec![LABEL_HELPER_IMAGE.to_string()])]);
+    let opts = bollard::query_parameters::ListImagesOptionsBuilder::default().filters(&filters).build();
+    for i in d.list_images(Some(opts)).await.unwrap_or_default() {
+        if !i.repo_tags.iter().any(|t| t == IMAGE) {
+            let _ = d.remove_image(&i.id, None::<bollard::query_parameters::RemoveImageOptions>, None).await;
+        }
+    }
     Ok(())
 }
 
-/// What a helper container is for. Both run the helper image without capabilities, `no-new-privileges` and the build
-/// [`limits`]; only the second holds the Engine's socket.
+/// What a helper container is for. Each runs the helper image without capabilities, `no-new-privileges` and the
+/// build [`limits`]; none has the Engine's socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Repository content: the clone, Railpack's plan, Compose's resolution. No Engine socket.
+    /// Repository content: the clone, Railpack's plan, Compose's resolution; registry lookups of SBOM attestations.
+    /// On Docker's default bridge (Git servers may be private ones the build network would refuse).
     Source,
-    /// `docker buildx` and `docker compose` against the builders and the Engine, on what a source container
-    /// produced. Never clones.
-    Docker,
+    /// `docker buildx` against one builder, through its socket volume, on what a source helper produced. On the
+    /// build network (buildx fetches registry tokens for BuildKit, through the build egress proxy with its builder's
+    /// token, set in its environment). Never clones.
+    Build(Builder),
+    /// The SBOM generator, on an image the agent exported from the Engine. No network.
+    Scan,
 }
 
-/// The container of a helper with `role` for `resource`.
-fn helper_container(role: Role, resource: &str) -> ContainerCreateBody {
+/// The container of a helper with `role` for `resource`, with `env` (a build helper's proxy settings).
+fn helper_container(role: Role, resource: &str, env: Vec<String>) -> ContainerCreateBody {
     let mut host = source_host_config();
     host.init = Some(true);
-    if role == Role::Docker {
-        host.mounts = Some(vec![Mount {
-            typ: Some(MountType::BIND),
-            source: Some(DOCKER_SOCKET.into()),
-            target: Some(DOCKER_SOCKET.into()),
-            ..Default::default()
-        }]);
+    match role {
+        Role::Source => {}
+        Role::Build(b) => {
+            host.network_mode = Some(BUILD_NETWORK.into());
+            host.mounts = Some(vec![Mount {
+                typ: Some(MountType::VOLUME),
+                source: Some(b.socket_volume().into()),
+                target: Some(BUILDKIT_SOCKET_DIR.into()),
+                ..Default::default()
+            }]);
+            host.group_add = Some(vec![BUILDKIT_ID.into()]);
+        }
+        Role::Scan => host.network_mode = Some("none".into()),
     }
     ContainerCreateBody {
         image: Some(IMAGE.into()),
+        env: (!env.is_empty()).then_some(env),
         // Idle until removed; each step is an exec. `sleep` outlives any build (24 h).
         entrypoint: Some(vec!["sleep".into(), "86400".into()]),
-        // The same label for both roles: `git::remove_leftover_helpers` finds them all.
+        // The same label for every role: `git::remove_leftover_helpers` finds them all.
         labels: Some(HashMap::from([(LABEL_HELPER.to_string(), resource.to_string())])),
         host_config: Some(host),
         ..Default::default()
@@ -354,24 +428,56 @@ pub struct Helper {
 }
 
 impl Helper {
-    /// The helper with the Engine's socket.
-    pub async fn start(d: &Docker, resource: &str, ev: &Events) -> Result<Helper, String> {
-        Helper::create(d, resource, Role::Docker, ev).await
+    /// A build helper for builder `b`: the build egress proxy and the builder are made usable first
+    /// ([`crate::egress::ensure_proxy`], [`ensure_builder`]), the builder's own token registered with the proxy, then
+    /// buildx in the helper knows the builder.
+    pub async fn build(
+        d: &Docker,
+        resource: &str,
+        b: Builder,
+        ev: &Events,
+        cancel: &CancellationToken,
+    ) -> Result<Helper, String> {
+        crate::egress::ensure_proxy(d, ev).await?;
+        let token = ensure_builder(d, b, ev).await?;
+        crate::egress::register_builder(d, b.name(), &token).await?;
+        let proxy = crate::egress::env(&crate::egress::url(&token, crate::egress::CONTAINER));
+        let h = Helper::create(d, resource, Role::Build(b), proxy, ev).await?;
+        let env = vec![format!("OWD_BUILDER={}", b.name()), format!("OWD_ADDR={BUILDKIT_ADDR}")];
+        match h.sh(BUILDER_SCRIPT, env, ev, cancel, &mut |_, _| true).await {
+            Ok(0) => Ok(h),
+            r => {
+                h.remove().await;
+                Err(match r {
+                    Ok(code) => format!("the BuildKit builder {} does not answer (exit code {code})", b.name()),
+                    Err(e) => e,
+                })
+            }
+        }
     }
 
-    /// A helper for repository content, without the Engine's socket.
+    /// A helper for repository content.
     pub async fn source(d: &Docker, resource: &str, ev: &Events) -> Result<Helper, String> {
-        Helper::create(d, resource, Role::Source, ev).await
+        Helper::create(d, resource, Role::Source, Vec::new(), ev).await
     }
 
-    async fn create(d: &Docker, resource: &str, role: Role, ev: &Events) -> Result<Helper, String> {
+    /// A helper for the SBOM generator, without network.
+    pub async fn scan(d: &Docker, resource: &str, ev: &Events) -> Result<Helper, String> {
+        Helper::create(d, resource, Role::Scan, Vec::new(), ev).await
+    }
+
+    async fn create(d: &Docker, resource: &str, role: Role, env: Vec<String>, ev: &Events) -> Result<Helper, String> {
         ensure_image_built(d, ev).await?;
         let what = match role {
             Role::Source => "source helper",
-            Role::Docker => "build helper",
+            Role::Build(_) => "build helper",
+            Role::Scan => "SBOM helper",
         };
         let created = d
-            .create_container(Some(CreateContainerOptionsBuilder::default().build()), helper_container(role, resource))
+            .create_container(
+                Some(CreateContainerOptionsBuilder::default().build()),
+                helper_container(role, resource, env),
+            )
             .await
             .map_err(|e| format!("create the {what}: {}", message(&e)))?;
         let h = Helper { id: created.id, role, d: d.clone() };
@@ -402,15 +508,17 @@ impl Helper {
     }
 
     /// Runs a command and returns its standard output (at most `cap` bytes); standard error goes to the log.
+    /// `stdin`, when given, is written to the command, then closed and wiped (see [`exec::start`]).
     pub async fn output(
         &self,
         cmd: Vec<String>,
         env: Vec<String>,
+        stdin: Option<Vec<u8>>,
         cap: usize,
         ev: &Events,
         cancel: &CancellationToken,
     ) -> Result<(i64, Vec<u8>), String> {
-        let mut r = exec::start(&self.d, &self.id, cmd, env, None).await?;
+        let mut r = exec::start(&self.d, &self.id, cmd, env, stdin).await?;
         let mut out = Vec::new();
         let mut err = crate::events::Lines::default();
         loop {
@@ -441,10 +549,10 @@ impl Helper {
     }
 
     /// Clones the repository into /src (the clone script of [`git::SCRIPT`], secrets through stdin). Only in a
-    /// source helper: repository content never meets the Engine's socket before the agent has checked it.
+    /// source helper: repository content reaches a build helper only through the agent's copy.
     pub async fn clone(&self, repo: &Repo<'_>, ev: &Events, cancel: &CancellationToken) -> Result<Cloned, String> {
         if self.role != Role::Source {
-            return Err("the clone runs in a source helper, never next to the Engine's socket".into());
+            return Err("the clone runs in a source helper".into());
         }
         let mut clone = git::prepare(repo)?;
         ev.system(format!("Fetching {} at {}", repo.url, repo.reference)).await;
@@ -503,53 +611,172 @@ impl Helper {
 
     /// Unpacks a build context archive into /ctx in the helper.
     async fn put_context(&self, archive: &std::path::Path) -> Result<(), String> {
+        let file = tokio::fs::File::open(archive).await.map_err(|e| format!("build context: {e}"))?;
+        let body = tokio_util::io::ReaderStream::new(file);
+        self.unpack("ctx", body, &CancellationToken::new())
+            .await
+            .map_err(|e| format!("copy the build context into the build helper: {e}"))
+    }
+
+    /// Unpacks the tar archive `archive` into the directory `/<dir>` (created here) of the helper.
+    pub async fn unpack<S, E>(&self, dir: &str, archive: S, cancel: &CancellationToken) -> Result<(), String>
+    where
+        S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
         let mut b = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Directory);
         h.set_mode(0o755);
         h.set_size(0);
-        b.append_data(&mut h, "ctx/", std::io::empty()).map_err(|e| e.to_string())?;
-        let dir = b.into_inner().map_err(|e| e.to_string())?;
+        b.append_data(&mut h, format!("{dir}/"), std::io::empty()).map_err(|e| e.to_string())?;
+        let made = b.into_inner().map_err(|e| e.to_string())?;
         let opts = |p: &str| UploadToContainerOptionsBuilder::default().path(p).build();
         self.d
-            .upload_to_container(&self.id, Some(opts("/")), bollard::body_full(dir.into()))
+            .upload_to_container(&self.id, Some(opts("/")), bollard::body_full(made.into()))
             .await
-            .map_err(|e| format!("copy into the build helper: {}", message(&e)))?;
-        let file = tokio::fs::File::open(archive).await.map_err(|e| format!("build context: {e}"))?;
-        let body = bollard::body_try_stream(tokio_util::io::ReaderStream::new(file));
-        self.d
-            .upload_to_container(&self.id, Some(opts("/ctx")), body)
-            .await
-            .map_err(|e| format!("copy the build context into the build helper: {}", message(&e)))
+            .map_err(|e| message(&e))?;
+        let body = bollard::body_try_stream(archive.map(|r| r.map_err(std::io::Error::other)));
+        let upload = self.d.upload_to_container(&self.id, Some(opts(&format!("/{dir}"))), body);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(crate::CANCELLED.into()),
+            r = upload => r.map_err(|e| message(&e)),
+        }
+    }
+
+    /// Checks and loads the image layout bake target `target` exported ([`OUT`]) as `tag` ([`oci::load`]).
+    pub async fn load(
+        &self,
+        target: &str,
+        expect: Expect<'_>,
+        tag: &str,
+        ev: &Events,
+        cancel: &CancellationToken,
+    ) -> Result<Loaded, String> {
+        let loaded = oci::load(&self.d, &self.id, &format!("{OUT}/{target}"), expect, tag, cancel).await?;
+        ev.system(format!("Checked and loaded {tag} ({})", loaded.id)).await;
+        Ok(loaded)
     }
 }
 
-/// A Dockerfile build, from the context [`git::fetch`] packed: a bake file (written into the helper, so build
-/// argument values are neither in argv nor in the environment, whatever their names) on the rootless builder,
-/// loaded into the Engine.
-const DOCKERFILE_SCRIPT: &str = r#"set -eu
+/// Runs `/owd/bake.json` in a build helper: the targets of `OWD_TARGETS` (and those they use), provenance off (an
+/// SBOM attestation is set per target by [`export`]).
+const BAKE_SCRIPT: &str = r#"set -eu
 cd /
-docker buildx bake --builder "$OWD_BUILDER" --progress plain --provenance=false -f /owd/bake.json
+docker buildx bake --builder "$OWD_BUILDER" --progress plain --provenance=false -f /owd/bake.json $OWD_TARGETS
 "#;
 
-/// The bake file of a Dockerfile build of `ctx` into `tag`.
-fn bake_file(spec: &BuildSpec, dockerfile: &str, tag: &str, resource: &str, deployment: &str) -> serde_json::Value {
-    let mut target = serde_json::json!({
+/// Makes bake target `name` export its image as an OCI image layout into [`OUT`] for the agent to load, with
+/// BuildKit's SBOM attestation when `sbom`.
+fn export(target: &mut Value, name: &str, sbom: bool) {
+    target["output"] = json!([format!("type=oci,tar=false,dest={OUT}/{name}")]);
+    target["attest"] = match sbom {
+        true => json!([format!("type=sbom,generator={SBOM_SCANNER}")]),
+        false => json!([]),
+    };
+}
+
+/// Whether a build log line names the SBOM generator in the summary of a failed step (` > … buildkit-syft-scanner
+/// …`).
+fn scanner_failed(line: &str) -> bool {
+    line.trim_start().starts_with("> ") && line.contains("buildkit-syft-scanner")
+}
+
+/// Builds `targets` of the bake file `file` on builder `b` from build helper `h`; each name of `exported` is a
+/// target whose image the agent loads afterwards ([`Helper::load`]). The file goes into the helper, so build
+/// arguments are neither in argv nor in the environment, whatever their names; `env` is the build's environment
+/// (secrets the file names). Every target gets the build egress proxy of `egress` as BuildKit's predefined proxy
+/// arguments (in place of the user's own), and the environment carries it for Railpack's secrets
+/// ([`crate::egress::Session::secret_env`]). The builder's cache is pruned afterwards ([`prune_cache`]).
+///
+/// BuildKit fails a build whose SBOM generator cannot run (its image cannot be pulled, say): such a build runs
+/// again without the attestation, so an SBOM never fails a deployment. Returns whether the attestations were made,
+/// or the build's exit code when it failed.
+#[allow(clippy::too_many_arguments)]
+pub async fn bake(
+    h: &Helper,
+    b: Builder,
+    mut file: Value,
+    targets: &[&str],
+    exported: &[&str],
+    env: Vec<String>,
+    egress: &crate::egress::Session,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<Result<bool, i64>, String> {
+    let mut env = env;
+    env.extend(egress.secret_env());
+    env.push(format!("OWD_BUILDER={}", b.name()));
+    env.push(format!("OWD_TARGETS={}", targets.join(" ")));
+    let replaced = proxy_args(&mut file, &egress.args());
+    if !replaced.is_empty() {
+        ev.system(format!(
+            "Build arguments {} are set by the agent: build steps reach the Internet through the build egress proxy",
+            replaced.join(", ")
+        ))
+        .await;
+    }
+    let mut outcome = Err(-1);
+    for sbom in [true, false] {
+        for t in exported {
+            export(&mut file["target"][*t], t, sbom);
+        }
+        let data = serde_json::to_vec(&file).expect("json");
+        h.put(&[File { path: "bake.json", data: &data, mode: 0o600 }]).await?;
+        let mut scanner = false;
+        let code = h
+            .sh(BAKE_SCRIPT, env.clone(), ev, cancel, &mut |_, l| {
+                scanner |= scanner_failed(l);
+                true
+            })
+            .await?;
+        outcome = if code == 0 { Ok(sbom) } else { Err(code) };
+        if code == 0 || !sbom || !scanner {
+            break;
+        }
+        ev.system("BuildKit could not run its SBOM generator: building again without the SBOM attestation").await;
+    }
+    prune_cache(h, b, ev, cancel).await;
+    Ok(outcome)
+}
+
+/// Sets `args` on every target of the bake file; returns the names some target had set otherwise.
+fn proxy_args(file: &mut Value, args: &[(String, String)]) -> Vec<String> {
+    let mut replaced = std::collections::BTreeSet::new();
+    if let Some(targets) = file["target"].as_object_mut() {
+        for t in targets.values_mut() {
+            if !t["args"].is_object() {
+                t["args"] = json!({});
+            }
+            let a = t["args"].as_object_mut().expect("an object");
+            for (k, v) in args {
+                if a.insert(k.clone(), v.as_str().into()).is_some_and(|old| old != v.as_str()) {
+                    replaced.insert(k.clone());
+                }
+            }
+        }
+    }
+    replaced.into_iter().collect()
+}
+
+/// The bake file of a Dockerfile build of the context in /ctx: one target, `image`.
+fn dockerfile_bake(spec: &BuildSpec, dockerfile: &str, resource: &str, deployment: &str) -> Value {
+    let mut target = json!({
         "context": "/ctx",
         "dockerfile": dockerfile,
         "args": spec.args,
         "labels": {LABEL_RESOURCE: resource, LABEL_DEPLOYMENT: deployment},
-        "tags": [tag],
         "no-cache": spec.no_cache,
-        "output": ["type=docker"],
     });
     if let Some(t) = &spec.target {
         target["target"] = t.as_str().into();
     }
-    serde_json::json!({"target": {"default": target}})
+    json!({"target": {"image": target}})
 }
 
-/// Builds the repository's Dockerfile from `ctx` into `tag` on the rootless builder ([`Builder::of`] the spec).
+/// Builds the repository's Dockerfile from `ctx` on the rootless builder ([`Builder::of`] the spec) and loads it as
+/// `tag`.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_dockerfile(
     d: &Docker,
@@ -560,23 +787,21 @@ pub async fn build_dockerfile(
     ctx: &git::Context,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
-    let h = Helper::start(d, resource, ev).await?;
+) -> Result<Loaded, String> {
+    let policy = crate::egress::policy(spec.egress.as_ref())?;
+    let builder = Builder::of(spec.untrusted);
+    let h = Helper::build(d, resource, builder, ev, cancel).await?;
     let r = async {
-        let builder = Builder::of(spec.untrusted);
-        ensure_builder(&h, builder, ev, cancel).await?;
         h.put_context(&ctx.tar).await?;
-        let bake = serde_json::to_vec(&bake_file(spec, &ctx.dockerfile, tag, resource, deployment)).expect("json");
-        h.put(&[crate::docker::File { path: "bake.json", data: &bake, mode: 0o600 }]).await?;
         ev.system(format!("Building on the rootless BuildKit builder {}", builder.name())).await;
-        let code = h
-            .sh(DOCKERFILE_SCRIPT, vec![format!("OWD_BUILDER={}", builder.name())], ev, cancel, &mut |_, _| true)
-            .await?;
-        prune_cache(&h, builder, ev, cancel).await;
-        if code != 0 {
+        let egress = crate::egress::Session::start(d, deployment, &policy, ev).await?;
+        let file = dockerfile_bake(spec, &ctx.dockerfile, resource, deployment);
+        let built = bake(&h, builder, file, &["image"], &["image"], Vec::new(), &egress, ev, cancel).await;
+        egress.finish(ev).await;
+        if let Err(code) = built? {
             return Err(format!("build failed (exit code {code})"));
         }
-        Ok(())
+        h.load("image", Expect { resource, deployment }, tag, ev, cancel).await
     }
     .await;
     h.remove().await;
@@ -584,34 +809,50 @@ pub async fn build_dockerfile(
 }
 
 /// Railpack's plan, in the source helper: detection and overrides, from the repository, written to /owd. Build
-/// variables reach Railpack as environment, never in argv.
+/// variables reach Railpack as environment, never in argv. The proxy variables are declared with a placeholder
+/// (Railpack lists every variable it is given as a secret its steps see as environment): their values, the build
+/// egress proxy's, only exist at build time ([`railpack_target`]).
 const PREPARE_SCRIPT: &str = r#"set -eu
 mkdir -p /owd
 cd "/src/$OWD_CONTEXT"
 set --
 for n in $OWD_ENV_NAMES; do set -- "$@" --env "$n"; done
+for n in $OWD_EGRESS_NAMES; do set -- "$@" --env "$n=build-egress-proxy"; done
 railpack prepare . --plan-out /owd/railpack-plan.json --info-out /owd/railpack-info.json "$@"
 "#;
 
-/// Railpack's build step, in the build helper: build the plan [`PREPARE_SCRIPT`] wrote on the rootless builder and
-/// load the image into the Engine. Build variables reach BuildKit as secrets, never in argv. Railpack's frontend
-/// ignores `--label`, so a second, metadata-only build on top of its image (on the Engine: nothing to merge or run
-/// there) adds the resource and deployment labels (image pruning and removal find an application's images by them).
-const RAILPACK_SCRIPT: &str = r#"set -eu
-cd "/src/$OWD_CONTEXT"
-set --
-for n in $OWD_ENV_NAMES; do set -- "$@" --secret "id=$n,env=$n"; done
-if [ "$OWD_NO_CACHE" = 1 ]; then set -- "$@" --no-cache; fi
-docker buildx build --builder "$OWD_BUILDER" --progress plain \
-  --build-arg "BUILDKIT_SYNTAX=$OWD_FRONTEND" \
-  --build-arg "cache-key=$OWD_CACHE_KEY" \
-  --build-arg "secrets-hash=$OWD_SECRETS_HASH" \
-  -f /owd/railpack-plan.json -t "$OWD_IMAGE-railpack" --load "$@" .
-mkdir -p /owd/empty
-printf 'FROM %s\n' "$OWD_IMAGE-railpack" | docker buildx build --progress plain \
-  --label "$OWD_LABEL_RESOURCE" --label "$OWD_LABEL_DEPLOYMENT" -t "$OWD_IMAGE" --load -f - /owd/empty
-docker image rm "$OWD_IMAGE-railpack" >/dev/null
-"#;
+/// What Railpack builds, in the build helper: the plan [`PREPARE_SCRIPT`] wrote, through Railpack's frontend
+/// (target `railpack`, kept in BuildKit). Build variables reach BuildKit as secrets from the build's environment,
+/// never in argv; so do the build egress proxy's settings ([`crate::egress::Session::secret_env`]), which stay out of
+/// the secrets hash (a new token per build would otherwise invalidate every cached step). Railpack's frontend ignores
+/// labels, so the image the agent loads is a metadata-only build on top of it (target `image`, see [`run`]), which
+/// adds the resource and deployment labels (image pruning and removal find an application's images by them).
+fn railpack_target(context: &str, vars: &BTreeMap<String, String>, resource: &str, no_cache: bool) -> Value {
+    let mut hash = Sha256::new();
+    for (k, v) in vars {
+        hash.update(k.as_bytes());
+        hash.update([0]);
+        hash.update(v.as_bytes());
+        hash.update([0]);
+    }
+    let mut secrets: Vec<String> = vars.keys().map(|n| format!("id={n},env={n}")).collect();
+    secrets.extend(crate::egress::PROXY_VARS.iter().map(|n| format!("id={n},env={}", crate::egress::SECRET_ENV_PROXY)));
+    secrets.extend(
+        crate::egress::NO_PROXY_VARS.iter().map(|n| format!("id={n},env={}", crate::egress::SECRET_ENV_NO_PROXY)),
+    );
+    json!({
+        "context": format!("/src/{context}"),
+        "dockerfile": "/owd/railpack-plan.json",
+        "args": {
+            "BUILDKIT_SYNTAX": RAILPACK_FRONTEND,
+            "cache-key": resource.to_ascii_lowercase(),
+            "secrets-hash": hex::encode(hash.finalize()),
+        },
+        "secret": secrets,
+        "no-cache": no_cache,
+        "output": ["type=cacheonly"],
+    })
+}
 
 /// Bounds a builder's cache after a build: what no build used for the maximum age, then the least recently used
 /// beyond the size cap (`--max-used-space`; `--keep-storage` is deprecated). The daemon's own garbage collection
@@ -636,7 +877,7 @@ fn prune_env(b: Builder, l: &Limits) -> Vec<String> {
 /// effort: a failure becomes a system line of the deployment, never its error; after a cancel nothing is logged.
 pub async fn prune_cache(h: &Helper, b: Builder, ev: &Events, cancel: &CancellationToken) {
     let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), PRUNE_SCRIPT.to_string()];
-    let failure = match h.output(cmd, prune_env(b, limits()), 64 * 1024, ev, cancel).await {
+    let failure = match h.output(cmd, prune_env(b, limits()), None, 64 * 1024, ev, cancel).await {
         Ok((0, _)) => return,
         Ok((code, out)) => {
             let out = String::from_utf8_lossy(&out);
@@ -649,13 +890,13 @@ pub async fn prune_cache(h: &Helper, b: Builder, ev: &Events, cancel: &Cancellat
     ev.system(format!("Could not prune the cache of the BuildKit builder {} ({failure})", b.name())).await;
 }
 
-/// Makes rootless builder `b` usable from helper `h`: its network exists, its container runs the pinned image with
-/// the current configuration, and buildx in the helper knows it. A builder of another image, revision or security
-/// options, and the privileged builder of earlier agents, are replaced, cache included; a builder with other limits
-/// or cache settings is recreated on the same cache ([`fit`]).
-pub async fn ensure_builder(h: &Helper, b: Builder, ev: &Events, cancel: &CancellationToken) -> Result<(), String> {
+/// Makes rootless builder `b` usable: its network and socket volume exist, and its container runs the pinned image
+/// with the current configuration. A builder of another image, revision or security options, and the privileged
+/// builder of earlier agents, are replaced, cache included; a builder with other limits, cache settings, daemon
+/// arguments, network or without its build egress proxy settings is recreated on the same cache ([`fit`]). Returns
+/// the builder's own token for the build egress proxy (read back from its environment, or new).
+async fn ensure_builder(d: &Docker, b: Builder, ev: &Events) -> Result<String, String> {
     let _g = BUILDER_LOCK.lock().await;
-    let d = &h.d;
     if d.inspect_container(LEGACY_CONTAINER, None).await.is_ok() {
         ev.system("Removing the privileged BuildKit builder of earlier agents").await;
         remove_container(d, LEGACY_CONTAINER).await?;
@@ -669,7 +910,7 @@ pub async fn ensure_builder(h: &Helper, b: Builder, ev: &Events, cancel: &Cancel
         Err(e) => return Err(format!("inspect {}: {}", b.name(), message(&e))),
     };
     let current = match current.map(|c| (fit(&c, &security, limits), c)) {
-        Some((Fit::Current, c)) => Some(c),
+        Some((Fit::Current(token), c)) => Some((token, c)),
         Some((Fit::Recreate, _)) => {
             ev.system(format!(
                 "Recreating the BuildKit builder {} with the current limits (its cache stays)",
@@ -687,14 +928,16 @@ pub async fn ensure_builder(h: &Helper, b: Builder, ev: &Events, cancel: &Cancel
         }
         None => None,
     };
-    let running = match current {
-        Some(c) => c.state.and_then(|s| s.running).unwrap_or(false),
+    let (token, running) = match current {
+        Some((token, c)) => (token, c.state.and_then(|s| s.running).unwrap_or(false)),
         None => {
             ensure_image(d, BUILDKIT_IMAGE, Some(ev)).await?;
             ensure_build_network(d).await?;
+            ensure_socket_volume(d, b).await?;
             ev.system(format!("Creating the rootless BuildKit builder {} (once per server)", b.name())).await;
+            let token = crate::egress::token();
             let opts = CreateContainerOptionsBuilder::default().name(b.name()).build();
-            d.create_container(Some(opts), builder_container(b, security, limits))
+            d.create_container(Some(opts), builder_container(b, security, limits, &token))
                 .await
                 .map_err(|e| format!("create the BuildKit builder {}: {}", b.name(), message(&e)))?;
             let config = limits.buildkitd_config();
@@ -708,7 +951,10 @@ pub async fn ensure_builder(h: &Helper, b: Builder, ev: &Events, cancel: &Cancel
                 remove_container(d, b.name()).await.ok();
                 return Err(format!("configure the BuildKit builder {}: {e}", b.name()));
             }
-            false
+            // The network of earlier builders goes once nothing uses it (best effort: a build helper of an earlier
+            // agent may still be on it).
+            let _ = d.remove_network(LEGACY_BUILD_NETWORK).await;
+            (token, false)
         }
     };
     if !running {
@@ -716,30 +962,60 @@ pub async fn ensure_builder(h: &Helper, b: Builder, ev: &Events, cancel: &Cancel
             .await
             .map_err(|e| format!("start the BuildKit builder {}: {}", b.name(), message(&e)))?;
     }
-    let code = h.sh(BUILDER_SCRIPT, vec![format!("OWD_BUILDER={}", b.name())], ev, cancel, &mut |_, _| true).await?;
-    if code != 0 {
-        return Err(format!("the BuildKit builder {} does not answer (exit code {code})", b.name()));
-    }
-    Ok(())
+    Ok(token)
 }
 
-/// The daemon's arguments: its configuration file ([`Limits::buildkitd_config`]), after the image's entrypoint
-/// (`rootlesskit buildkitd`).
+/// The volume of builder `b`'s socket: a tmpfs owned by the image's user and group, mode 0750 (see
+/// [`BUILDKIT_ID`]). An existing one with other options is refused rather than used.
+async fn ensure_socket_volume(d: &Docker, b: Builder) -> Result<(), String> {
+    let name = b.socket_volume();
+    let options = HashMap::from([
+        ("type".to_string(), "tmpfs".to_string()),
+        ("device".to_string(), "tmpfs".to_string()),
+        ("o".to_string(), format!("uid={BUILDKIT_ID},gid={BUILDKIT_ID},mode=0750,size=1m,nosuid,nodev,noexec")),
+    ]);
+    match d.inspect_volume(name).await {
+        Ok(v) if v.options == options => return Ok(()),
+        Ok(_) => return Err(format!("volume {name} exists with other options than the builder's socket volume")),
+        Err(e) if crate::docker::is_not_found(&e) => {}
+        Err(e) => return Err(format!("inspect volume {name}: {}", message(&e))),
+    }
+    let req = bollard::models::VolumeCreateRequest {
+        name: Some(name.into()),
+        driver: Some("local".into()),
+        driver_opts: Some(options),
+        labels: Some(HashMap::from([(LABEL_BUILDER.to_string(), "socket".to_string())])),
+        ..Default::default()
+    };
+    d.create_volume(req).await.map(|_| ()).map_err(|e| format!("create volume {name}: {}", message(&e)))
+}
+
+/// The daemon's arguments, after the image's entrypoint (`rootlesskit buildkitd`): its socket in the socket volume
+/// and its configuration file ([`Limits::buildkitd_config`]).
 fn builder_cmd() -> Vec<String> {
-    vec!["--config".into(), BUILDKITD_CONFIG.into()]
+    vec!["--addr".into(), BUILDKIT_ADDR.into(), "--config".into(), BUILDKITD_CONFIG.into()]
 }
 
 /// The container of builder `b`. Every builder gets the whole [`Limits`]: the builds running on it share them.
-fn builder_container(b: Builder, security: Vec<String>, limits: &Limits) -> ContainerCreateBody {
+/// BuildKit's own traffic (image pulls, remote contexts) goes through the build egress proxy with `token`.
+fn builder_container(b: Builder, security: Vec<String>, limits: &Limits, token: &str) -> ContainerCreateBody {
     let mut host = HostConfig {
         network_mode: Some(BUILD_NETWORK.into()),
-        // No host path: its state is a named volume.
-        mounts: Some(vec![Mount {
-            typ: Some(MountType::VOLUME),
-            source: Some(b.volume().into()),
-            target: Some(BUILDKIT_STATE.into()),
-            ..Default::default()
-        }]),
+        // No host path: its state and its socket are named volumes.
+        mounts: Some(vec![
+            Mount {
+                typ: Some(MountType::VOLUME),
+                source: Some(b.volume().into()),
+                target: Some(BUILDKIT_STATE.into()),
+                ..Default::default()
+            },
+            Mount {
+                typ: Some(MountType::VOLUME),
+                source: Some(b.socket_volume().into()),
+                target: Some(BUILDKIT_SOCKET_DIR.into()),
+                ..Default::default()
+            },
+        ]),
         // newuidmap and newgidmap (setuid) map the build's user namespace; nothing else is needed.
         cap_drop: Some(vec!["ALL".into()]),
         cap_add: Some(vec!["SETUID".into(), "SETGID".into()]),
@@ -754,6 +1030,7 @@ fn builder_container(b: Builder, security: Vec<String>, limits: &Limits) -> Cont
     ContainerCreateBody {
         image: Some(BUILDKIT_IMAGE.into()),
         cmd: Some(builder_cmd()),
+        env: Some(crate::egress::env(&crate::egress::url(token, crate::egress::CONTAINER))),
         labels: Some(HashMap::from([
             (LABEL_BUILDER.to_string(), BUILDER_REVISION.to_string()),
             (LABEL_BUILDER_SETTINGS.to_string(), limits.builder_settings()),
@@ -766,8 +1043,9 @@ fn builder_container(b: Builder, security: Vec<String>, limits: &Limits) -> Cont
 /// How an existing builder container compares with the one [`builder_container`] makes now.
 #[derive(Debug, PartialEq, Eq)]
 enum Fit {
-    Current,
-    /// Other limits or cache settings: a new container on the same cache volume.
+    /// As wanted, with its build egress proxy token.
+    Current(String),
+    /// Other limits, cache settings, network, or no proxy settings: a new container on the same cache volume.
     Recreate,
     /// Another image, revision or security options: the cache was written by another configuration and goes too.
     Replace,
@@ -782,12 +1060,17 @@ fn fit(c: &bollard::models::ContainerInspectResponse, security: &[String], limit
     {
         return Fit::Replace;
     }
-    if label(LABEL_BUILDER_SETTINGS) != Some(limits.builder_settings().as_str())
-        || config.and_then(|c| c.cmd.as_deref()) != Some(builder_cmd().as_slice())
-    {
-        return Fit::Recreate;
+    let token = config.and_then(|c| crate::egress::token_in(c.env.as_deref().unwrap_or_default()));
+    match token {
+        Some(token)
+            if label(LABEL_BUILDER_SETTINGS) == Some(limits.builder_settings().as_str())
+                && config.and_then(|c| c.cmd.as_deref()) == Some(builder_cmd().as_slice())
+                && c.host_config.as_ref().and_then(|h| h.network_mode.as_deref()) == Some(BUILD_NETWORK) =>
+        {
+            Fit::Current(token)
+        }
+        _ => Fit::Recreate,
     }
-    Fit::Current
 }
 
 async fn remove_volume(d: &Docker, name: &str) -> Result<(), String> {
@@ -798,18 +1081,20 @@ async fn remove_volume(d: &Docker, name: &str) -> Result<(), String> {
     }
 }
 
-/// The builders' network, without IPv6, its bridge named so the firewall recognizes it.
-async fn ensure_build_network(d: &Docker) -> Result<(), String> {
-    match d.inspect_network(BUILD_NETWORK, None).await {
-        Ok(_) => return Ok(()),
-        Err(e) if crate::docker::is_not_found(&e) => {}
-        Err(e) => return Err(format!("inspect network {BUILD_NETWORK}: {}", message(&e))),
+/// The network of the builders, the build helpers and the build egress proxy: internal (see [`BUILD_NETWORK`]),
+/// without IPv6, its bridge named so the firewall recognizes it. An existing one that is not internal is refused.
+pub(crate) async fn ensure_build_network(d: &Docker) -> Result<(), String> {
+    match build_network_internal(d).await? {
+        Some(true) => return Ok(()),
+        Some(false) => return Err(format!("the network {BUILD_NETWORK} exists but is not internal: remove it")),
+        None => {}
     }
     let req = bollard::models::NetworkCreateRequest {
         name: BUILD_NETWORK.into(),
         driver: Some("bridge".into()),
+        internal: Some(true),
         enable_ipv6: Some(false),
-        options: Some(HashMap::from([("com.docker.network.bridge.name".to_string(), BUILD_BRIDGE.to_string())])),
+        options: Some(HashMap::from([(crate::firewall::BRIDGE_OPTION.to_string(), BUILD_BRIDGE.to_string())])),
         labels: Some(HashMap::from([(LABEL_BUILDER.to_string(), "network".to_string())])),
         ..Default::default()
     };
@@ -820,6 +1105,15 @@ async fn ensure_build_network(d: &Docker) -> Result<(), String> {
         Err(e) => return Err(format!("create network {BUILD_NETWORK}: {}", message(&e))),
     }
     crate::firewall::guard_new_network().await
+}
+
+/// Whether the build network is internal (Docker gives its containers no route out); None when it does not exist.
+pub(crate) async fn build_network_internal(d: &Docker) -> Result<Option<bool>, String> {
+    match d.inspect_network(BUILD_NETWORK, None).await {
+        Ok(n) => Ok(Some(n.internal == Some(true))),
+        Err(e) if crate::docker::is_not_found(&e) => Ok(None),
+        Err(e) => Err(format!("inspect network {BUILD_NETWORK}: {}", message(&e))),
+    }
 }
 
 /// Security options of the builders. Rootless BuildKit sandboxes each build step in user, mount and PID namespaces
@@ -880,16 +1174,6 @@ async fn load_apparmor_profile() -> Result<(), String> {
     ))
 }
 
-/// A static site: the files of the publish directory (in the context, or in the image Railpack built) behind Caddy.
-/// With a Railpack build, the context is empty: the files come from that image, removed afterwards.
-const STATIC_SCRIPT: &str = r#"set -eu
-if [ "$OWD_NO_CACHE" = 1 ]; then set -- --no-cache; else set --; fi
-if [ -n "${OWD_BUILT:-}" ]; then ctx=/owd/empty; else ctx="/src/$OWD_CONTEXT"; fi
-docker buildx build --progress plain --label "$OWD_LABEL_RESOURCE" --label "$OWD_LABEL_DEPLOYMENT" \
-  -f /owd/static.Dockerfile -t "$OWD_IMAGE" --load "$@" "$ctx"
-if [ -n "${OWD_BUILT:-}" ]; then docker image rm "$OWD_BUILT" >/dev/null; fi
-"#;
-
 /// Names a Railpack build cannot take from the user: the helper's own variables and what its tools depend on.
 fn reserved(name: &str) -> bool {
     name.starts_with("OWD_")
@@ -898,6 +1182,11 @@ fn reserved(name: &str) -> bool {
         || name.starts_with("DOCKER_")
         || name.starts_with("MISE_")
         || ["PATH", "HOME", "HOSTNAME", "PWD", "SHELL", "USER", "IFS"].contains(&name)
+}
+
+/// The proxy variables, which the agent sets to the build egress proxy ([`crate::egress`]).
+fn egress_name(name: &str) -> bool {
+    crate::egress::PROXY_VARS.contains(&name) || crate::egress::NO_PROXY_VARS.contains(&name)
 }
 
 fn env_name_ok(n: &str) -> bool {
@@ -914,12 +1203,12 @@ pub fn caddyfile(spa: bool) -> String {
     )
 }
 
-/// The static site's Dockerfile. Without a build, `site` is a directory of the context; with one, of the image
-/// Railpack built (its application lives in /app).
-pub fn static_dockerfile(site: &str, built: Option<&str>, spa: bool) -> String {
+/// The static site's Dockerfile. Without a build, `site` is a directory of the context; with one (`built`), of the
+/// image Railpack built (its application lives in /app), the bake target named context `railpack`.
+pub fn static_dockerfile(site: &str, built: bool, spa: bool) -> String {
     let (stage, from) = match built {
-        Some(image) => (format!("FROM {image} AS site\n"), format!("--from=site /app/{site}")),
-        None => (String::new(), site.to_string()),
+        true => ("FROM railpack AS site\n".to_string(), format!("--from=site /app/{site}")),
+        false => (String::new(), site.to_string()),
     };
     let from = from.trim_end_matches('/');
     let from = if from.is_empty() { "." } else { from };
@@ -932,6 +1221,7 @@ pub fn static_dockerfile(site: &str, built: Option<&str>, spa: bool) -> String {
 pub struct Built {
     pub commit: String,
     pub known_hosts: Vec<String>,
+    pub image: Loaded,
 }
 
 /// A Railpack or static image for `tag` from the repository.
@@ -946,9 +1236,11 @@ pub async fn build(
     ev: &Events,
     cancel: &CancellationToken,
 ) -> Result<Built, String> {
+    let policy = crate::egress::policy(spec.egress.as_ref())?;
     let context = git::inside(&spec.context, "build context")?;
     let site = git::inside(spec.publish_dir.as_deref().unwrap_or("."), "publish directory")?;
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    let mut ignored = Vec::new();
     for (k, v) in &spec.args {
         if !env_name_ok(k) || reserved(k) {
             return Err(format!("build variable {k:?} cannot be used in a Railpack build"));
@@ -956,7 +1248,18 @@ pub async fn build(
         if v.contains('\0') {
             return Err("build variable values cannot contain NUL".into());
         }
+        if egress_name(k) {
+            ignored.push(k.as_str());
+            continue;
+        }
         vars.insert(k.clone(), v.clone());
+    }
+    if !ignored.is_empty() {
+        ev.system(format!(
+            "Build variables {} are set by the agent: build steps reach the Internet through the build egress proxy",
+            ignored.join(", ")
+        ))
+        .await;
     }
     for (name, v) in [
         ("RAILPACK_INSTALL_CMD", &spec.install_command),
@@ -970,10 +1273,11 @@ pub async fn build(
             vars.insert(name.into(), v.into());
         }
     }
-    ensure_image(d, crate::router::IMAGE, Some(ev)).await?;
     let src = Helper::source(d, resource, ev).await?;
     let mut helper = None;
-    let r = run(d, &src, &mut helper, resource, deployment, tag, repo, spec, &context, &site, vars, ev, cancel).await;
+    let r =
+        run(d, &src, &mut helper, resource, deployment, tag, repo, spec, &policy, &context, &site, vars, ev, cancel)
+            .await;
     // Both go on success, failure and cancel alike.
     src.remove().await;
     if let Some(h) = helper {
@@ -982,8 +1286,8 @@ pub async fn build(
     r
 }
 
-/// Clones and plans in the source helper `src`, then copies the result into a helper with the Engine's socket
-/// (kept in `helper`, for its owner to remove) that builds it.
+/// Clones and plans in the source helper `src`, then copies the result into a build helper (kept in `helper`, for
+/// its owner to remove) that builds it, and loads the image.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     d: &Docker,
@@ -994,6 +1298,7 @@ async fn run(
     tag: &str,
     repo: Repo<'_>,
     spec: &BuildSpec,
+    policy: &BuildEgress,
     context: &str,
     site: &str,
     vars: BTreeMap<String, String>,
@@ -1003,83 +1308,70 @@ async fn run(
     let cloned = src.clone(&repo, ev, cancel).await?;
     ev.step_after_fetch(Step::Building, cloned.info()).await;
     let commit = cloned.commit.clone().unwrap_or_default();
-    let common = vec![
-        format!("OWD_CONTEXT={context}"),
-        format!("OWD_NO_CACHE={}", u8::from(spec.no_cache)),
-        format!("OWD_LABEL_RESOURCE={LABEL_RESOURCE}={resource}"),
-        format!("OWD_LABEL_DEPLOYMENT={LABEL_DEPLOYMENT}={deployment}"),
-    ];
     let railpack =
         spec.pack == BuildPack::Railpack || spec.build_command.as_deref().is_some_and(|c| !c.trim().is_empty());
-    let built = format!("{tag}-build");
     let builder = Builder::of(spec.untrusted);
-    let names = format!("OWD_ENV_NAMES={}", vars.keys().cloned().collect::<Vec<_>>().join(" "));
     if railpack {
         ev.system(format!(
             "Building with Railpack {RAILPACK_VERSION} on the rootless BuildKit builder {}",
             builder.name()
         ))
         .await;
-        let mut env = vec![format!("OWD_CONTEXT={context}"), names.clone()];
+        let names = format!("OWD_ENV_NAMES={}", vars.keys().cloned().collect::<Vec<_>>().join(" "));
+        let egress_names: Vec<&str> =
+            crate::egress::PROXY_VARS.iter().chain(&crate::egress::NO_PROXY_VARS).copied().collect();
+        let mut env =
+            vec![format!("OWD_CONTEXT={context}"), names, format!("OWD_EGRESS_NAMES={}", egress_names.join(" "))];
         env.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
         let code = src.sh(PREPARE_SCRIPT, env, ev, cancel, &mut |_, _| true).await?;
         if code != 0 {
             return Err(format!("Railpack could not plan the build (exit code {code})"));
         }
     }
-    // Only what the source helper produced reaches the helper with the Engine's socket.
-    let h = &*helper.insert(Helper::start(d, resource, ev).await?);
+    // Only what the source helper produced reaches the build helper.
+    let h = &*helper.insert(Helper::build(d, resource, builder, ev, cancel).await?);
     h.copy_from(src, "/src", cancel).await?;
     if railpack {
         h.copy_from(src, "/owd", cancel).await?;
     }
     src.remove().await;
+    let labels = json!({LABEL_RESOURCE: resource, LABEL_DEPLOYMENT: deployment});
+    let mut targets = Map::new();
+    let mut files = vec![File { path: "empty/.keep", data: b"", mode: 0o644 }];
+    let dockerfile;
     if railpack {
-        ensure_builder(h, builder, ev, cancel).await?;
-        let mut hash = Sha256::new();
-        for (k, v) in &vars {
-            hash.update(k.as_bytes());
-            hash.update([0]);
-            hash.update(v.as_bytes());
-            hash.update([0]);
-        }
-        let mut env = common.clone();
-        env.extend([
-            names,
-            format!("OWD_FRONTEND={RAILPACK_FRONTEND}"),
-            format!("OWD_BUILDER={}", builder.name()),
-            format!("OWD_CACHE_KEY={}", resource.to_ascii_lowercase()),
-            format!("OWD_SECRETS_HASH={}", hex::encode(hash.finalize())),
-            format!("OWD_IMAGE={}", if spec.pack == BuildPack::Static { &built } else { tag }),
-        ]);
-        env.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
-        let code = h.sh(RAILPACK_SCRIPT, env, ev, cancel, &mut |_, _| true).await?;
-        prune_cache(h, builder, ev, cancel).await;
-        if code != 0 {
-            return Err(format!("Railpack build failed (exit code {code})"));
-        }
+        targets.insert("railpack".into(), railpack_target(context, &vars, resource, spec.no_cache));
     }
-    if spec.pack == BuildPack::Static {
+    let mut image = if spec.pack == BuildPack::Static {
         ev.system(format!("Packaging the static site from {}", if site.is_empty() { "." } else { site })).await;
-        let dockerfile = static_dockerfile(site, railpack.then_some(built.as_str()), spec.spa);
-        h.put(&[
-            crate::docker::File { path: "static.Dockerfile", data: dockerfile.as_bytes(), mode: 0o644 },
-            // The repository's .git never ends up in the served files.
-            crate::docker::File { path: "static.Dockerfile.dockerignore", data: b".git\n", mode: 0o644 },
-            crate::docker::File { path: "empty/.keep", data: b"", mode: 0o644 },
-        ])
-        .await?;
-        let mut env = common;
-        env.push(format!("OWD_IMAGE={tag}"));
-        if railpack {
-            env.push(format!("OWD_BUILT={built}"));
-        }
-        let code = h.sh(STATIC_SCRIPT, env, ev, cancel, &mut |_, _| true).await?;
-        if code != 0 {
-            return Err(format!("static site build failed (exit code {code})"));
-        }
+        dockerfile = static_dockerfile(site, railpack, spec.spa);
+        files.push(File { path: "static.Dockerfile", data: dockerfile.as_bytes(), mode: 0o644 });
+        // The repository's .git never ends up in the served files.
+        files.push(File { path: "static.Dockerfile.dockerignore", data: b".git\n", mode: 0o644 });
+        let ctx = if railpack { "/owd/empty".to_string() } else { format!("/src/{context}") };
+        json!({"context": ctx, "dockerfile": "/owd/static.Dockerfile"})
+    } else {
+        json!({"context": "/owd/empty", "dockerfile-inline": "FROM railpack\n"})
+    };
+    image["labels"] = labels;
+    image["no-cache"] = spec.no_cache.into();
+    if railpack {
+        image["contexts"] = json!({"railpack": "target:railpack"});
     }
-    Ok(Built { commit, known_hosts: cloned.known_hosts })
+    targets.insert("image".into(), image);
+    h.put(&files).await?;
+    let env = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let egress = crate::egress::Session::start(d, deployment, policy, ev).await?;
+    let built = bake(h, builder, json!({"target": targets}), &["image"], &["image"], env, &egress, ev, cancel).await;
+    egress.finish(ev).await;
+    if let Err(code) = built? {
+        return Err(match railpack {
+            true => format!("Railpack build failed (exit code {code})"),
+            false => format!("static site build failed (exit code {code})"),
+        });
+    }
+    let image = h.load("image", Expect { resource, deployment }, tag, ev, cancel).await?;
+    Ok(Built { commit, known_hosts: cloned.known_hosts, image })
 }
 
 #[cfg(test)]
@@ -1096,17 +1388,20 @@ mod tests {
         let x86 = dockerfile("x86_64").unwrap();
         assert!(x86.contains("mise-v2026.10.14-linux-x64-musl.tar.xz"));
         assert!(x86.contains("d2ce450af6abc290d153723f790546d836428aa60f8b61d4a3d2c1dacde5d6c5  /tmp/mise.txz"));
+        assert!(arm.contains("syft_1.51.0_linux_arm64.tar.gz"));
+        assert!(arm.contains("6c0466811541ea03add5213a60a1562f0851e4c0b0ecfdee1a694a9455285900  /tmp/syft.tgz"));
+        assert!(x86.contains("2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f  /tmp/syft.tgz"));
         assert!(dockerfile("riscv64").is_err());
     }
 
     #[test]
     fn static_sites_copy_the_publish_directory() {
-        let plain = static_dockerfile("", None, false);
+        let plain = static_dockerfile("", false, false);
         assert!(plain.starts_with(&format!("FROM {STATIC_SERVER_IMAGE}\n")));
         assert!(plain.ends_with("COPY ./ /srv/\n"), "{plain}");
         assert!(!plain.contains("try_files"));
-        let built = static_dockerfile("dist", Some("owd/app_1:dep_1-build"), true);
-        assert!(built.starts_with("FROM owd/app_1:dep_1-build AS site\n"), "{built}");
+        let built = static_dockerfile("dist", true, true);
+        assert!(built.starts_with("FROM railpack AS site\n"), "{built}");
         assert!(built.ends_with("COPY --from=site /app/dist/ /srv/\n"), "{built}");
         assert!(built.contains("try_files {path} {path}/ /index.html"));
         assert!(caddyfile(false).contains(":{$PORT:80} {"));
@@ -1122,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_builds_take_any_argument_name_from_the_bake_file() {
+    fn dockerfile_builds_take_any_argument_name_from_the_bake_file_and_export_a_layout_with_its_sbom() {
         let spec = BuildSpec {
             context: ".".into(),
             dockerfile: "docker/Dockerfile".into(),
@@ -1136,18 +1431,80 @@ mod tests {
             publish_dir: None,
             spa: false,
             untrusted: false,
+            egress: None,
         };
-        let b = bake_file(&spec, "docker/Dockerfile", "owd/app_1:dep_1", "app_1", "dep_1");
-        let t = &b["target"]["default"];
-        assert_eq!(t["args"], serde_json::json!({"PATH": "/x", "TOKEN": "v"}));
+        let mut b = dockerfile_bake(&spec, "docker/Dockerfile", "app_1", "dep_1");
+        let t = &mut b["target"]["image"];
+        assert_eq!(t["args"], json!({"PATH": "/x", "TOKEN": "v"}));
         assert_eq!(
             (t["dockerfile"].as_str(), t["target"].as_str(), t["no-cache"].as_bool()),
             (Some("docker/Dockerfile"), Some("prod"), Some(true))
         );
         assert_eq!(t["labels"][LABEL_RESOURCE], "app_1");
-        assert_eq!(t["output"], serde_json::json!(["type=docker"]));
-        let b = bake_file(&BuildSpec { target: None, ..spec }, "Dockerfile", "t", "r", "d");
-        assert!(b["target"]["default"].get("target").is_none());
+        assert!(t.get("tags").is_none(), "the build names no image: the agent tags what it loaded");
+        export(t, "image", true);
+        assert_eq!(t["output"], json!(["type=oci,tar=false,dest=/owd/out/image"]), "never into the Engine");
+        assert_eq!(t["attest"], json!([format!("type=sbom,generator={SBOM_SCANNER}")]));
+        assert!(SBOM_SCANNER.contains("@sha256:"), "the generator is pinned");
+        export(t, "image", false);
+        assert_eq!(t["attest"], json!([]));
+        let b = dockerfile_bake(&BuildSpec { target: None, ..spec }, "Dockerfile", "r", "d");
+        assert!(b["target"]["image"].get("target").is_none());
+    }
+
+    /// Every target of a bake file gets the build egress proxy as BuildKit's predefined proxy arguments, over the
+    /// user's own values (reported), with its other arguments kept.
+    #[test]
+    fn every_bake_target_gets_the_proxy_arguments() {
+        let mut file = json!({"target": {
+            "web": {"context": "/src", "args": {"HTTP_PROXY": "http://corp:3128", "TOKEN": "v"}},
+            "worker": {"context": "/src/worker"},
+            "same": {"args": {"NO_PROXY": NO_PROXY_VALUE}},
+        }});
+        let args: Vec<(String, String)> = [("HTTP_PROXY", "http://owd:t@192.0.2.2:3128"), ("NO_PROXY", NO_PROXY_VALUE)]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(proxy_args(&mut file, &args), ["HTTP_PROXY"], "only a different value counts as replaced");
+        for t in ["web", "worker", "same"] {
+            assert_eq!(file["target"][t]["args"]["HTTP_PROXY"], "http://owd:t@192.0.2.2:3128", "{t}");
+            assert_eq!(file["target"][t]["args"]["NO_PROXY"], NO_PROXY_VALUE, "{t}");
+        }
+        assert_eq!(file["target"]["web"]["args"]["TOKEN"], "v");
+    }
+
+    const NO_PROXY_VALUE: &str = crate::egress::NO_PROXY;
+
+    #[test]
+    fn a_failed_sbom_generator_is_told_apart_from_a_failed_build() {
+        assert!(scanner_failed(
+            " > resolve image config for docker-image://docker.io/docker/buildkit-syft-scanner@sha256:1:"
+        ));
+        assert!(scanner_failed(
+            " > [linux/arm64] generating sbom using docker.io/docker/buildkit-syft-scanner:stable-1:"
+        ));
+        assert!(!scanner_failed(
+            "#2 resolve image config for docker-image://docker.io/docker/buildkit-syft-scanner:stable-1"
+        ));
+        assert!(!scanner_failed(" > [2/2] RUN npm ci:"));
+    }
+
+    #[test]
+    fn railpack_builds_keep_variables_out_of_the_bake_file() {
+        let vars = BTreeMap::from([("NODE_ENV".to_string(), "production".to_string())]);
+        let t = railpack_target("web", &vars, "App_1", false);
+        assert_eq!(t["context"], "/src/web");
+        let secrets: Vec<&str> = t["secret"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        assert_eq!(secrets[0], "id=NODE_ENV,env=NODE_ENV");
+        // The proxy's settings reach the steps as secrets read from the bake's environment, never from its own
+        // proxy variables, and stay out of the secrets hash (a new token per build keeps the cache).
+        assert!(secrets.contains(&"id=HTTPS_PROXY,env=OWD_EGRESS_PROXY"));
+        assert!(secrets.contains(&"id=no_proxy,env=OWD_EGRESS_NO_PROXY"));
+        assert_eq!(secrets.len(), 7);
+        assert_eq!(t["args"]["BUILDKIT_SYNTAX"], RAILPACK_FRONTEND);
+        assert_eq!(t["args"]["cache-key"], "app_1");
+        assert!(!t.to_string().contains("production"), "values reach BuildKit as secrets only");
+        assert_eq!(t["output"], json!(["type=cacheonly"]), "only the labelled image is exported");
     }
 
     fn limits(vars: &[(&str, &str)]) -> (Limits, Vec<String>) {
@@ -1225,13 +1582,28 @@ mod tests {
     fn builders_mount_no_host_path_and_keep_only_their_namespace_capabilities() {
         let (l, _) = limits(&[("OWDEPLOY_BUILD_CPUS", "0.5")]);
         for b in [Builder::Trusted, Builder::Untrusted] {
-            let c = builder_container(b, vec!["seccomp=unconfined".into()], &l);
-            assert_eq!(c.cmd, Some(vec!["--config".to_string(), BUILDKITD_CONFIG.to_string()]));
+            let token = crate::egress::token();
+            let c = builder_container(b, vec!["seccomp=unconfined".into()], &l, &token);
+            assert_eq!(
+                crate::egress::token_in(c.env.as_deref().unwrap()),
+                Some(token),
+                "its pulls go through the proxy"
+            );
+            assert_eq!(
+                c.cmd,
+                Some(vec!["--addr".into(), BUILDKIT_ADDR.into(), "--config".into(), BUILDKITD_CONFIG.into()])
+            );
             let h = c.host_config.unwrap();
             assert!(h.binds.is_none() && h.privileged.is_none() && h.devices.is_none());
-            let mounts = h.mounts.as_ref().unwrap();
-            assert_eq!(mounts.len(), 1);
-            assert_eq!((mounts[0].typ, mounts[0].source.as_deref()), (Some(MountType::VOLUME), Some(b.volume())));
+            let mounts: Vec<_> =
+                h.mounts.iter().flatten().map(|m| (m.typ, m.source.as_deref(), m.target.as_deref())).collect();
+            assert_eq!(
+                mounts,
+                [
+                    (Some(MountType::VOLUME), Some(b.volume()), Some(BUILDKIT_STATE)),
+                    (Some(MountType::VOLUME), Some(b.socket_volume()), Some(BUILDKIT_SOCKET_DIR))
+                ]
+            );
             assert_eq!(
                 (h.cap_drop.clone().unwrap(), h.cap_add.clone().unwrap()),
                 (vec!["ALL".to_string()], vec!["SETUID".to_string(), "SETGID".to_string()])
@@ -1240,13 +1612,15 @@ mod tests {
             assert_limits(&h, &l);
         }
         assert_ne!(Builder::Trusted.volume(), Builder::Untrusted.volume(), "untrusted code never shares a cache");
+        assert_ne!(Builder::Trusted.socket_volume(), Builder::Untrusted.socket_volume());
     }
 
+    /// No helper has the Engine's socket or a host path; a build helper reaches its own builder's socket only.
     #[test]
-    fn only_the_docker_helper_gets_the_socket_and_no_helper_gets_privileges() {
+    fn no_helper_gets_the_engine_or_privileges() {
         let l = super::limits();
-        for role in [Role::Source, Role::Docker] {
-            let c = helper_container(role, "app_1");
+        for role in [Role::Source, Role::Build(Builder::Trusted), Role::Build(Builder::Untrusted), Role::Scan] {
+            let c = helper_container(role, "app_1", Vec::new());
             assert_eq!(c.labels.unwrap().get(LABEL_HELPER).map(String::as_str), Some("app_1"), "found as a leftover");
             let h = c.host_config.unwrap();
             assert!(h.binds.is_none() && h.privileged.is_none() && h.devices.is_none() && h.cap_add.is_none());
@@ -1254,10 +1628,19 @@ mod tests {
             assert_eq!(h.security_opt.as_deref(), Some(["no-new-privileges".to_string()].as_slice()));
             assert!(h.tmpfs.as_ref().unwrap().contains_key(SECRETS_TMPFS.0), "the clone's secrets stay in memory");
             assert_limits(&h, l);
-            let mounts = h.mounts.unwrap_or_default();
-            let sockets = mounts.iter().filter(|m| m.source.as_deref() == Some(DOCKER_SOCKET)).count();
-            assert_eq!(sockets, usize::from(role == Role::Docker), "{role:?}");
-            assert_eq!(mounts.len(), sockets, "{role:?}: no other mount");
+            let mounts: Vec<_> = h.mounts.iter().flatten().map(|m| (m.typ, m.source.clone())).collect();
+            match role {
+                Role::Build(b) => {
+                    assert_eq!(mounts, [(Some(MountType::VOLUME), Some(b.socket_volume().to_string()))]);
+                    assert_eq!(h.network_mode.as_deref(), Some(BUILD_NETWORK));
+                    assert_eq!(h.group_add, Some(vec![BUILDKIT_ID.to_string()]));
+                }
+                Role::Scan => {
+                    assert!(mounts.is_empty());
+                    assert_eq!(h.network_mode.as_deref(), Some("none"));
+                }
+                Role::Source => assert!(mounts.is_empty() && h.network_mode.is_none() && h.group_add.is_none()),
+            }
         }
     }
 
@@ -1270,13 +1653,15 @@ mod tests {
                 image: body.image,
                 labels: body.labels,
                 cmd: body.cmd,
+                env: body.env,
                 ..Default::default()
             }),
             host_config: body.host_config,
             ..Default::default()
         };
-        let made = |l: &Limits| inspect(builder_container(Builder::Trusted, security.clone(), l));
-        assert_eq!(fit(&made(&l), &security, &l), Fit::Current);
+        let token = crate::egress::token();
+        let made = |l: &Limits| inspect(builder_container(Builder::Trusted, security.clone(), l, &token));
+        assert_eq!(fit(&made(&l), &security, &l), Fit::Current(token.clone()), "its token is read back");
         for other in [
             limits(&[("OWDEPLOY_BUILD_CPUS", "4")]).0,
             limits(&[("OWDEPLOY_BUILD_MEMORY_MB", "8192")]).0,
@@ -1292,6 +1677,13 @@ mod tests {
         config.cmd = None;
         config.labels.as_mut().unwrap().remove(LABEL_BUILDER_SETTINGS);
         assert_eq!(fit(&earlier, &security, &l), Fit::Recreate);
+        // One of an agent before the build egress proxy: direct egress on the old network, no proxy settings.
+        let mut direct = made(&l);
+        direct.config.as_mut().unwrap().env = None;
+        assert_eq!(fit(&direct, &security, &l), Fit::Recreate);
+        let mut legacy_network = made(&l);
+        legacy_network.host_config.as_mut().unwrap().network_mode = Some(LEGACY_BUILD_NETWORK.into());
+        assert_eq!(fit(&legacy_network, &security, &l), Fit::Recreate);
 
         let mut revision = made(&l);
         revision.config.as_mut().unwrap().labels.as_mut().unwrap().insert(LABEL_BUILDER.into(), "rootless-0".into());

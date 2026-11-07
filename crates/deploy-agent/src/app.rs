@@ -126,7 +126,7 @@ pub async fn action(resource: &str, action: AppActionKind) -> Result<AppState, S
 /// Networks Compose created for the application's project (its default network and the file's own), as (id,
 /// name); one carrying the project's label without its name is refused.
 async fn compose_networks(d: &Docker, resource: &str) -> Result<Vec<(String, String)>, String> {
-    let filter = format!("{COMPOSE_PROJECT}={}", crate::compose::project(resource));
+    let filter = format!("{COMPOSE_PROJECT}={}", crate::project::project(resource));
     let opts = bollard::query_parameters::ListNetworksOptionsBuilder::default()
         .filters(&HashMap::from([("label".to_string(), vec![filter])]))
         .build();
