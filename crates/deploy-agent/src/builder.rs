@@ -731,14 +731,21 @@ struct PullWatch {
 
 impl PullWatch {
     fn feed(&mut self, line: &str) {
+        // The resolver's own error, or the summary of the failed step BuildKit prints before its final error (with
+        // registries whose token service refuses the anonymous token, such as GHCR, it is the only one naming the
+        // image: `failed to authorize: failed to fetch anonymous token: … 401 Unauthorized`).
         const MARK: &str = "failed to resolve source metadata for ";
-        if self.image.is_none()
-            && let Some(i) = line.find(MARK)
-        {
-            let rest = &line[i + MARK.len()..];
-            let image = rest.split_whitespace().next().unwrap_or_default().trim_end_matches(':');
-            if !image.is_empty() {
-                self.image = Some(image.to_string());
+        const SUMMARY: &str = "> [internal] load metadata for ";
+        if self.image.is_none() {
+            let rest = line.find(MARK).map(|i| &line[i + MARK.len()..]).or_else(|| {
+                let t = line.trim_start();
+                t.starts_with(SUMMARY).then(|| &t[SUMMARY.len()..])
+            });
+            if let Some(rest) = rest {
+                let image = rest.split_whitespace().next().unwrap_or_default().trim_end_matches(':');
+                if !image.is_empty() {
+                    self.image = Some(image.to_string());
+                }
             }
         }
         if self.image.is_some() && self.status.is_none() {
@@ -1605,6 +1612,20 @@ mod tests {
         assert!(denied.message(&[auth]).unwrap().contains("with the selected credential (403)"));
         assert!(feed(&["#5 RUN false", "ERROR: process did not complete successfully"]).message(&[]).is_none());
         assert!(feed(&["failed to resolve source metadata for ghcr.io/x:1: not found"]).message(&[]).is_none());
+        // GHCR refuses the anonymous token: the image is only named in the failed step's summary.
+        let ghcr = feed(&[
+            "#4 [internal] load metadata for ghcr.io/acme/base:3",
+            "#4 ERROR: failed to authorize: failed to fetch anonymous token: unexpected status from GET request to \
+             https://ghcr.io/token?scope=repository%3Aacme%2Fbase%3Apull&service=ghcr.io: 401 Unauthorized",
+            " > [internal] load metadata for ghcr.io/acme/base:3:",
+            "   1 | >>> FROM ghcr.io/acme/base:3",
+            "ERROR: failed to solve: failed to fetch anonymous token: unexpected status from GET request to \
+             https://ghcr.io/token?scope=repository%3Aacme%2Fbase%3Apull&service=ghcr.io: 401 Unauthorized",
+        ]);
+        assert!(ghcr.message(&[]).unwrap().starts_with("ghcr.io refused the anonymous pull of acme/base (401)"));
+        // A base image that resolved is not taken for the failing one.
+        let ok_first = feed(&["#3 [internal] load metadata for docker.io/library/node:22", "#3 DONE 0.4s"]);
+        assert!(ok_first.image.is_none());
     }
 
     #[test]
