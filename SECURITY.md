@@ -153,6 +153,17 @@ What the agent never does:
     tokens use each builder's own token: always `open` (private ranges still refused), not recorded per
     deployment. A Dockerfile can put build arguments in such a URL; the policy covers what build steps run.
   - A build step can read its own build's proxy token, which only grants its own policy, for that build.
+- Registry credentials (since `registry_auth`): the agent gets only the credentials the application selected, at most
+  one per registry, matched to images by host. It hands them to the Docker Engine with each pull (never stored in the
+  Engine or on disk) and to buildx as a Docker config written through stdin onto the build helper's secrets tmpfs
+  (`/run/owd`, memory only, mode 0700; `~/.docker/config.json` is a symlink to it), never in argv or environment. buildx
+  answers BuildKit's registry auth requests for base images from it; build steps (`RUN`) execute inside BuildKit and
+  never see the helper's files, nor get credentials as build arguments or secrets. Every bake runs with `--pull`, so a
+  build without a credential cannot reuse a private base image another build left in the shared cache. Pull requests
+  from forks get no credentials, and the agent refuses an untrusted build that carries some. Each line and error of an
+  operation holding credentials is redacted (the password, its percent-encoded form, the base64 of `username:password`,
+  `Bearer`/`Basic` values). What remains: a trusted Dockerfile chooses which base images are pulled with the
+  credentials, and redaction only catches those forms of the secret.
 - The broker runs as root and drives the Docker Engine. Its systemd unit narrows it (read-only system directories,
   hidden home directories, a private /tmp, protected kernel logs, cgroups and hostname), but anything that takes over
   the broker still controls the Docker Engine. This includes a control plane that is compromised (it signs frames)
@@ -171,18 +182,19 @@ What the agent never does:
 
 ## Controls by version
 
-| Control | 0.1.0 | 0.2.0 |
-|---|---|---|
-| Every frame signed (Ed25519), keys pinned at enrollment | yes | yes |
-| Frames bound to their connection, no protocol downgrade once protocol 2 was used | no | yes (protocol 2) |
-| Frame bodies encrypted end to end (X25519, ChaCha20-Poly1305) | no | yes (protocol 2) |
-| Network code without privileges (relay and broker) | no | new installs; `migrate-split` for earlier ones |
-| Updates signed by the update key and the offline release key, anti-downgrade | yes | yes |
-| Repository content handled without the Docker Engine | clone and analysis only | everything: no deployment container gets the Engine |
-| Images built on rootless BuildKit, checked by the agent before loading | rootless builds, loaded by a helper with the Engine | yes |
-| Compose applied from a typed plan, unmodelled fields refused | partly (`docker compose up` after checks) | yes |
-| Build egress only through the agent's proxy, with `open`, `audit` and `allowlist` policies | no (private ranges blocked, Internet open) | yes |
-| SBOM of every deployed image | no | yes |
+| Control | 0.1.0 | 0.2.0 | 0.3.0 |
+|---|---|---|---|
+| Every frame signed (Ed25519), keys pinned at enrollment | yes | yes | yes |
+| Frames bound to their connection, no protocol downgrade once protocol 2 was used | no | yes (protocol 2) | yes (protocol 2) |
+| Frame bodies encrypted end to end (X25519, ChaCha20-Poly1305) | no | yes (protocol 2) | yes (protocol 2) |
+| Network code without privileges (relay and broker) | no | new installs; `migrate-split` for earlier ones | new installs; `migrate-split` for earlier ones |
+| Updates signed by the update key and the offline release key, anti-downgrade | yes | yes | yes |
+| Repository content handled without the Docker Engine | clone and analysis only | everything: no deployment container gets the Engine | yes |
+| Images built on rootless BuildKit, checked by the agent before loading | rootless builds, loaded by a helper with the Engine | yes | yes |
+| Compose applied from a typed plan, unmodelled fields refused | partly (`docker compose up` after checks) | yes | yes |
+| Build egress only through the agent's proxy, with `open`, `audit` and `allowlist` policies | no (private ranges blocked, Internet open) | yes | yes |
+| SBOM of every deployed image | no | yes | yes |
+| Registry credentials for Compose pulls and build base images, kept from build steps, redacted from logs | image pulls only, not redacted | image pulls only, not redacted | yes |
 
 The control plane adds signed-image policies (cosign, SLSA provenance), digest pinning and a hash-chained audit log;
 they do not depend on the agent's version.

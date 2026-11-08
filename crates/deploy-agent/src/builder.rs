@@ -32,6 +32,13 @@
 //!
 //! Every image built gets an SPDX SBOM attestation from BuildKit's generator ([`SBOM_SCANNER`], pinned by digest),
 //! which the agent sends with the deployment ([`crate::sbom`]).
+//!
+//! Registry credentials a trusted build carries live in its build helper only: a Docker config on the helper's
+//! secrets tmpfs ([`git::SECRETS_TMPFS`], written through stdin by [`CONFIG_SCRIPT`]), from which buildx answers
+//! BuildKit's registry auth requests for base images. `RUN` steps execute inside BuildKit and never see the helper's
+//! file system. Every bake runs with `--pull`, so a base image is resolved against its registry, with the build's own
+//! credentials, on every build: an application without a credential cannot reuse a private image another
+//! application's build left in the shared cache. Untrusted builds never get credentials.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -42,7 +49,9 @@ use bollard::query_parameters::{
     BuildImageOptionsBuilder, CreateContainerOptionsBuilder, DownloadFromContainerOptionsBuilder,
     UploadToContainerOptionsBuilder,
 };
-use deploy_proto::msg::{BuildEgress, BuildPack, BuildSpec, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, Step};
+use deploy_proto::msg::{
+    BuildEgress, BuildPack, BuildSpec, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, RegistryAuth, Step,
+};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -270,6 +279,16 @@ until docker buildx inspect --bootstrap "$OWD_BUILDER" >/dev/null 2>&1; do
 done
 "#;
 
+/// Writes the build's Docker config (stdin) to the helper's secrets tmpfs and points buildx at it; buildx's own
+/// state stays in `~/.docker`, on the helper's disposable file system. Runs with an empty config too, so every build
+/// helper has the same layout.
+const CONFIG_SCRIPT: &str = r#"set -eu
+umask 077
+cat > /run/owd/docker-config.json
+mkdir -p "$HOME/.docker"
+ln -sf /run/owd/docker-config.json "$HOME/.docker/config.json"
+"#;
+
 /// Release assets per architecture of the Docker host: (Railpack archive, SHA-256), (mise archive, SHA-256), (syft
 /// archive, SHA-256).
 fn assets(arch: &str) -> Result<[(String, &'static str); 3], String> {
@@ -425,24 +444,43 @@ pub struct Helper {
     pub id: String,
     role: Role,
     d: Docker,
+    /// The registry credentials of a build helper's builds (failure texts match base images against them).
+    registry: Vec<RegistryAuth>,
 }
 
 impl Helper {
     /// A build helper for builder `b`: the build egress proxy and the builder are made usable first
     /// ([`crate::egress::ensure_proxy`], [`ensure_builder`]), the builder's own token registered with the proxy, then
-    /// buildx in the helper knows the builder.
+    /// buildx in the helper knows the builder and reads `registry` (keyed by host) from its Docker config.
     pub async fn build(
         d: &Docker,
         resource: &str,
         b: Builder,
+        registry: &[RegistryAuth],
         ev: &Events,
         cancel: &CancellationToken,
     ) -> Result<Helper, String> {
+        if b == Builder::Untrusted && !registry.is_empty() {
+            return Err("registry credentials are never used by an untrusted build".into());
+        }
         crate::egress::ensure_proxy(d, ev).await?;
         let token = ensure_builder(d, b, ev).await?;
         crate::egress::register_builder(d, b.name(), &token).await?;
         let proxy = crate::egress::env(&crate::egress::url(&token, crate::egress::CONTAINER));
-        let h = Helper::create(d, resource, Role::Build(b), proxy, ev).await?;
+        let mut h = Helper::create(d, resource, Role::Build(b), proxy, ev).await?;
+        h.registry = registry.to_vec();
+        let config = vec!["/bin/sh".to_string(), "-c".to_string(), CONFIG_SCRIPT.to_string()];
+        let configured = h.output(config, vec![], Some(deploy_proto::registry::docker_config(registry)), 0, ev, cancel);
+        match configured.await {
+            Ok((0, _)) => {}
+            r => {
+                h.remove().await;
+                return Err(match r {
+                    Ok((code, _)) => format!("the build helper's registry configuration failed (exit code {code})"),
+                    Err(e) => e,
+                });
+            }
+        }
         let env = vec![format!("OWD_BUILDER={}", b.name()), format!("OWD_ADDR={BUILDKIT_ADDR}")];
         match h.sh(BUILDER_SCRIPT, env, ev, cancel, &mut |_, _| true).await {
             Ok(0) => Ok(h),
@@ -480,7 +518,7 @@ impl Helper {
             )
             .await
             .map_err(|e| format!("create the {what}: {}", message(&e)))?;
-        let h = Helper { id: created.id, role, d: d.clone() };
+        let h = Helper { id: created.id, role, d: d.clone(), registry: Vec::new() };
         if let Err(e) = d.start_container(&h.id, None).await {
             h.remove().await;
             return Err(format!("start the {what}: {}", message(&e)));
@@ -661,10 +699,10 @@ impl Helper {
 }
 
 /// Runs `/owd/bake.json` in a build helper: the targets of `OWD_TARGETS` (and those they use), provenance off (an
-/// SBOM attestation is set per target by [`export`]).
+/// SBOM attestation is set per target by [`export`]), every base image resolved at its registry (`--pull`).
 const BAKE_SCRIPT: &str = r#"set -eu
 cd /
-docker buildx bake --builder "$OWD_BUILDER" --progress plain --provenance=false -f /owd/bake.json $OWD_TARGETS
+docker buildx bake --builder "$OWD_BUILDER" --progress plain --provenance=false --pull -f /owd/bake.json $OWD_TARGETS
 "#;
 
 /// Makes bake target `name` export its image as an OCI image layout into [`OUT`] for the agent to load, with
@@ -681,6 +719,49 @@ fn export(target: &mut Value, name: &str, sbom: bool) {
 /// …`).
 fn scanner_failed(line: &str) -> bool {
     line.trim_start().starts_with("> ") && line.contains("buildkit-syft-scanner")
+}
+
+/// What BuildKit's output says about a base image it could not pull: the first image it failed to resolve and the
+/// registry's status for it.
+#[derive(Debug, Default)]
+struct PullWatch {
+    image: Option<String>,
+    status: Option<u16>,
+}
+
+impl PullWatch {
+    fn feed(&mut self, line: &str) {
+        const MARK: &str = "failed to resolve source metadata for ";
+        if self.image.is_none()
+            && let Some(i) = line.find(MARK)
+        {
+            let rest = &line[i + MARK.len()..];
+            let image = rest.split_whitespace().next().unwrap_or_default().trim_end_matches(':');
+            if !image.is_empty() {
+                self.image = Some(image.to_string());
+            }
+        }
+        if self.image.is_some() && self.status.is_none() {
+            self.status = [(401, "401 Unauthorized"), (403, "403 Forbidden"), (429, "429 Too Many Requests")]
+                .into_iter()
+                .find(|(_, t)| line.contains(t))
+                .map(|(s, _)| s);
+        }
+    }
+
+    /// The agent's text for the failure, when both the image and a recognized status were seen.
+    fn message(&self, registry: &[RegistryAuth]) -> Option<String> {
+        use crate::deploy::PullFailure;
+        let image = self.image.as_deref()?;
+        let with_auth = deploy_proto::registry::matching(registry, image).is_some();
+        let class = match (self.status?, with_auth) {
+            (401, true) => PullFailure::Rejected,
+            (403, true) => PullFailure::Denied,
+            (429, _) => PullFailure::RateLimited,
+            _ => PullFailure::Anonymous,
+        };
+        Some(class.message(image, with_auth))
+    }
 }
 
 /// Builds `targets` of the bake file `file` on builder `b` from build helper `h`; each name of `exported` is a
@@ -725,12 +806,19 @@ pub async fn bake(
         let data = serde_json::to_vec(&file).expect("json");
         h.put(&[File { path: "bake.json", data: &data, mode: 0o600 }]).await?;
         let mut scanner = false;
+        let mut watch = PullWatch::default();
         let code = h
             .sh(BAKE_SCRIPT, env.clone(), ev, cancel, &mut |_, l| {
                 scanner |= scanner_failed(l);
+                watch.feed(l);
                 true
             })
             .await?;
+        if code != 0
+            && let Some(m) = watch.message(&h.registry)
+        {
+            ev.system(m).await;
+        }
         outcome = if code == 0 { Ok(sbom) } else { Err(code) };
         if code == 0 || !sbom || !scanner {
             break;
@@ -790,7 +878,7 @@ pub async fn build_dockerfile(
 ) -> Result<Loaded, String> {
     let policy = crate::egress::policy(spec.egress.as_ref())?;
     let builder = Builder::of(spec.untrusted);
-    let h = Helper::build(d, resource, builder, ev, cancel).await?;
+    let h = Helper::build(d, resource, builder, &spec.registry_auth, ev, cancel).await?;
     let r = async {
         h.put_context(&ctx.tar).await?;
         ev.system(format!("Building on the rootless BuildKit builder {}", builder.name())).await;
@@ -1329,7 +1417,7 @@ async fn run(
         }
     }
     // Only what the source helper produced reaches the build helper.
-    let h = &*helper.insert(Helper::build(d, resource, builder, ev, cancel).await?);
+    let h = &*helper.insert(Helper::build(d, resource, builder, &spec.registry_auth, ev, cancel).await?);
     h.copy_from(src, "/src", cancel).await?;
     if railpack {
         h.copy_from(src, "/owd", cancel).await?;
@@ -1432,6 +1520,7 @@ mod tests {
             spa: false,
             untrusted: false,
             egress: None,
+            registry_auth: Vec::new(),
         };
         let mut b = dockerfile_bake(&spec, "docker/Dockerfile", "app_1", "dep_1");
         let t = &mut b["target"]["image"];
@@ -1474,6 +1563,49 @@ mod tests {
     }
 
     const NO_PROXY_VALUE: &str = crate::egress::NO_PROXY;
+
+    /// Every bake re-resolves base images; the credentials reach the helper on stdin, into its secrets tmpfs, never
+    /// in argv or the helper's environment.
+    #[test]
+    fn builds_pull_and_keep_registry_credentials_on_the_secrets_tmpfs() {
+        assert!(BAKE_SCRIPT.contains(" --pull "), "{BAKE_SCRIPT}");
+        assert!(CONFIG_SCRIPT.contains(&format!("cat > {}/docker-config.json", SECRETS_TMPFS.0)));
+        assert!(CONFIG_SCRIPT.contains("umask 077"));
+        let c = helper_container(Role::Build(Builder::Trusted), "app_1", vec!["HTTPS_PROXY=http://p".into()]);
+        let all = format!("{:?}{:?}{:?}", c.env, c.cmd, c.entrypoint);
+        assert!(!all.contains("auths") && !all.contains("docker-config"), "{all}");
+    }
+
+    #[test]
+    fn buildkit_pull_failures_get_the_agents_text() {
+        let auth = RegistryAuth { server: "ghcr.io".into(), username: "u".into(), password: "secret-1".into() };
+        let feed = |lines: &[&str]| {
+            let mut w = PullWatch::default();
+            for l in lines {
+                w.feed(l);
+            }
+            w
+        };
+        let one = "ERROR: failed to solve: failed to resolve source metadata for ghcr.io/acme/base:3: unexpected \
+                   status from HEAD request to https://ghcr.io/v2/acme/base/manifests/3: 401 Unauthorized";
+        let w = feed(&[one]);
+        assert_eq!(w.image.as_deref(), Some("ghcr.io/acme/base:3"));
+        assert!(w.message(&[]).unwrap().starts_with("ghcr.io refused the anonymous pull of acme/base (401)"));
+        assert!(
+            w.message(std::slice::from_ref(&auth))
+                .unwrap()
+                .starts_with("ghcr.io rejected the selected credential (401)")
+        );
+        let split = feed(&[
+            "#3 failed to resolve source metadata for docker.io/library/x:1",
+            "#3 ERROR: 429 Too Many Requests",
+        ]);
+        assert!(split.message(&[]).unwrap().contains("anonymous Docker Hub pulls share this server's limit"));
+        let denied = feed(&["failed to resolve source metadata for ghcr.io/acme/base:3: 403 Forbidden"]);
+        assert!(denied.message(&[auth]).unwrap().contains("with the selected credential (403)"));
+        assert!(feed(&["#5 RUN false", "ERROR: process did not complete successfully"]).message(&[]).is_none());
+        assert!(feed(&["failed to resolve source metadata for ghcr.io/x:1: not found"]).message(&[]).is_none());
+    }
 
     #[test]
     fn a_failed_sbom_generator_is_told_apart_from_a_failed_build() {

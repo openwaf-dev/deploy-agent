@@ -52,7 +52,7 @@ then:
 
    ```json
    {"token": "owde_…", "public_key": "<agent public key>", "name": "web-1",
-    "hostname": "…", "os": "…", "arch": "…", "kernel": "…", "agent_version": "0.2.0+…", "protocol": 2}
+    "hostname": "…", "os": "…", "arch": "…", "kernel": "…", "agent_version": "0.3.0+…", "protocol": 2}
    ```
 
    `protocol` is the highest protocol version the agent speaks (absent: 1). The control plane holds a server enrolled
@@ -79,7 +79,8 @@ the keys it pinned here and the changes those keys sign (section 8).
 
 ## 3. Connect handshake
 
-The agent opens the WebSocket with `GET <connect_url>` (the control plane's `/v1/agent/connect`) and adds four headers.
+The agent opens the WebSocket with `GET <connect_url>` (the control plane's `/v1/agent/connect`) and adds four headers
+(the `HDR_*` constants of the `connect` module in `crates/deploy-proto/src/lib.rs`).
 They prove that it holds its key before the upgrade:
 
 | Header | Value |
@@ -323,6 +324,9 @@ stream.
 
 ## 5. Session
 
+The message structs are in `crates/deploy-proto/src/msg.rs`; the agent's session loop is in
+`crates/deploy-agent/src/session.rs`.
+
 1. In protocol 2 the agent sends `session_proof` first (section 3). Then, in both versions, it sends `hello`.
 2. The control plane sends whatever the agent needs in signed frames: `update_key`, `control_key_rotate`, commands,
    `agent_update`, `ping`.
@@ -349,12 +353,12 @@ stream.
 | `update_status` | agent → control | `version`, `sha256`, `state` (section 10), `message` |
 | `update_key` | control → agent | `public_key`, `signature` (optional; section 8) |
 | `control_key_rotate` | control → agent | `next_public_key` (section 8) |
-| `pinned_keys` | agent → control | `control`, `control_next`, `update`, `message`: the keys the agent pinned, sent after any change or refused announcement |
+| `pinned_keys` | agent → control | `control`, `control_next`, `update`, `release` (omitted when none is pinned), `message`: the keys the agent pinned, sent after any change or refused announcement |
 
 `DockerInfo` has the fields `version`, `api_version`, `containers_running`, `containers_total` and `images`.
 
 `CommitInfo` describes the commit just fetched: `sha`, and when the agent could read them `author_name`, `author_email` and `subject` (the first line of the message). Control characters are removed and the values are cut
-at 200, 320 and 300 bytes. Peers that do not know `step` on log lines or `commit` on steps ignore them.
+at 200, 320 and 300 characters (Unicode scalar values). Peers that do not know `step` on log lines or `commit` on steps ignore them.
 
 An `sbom` event carries part of the software bill of materials of an image a deployment runs (`deploy_app`,
 `deploy_compose`): an SPDX 2.3 JSON document, gzip-compressed, then base64-encoded (standard alphabet, padded), cut
@@ -391,7 +395,8 @@ are `owd-<resource lowercased>`.
 
 ## 7. Operations
 
-A `command` carries one operation, tagged by `op`. The fields of the operation sit next to `op` at the top level:
+A `command` carries one operation, tagged by `op` (the `Op` enum in `crates/deploy-proto/src/msg.rs`; the agent runs
+them in `crates/deploy-agent/src/main.rs` and `crates/deploy-agent/src/app.rs`). The fields of the operation sit next to `op` at the top level:
 
 ```json
 {"id": "cmd_01", "op": {"op": "app_status", "resource": "app_01"}}
@@ -436,16 +441,21 @@ Notes on specific operations:
 | `resource`, `deployment` | application and deployment ids (labels) |
 | `network`, `alias` | the environment's Docker network (created if missing) and the container's alias on it |
 | `source` | `{"kind": "git", "url", "reference", "auth", "ssh", "commit"}`, `{"kind": "image", "image", "auth"}` or `{"kind": "local", "image"}` |
-| `build` | `BuildSpec` (Git sources): `context`, `dockerfile`, `args`, `target`, `no_cache`, `pack` (`dockerfile`\|`railpack`\|`static`), `install_command`, `build_command`, `start_command`, `publish_dir`, `spa`, `untrusted`, `egress` (`build_egress`) |
+| `build` | `BuildSpec` (Git sources): `context`, `dockerfile`, `args`, `target`, `no_cache`, `pack` (`dockerfile`\|`railpack`\|`static`), `install_command`, `build_command`, `start_command`, `publish_dir`, `spa`, `untrusted`, `egress` (`build_egress`), `registry_auth` (`registry_auth`) |
 | `run` | `RunSpec`: `image_tag`, `env`, `port`, `publish`, `health` (`path`, `interval_secs`, `timeout_secs`, `retries`), `command`, `memory_bytes`, `cpus`, `labels`, `volumes` (`name`, `path`, `service`), `files` (`path`, `content`, `service`) |
 | `routes` | router routes applied when the new container takes over (null: one route on `run.publish`) |
 | `drain_secs` | seconds the previous container keeps serving requests in flight (default 10) |
 
 Notes on `AppDeploy` fields:
 
-- **Credentials.** `auth` for Git is a `username` and `token` pair (HTTPS). For registries it is `server`, `username`
-  and `password`. `ssh` is a deploy key: `private_key` (OpenSSH format, unencrypted) and `known_hosts` lines.
+- **Credentials.** `auth` for Git is a `username` and `token` pair (HTTPS). For registries it is a `RegistryAuth`:
+  `server`, `username` and `password`, where `server` is the key of the registry in a Docker config's `auths`: the
+  registry host (with its port, `:443` dropped, lowercase) or `https://index.docker.io/v1/` for Docker Hub (every
+  alias: `docker.io`, `index.docker.io`, `registry-1.docker.io`, `registry.hub.docker.com`, `hub.docker.com`, and
+  images without a host). `ssh` is a deploy key: `private_key` (OpenSSH format, unencrypted) and `known_hosts` lines.
   Credentials are never logged and never passed in argv. A deploy key exists only on a tmpfs of the helper container.
+- **`registry_auth`.** A list of `RegistryAuth`, at most one per registry, matched by host to each base image the
+  build pulls (`registry_auth`; omitted when empty). The agent refuses a build with `untrusted` that carries any.
 - **Host keys.** When `known_hosts` is empty, the agent uses the host keys it pins for github.com, gitlab.com and
   bitbucket.org. For any other host it trusts the key on first use and returns it in `known_hosts` so that the control
   plane can pin it.
@@ -466,8 +476,10 @@ Notes on `AppDeploy` fields:
 | `source` | `{"kind": "git", "url", "reference", "auth", "ssh", "file"}` or `{"kind": "inline", "content"}` (inline Compose files reference images only) |
 | `env` | environment for every service and for `${VAR}` interpolation |
 | `volumes`, `files` | each mounted in its `service` |
-| `labels`, `routes`, `no_cache` | as in `AppDeploy`; each route names its `service` |
+| `labels`, `no_cache` | as in `AppDeploy` |
+| `routes` | as in `AppDeploy`, but required: a list (possibly empty), never `null`; each route names its `service` |
 | `egress` | the build egress policy of the services' builds, as in `AppDeploy.build.egress` (`build_egress`) |
+| `registry_auth` | a list of `RegistryAuth` (as in `AppDeploy`), at most one per registry: each service image pull, SBOM lookup and build base image pull uses the one whose `server` matches the image's host (`registry_auth`; omitted when empty) |
 
 Compose resolves the file (`docker compose config`, without access to the Docker Engine); the agent then applies the
 resolved project itself through the Engine API, with Compose's names and labels (`com.docker.compose.project`,
@@ -607,11 +619,13 @@ If a key is lost or leaked, a root user on the server can replace the pinned key
 | `isolated_builds` | rootless BuildKit builders, `BuildSpec.untrusted`, `Source.git.commit` |
 | `sbom` | `sbom` events of `deploy_app` and `deploy_compose` |
 | `build_egress` | builds only through the build egress proxy, `BuildSpec.egress`, `ComposeDeploy.egress`, `egress` events |
+| `registry_auth` | `ComposeDeploy.registry_auth`, `BuildSpec.registry_auth`, redaction of credentials from the operation's logs and errors (agent 0.3.0) |
 
 ## 10. Self-update
 
 The control plane serves agent binaries at `GET /v1/agent/binary/{target}`, where the target is `linux-amd64` or
-`linux-arm64`. The SHA-256 of each binary is at `/v1/agent/binary/{target}.sha256`.
+`linux-arm64`. The SHA-256 of each binary is at `/v1/agent/binary/{target}.sha256`. The agent's checks are in
+`crates/deploy-agent/src/update.rs` (`consider`, `install`, `preflight`).
 
 An `agent_update` offer names one binary. Besides the frame's own signature, the offer carries a signature over the
 binary itself, under a context of its own:

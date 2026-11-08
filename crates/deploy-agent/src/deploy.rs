@@ -96,6 +96,10 @@ fn validate(d: &AppDeploy) -> Result<(), String> {
     check_env(&d.run.env)?;
     if let Some(b) = &d.build {
         crate::egress::policy(b.egress.as_ref())?;
+        // Second check after the control plane: untrusted code never gets a secret.
+        if b.untrusted && !b.registry_auth.is_empty() {
+            return Err("registry credentials are never used by an untrusted build".into());
+        }
     }
     if let Some(h) = &d.run.health
         && (!h.path.starts_with('/') || h.path.chars().any(|c| c.is_control() || c.is_whitespace()))
@@ -130,7 +134,18 @@ fn publishes(c: &ContainerSummary) -> bool {
     c.ports.iter().flatten().any(|p| p.public_port.is_some())
 }
 
+/// Runs a `DeployApp`. Its log lines and its error never carry the registry credentials it holds.
 pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Result<DeployOutput, String> {
+    if let Source::Image { auth: Some(a), .. } = &d.source {
+        ev.redact_with(std::slice::from_ref(a));
+    }
+    if let Some(b) = &d.build {
+        ev.redact_with(&b.registry_auth);
+    }
+    deploy(d, ev, cancel).await.map_err(|e| ev.scrub(&e))
+}
+
+async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Result<DeployOutput, String> {
     validate(d)?;
     let docker = crate::docker::client()?;
     let tag = &d.run.image_tag;
@@ -155,6 +170,7 @@ pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resu
                 spa: false,
                 untrusted: false,
                 egress: None,
+                registry_auth: Vec::new(),
             });
             let repo = Repo {
                 url,
@@ -341,8 +357,64 @@ fn progress_line(id: Option<&str>, status: &str) -> String {
     }
 }
 
+/// Why a registry refused a pull, as the agent can tell from the error text (Engine or BuildKit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullFailure {
+    /// 401 without a credential (or 403 without one: the registry hides private repositories from anonymous pulls).
+    Anonymous,
+    /// 401 with the credential.
+    Rejected,
+    /// 403 with the credential.
+    Denied,
+    RateLimited,
+}
+
+impl PullFailure {
+    /// The class of an Engine pull error, None when the text says nothing the agent recognizes. A 401 reads
+    /// `unauthorized` (the containerd image store), `no basic auth credentials` (the classic store, from a registry
+    /// asking for Basic credentials) or `authentication required`.
+    pub fn of_engine(text: &str, with_auth: bool) -> Option<PullFailure> {
+        let t = text.to_ascii_lowercase();
+        if t.contains("toomanyrequests") || t.contains("too many requests") {
+            Some(PullFailure::RateLimited)
+        } else if ["unauthorized", "no basic auth credentials", "authentication required"].iter().any(|s| t.contains(s))
+        {
+            Some(if with_auth { PullFailure::Rejected } else { PullFailure::Anonymous })
+        } else if t.contains("denied") || t.contains("forbidden") {
+            Some(if with_auth { PullFailure::Denied } else { PullFailure::Anonymous })
+        } else {
+            None
+        }
+    }
+
+    /// The log text for `image`, pulled with a selected credential for its host when `with_auth`.
+    pub fn message(self, image: &str, with_auth: bool) -> String {
+        let host = deploy_proto::registry::image_host(image);
+        let repo = deploy_proto::registry::image_repo(image);
+        match self {
+            PullFailure::Anonymous => format!(
+                "{host} refused the anonymous pull of {repo} (401): the application selects no credential for {host}"
+            ),
+            PullFailure::Rejected => format!(
+                "{host} rejected the selected credential (401): the username or token is wrong or expired; update it \
+                 in the organization's registry credentials"
+            ),
+            PullFailure::Denied => format!(
+                "{host} refused access to {repo} with the selected credential (403): the account cannot read this \
+                 repository"
+            ),
+            PullFailure::RateLimited if host == deploy_proto::registry::DOCKER_HUB && !with_auth => format!(
+                "{host} is rate limiting pulls (429); anonymous Docker Hub pulls share this server's limit: select a \
+                 Docker Hub credential for this application"
+            ),
+            PullFailure::RateLimited => format!("{host} is rate limiting pulls (429)"),
+        }
+    }
+}
+
 /// Pulls `image` (for `platform`, when given), its progress in the deployment's log. Returns the reference pulled
-/// (with an explicit tag).
+/// (with an explicit tag). A refusal the agent recognizes ([`PullFailure`]) is the error, after the Engine's own text
+/// as a log line.
 pub async fn pull(
     d: &Docker,
     image: &str,
@@ -363,6 +435,16 @@ pub async fn pull(
     if let Some(p) = platform {
         opts = opts.platform(p);
     }
+    let failed = async |text: String| -> Result<String, String> {
+        let text = format!("pull {reference}: {text}");
+        match PullFailure::of_engine(&text, auth.is_some()) {
+            Some(f) => {
+                ev.system(&text).await;
+                Err(ev.scrub(&f.message(image, auth.is_some())))
+            }
+            None => Err(ev.scrub(&text)),
+        }
+    };
     let mut s = d.create_image(Some(opts.build()), None, creds);
     loop {
         let item = tokio::select! {
@@ -371,9 +453,12 @@ pub async fn pull(
             i = s.next() => i,
         };
         let Some(item) = item else { break };
-        let info = item.map_err(|e| format!("pull {reference}: {}", message(&e)))?;
+        let info = match item {
+            Ok(i) => i,
+            Err(e) => return failed(message(&e)).await,
+        };
         if let Some(e) = info.error_detail {
-            return Err(format!("pull {reference}: {}", e.message.unwrap_or_default()));
+            return failed(e.message.unwrap_or_default()).await;
         }
         // Byte progress of each layer is noise in a deployment log; its state changes are not.
         if let Some(st) = info.status
@@ -622,6 +707,39 @@ mod tests {
     use deploy_proto::msg::RunSpec;
 
     use super::*;
+    #[test]
+    fn engine_pull_errors_are_classified() {
+        use PullFailure::*;
+        let unauthorized = "pull ghcr.io/acme/api:1: Head \"https://ghcr.io/v2/acme/api/manifests/1\": unauthorized";
+        assert_eq!(PullFailure::of_engine(unauthorized, false), Some(Anonymous));
+        assert_eq!(PullFailure::of_engine(unauthorized, true), Some(Rejected));
+        let denied = "pull access denied for acme/x, repository does not exist or may require 'docker login': denied";
+        assert_eq!(PullFailure::of_engine(denied, true), Some(Denied));
+        assert_eq!(PullFailure::of_engine(denied, false), Some(Anonymous));
+        assert_eq!(
+            PullFailure::of_engine("toomanyrequests: You have reached your pull rate limit", false),
+            Some(RateLimited)
+        );
+        assert_eq!(PullFailure::of_engine("manifest unknown", true), None);
+        // The classic image store, from a registry asking for Basic credentials.
+        let basic = "pull 203.0.113.50:5000/e2e/base:1: Head \"http://203.0.113.50:5000/v2/e2e/base/manifests/1\": \
+                     no basic auth credentials";
+        assert_eq!(PullFailure::of_engine(basic, false), Some(Anonymous));
+        assert_eq!(
+            Anonymous.message("ghcr.io/acme/api:1", false),
+            "ghcr.io refused the anonymous pull of acme/api (401): the application selects no credential for ghcr.io"
+        );
+        assert!(
+            Rejected.message("ghcr.io/acme/api:1", true).starts_with("ghcr.io rejected the selected credential (401)")
+        );
+        assert!(
+            Denied
+                .message("ghcr.io/acme/api:1", true)
+                .contains("refused access to acme/api with the selected credential (403)")
+        );
+        assert!(RateLimited.message("redis:7", false).ends_with("select a Docker Hub credential for this application"));
+        assert_eq!(RateLimited.message("redis:7", true), "docker.io is rate limiting pulls (429)");
+    }
 
     fn dep(network: &str, image_tag: &str, source: Source) -> AppDeploy {
         AppDeploy {
@@ -668,5 +786,35 @@ mod tests {
             let e = validate(&dep("owd-env", tag, Source::Local { image: image.into() })).unwrap_err();
             assert!(e.contains("not in the repository of app_01J"), "{image}: {e}");
         }
+    }
+
+    #[test]
+    fn an_untrusted_build_with_registry_credentials_is_refused() {
+        let git =
+            Source::Git { url: "https://x/y".into(), reference: "main".into(), auth: None, ssh: None, commit: None };
+        let mut d = dep("owd-env", "owd/app_01j:dep_01x", git);
+        let mut b = BuildSpec {
+            context: ".".into(),
+            dockerfile: "Dockerfile".into(),
+            args: Default::default(),
+            target: None,
+            no_cache: false,
+            pack: BuildPack::Dockerfile,
+            install_command: None,
+            build_command: None,
+            start_command: None,
+            publish_dir: None,
+            spa: false,
+            untrusted: false,
+            egress: None,
+            registry_auth: Vec::new(),
+        };
+        b.untrusted = true;
+        b.registry_auth = vec![RegistryAuth { server: "ghcr.io".into(), username: "u".into(), password: "p".into() }];
+        d.build = Some(b.clone());
+        assert_eq!(validate(&d).unwrap_err(), "registry credentials are never used by an untrusted build");
+        b.untrusted = false;
+        d.build = Some(b);
+        assert!(validate(&d).is_ok(), "a trusted build may use them");
     }
 }

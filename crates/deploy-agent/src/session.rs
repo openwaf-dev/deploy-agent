@@ -463,6 +463,7 @@ pub mod tests {
             routes: vec![],
             no_cache: false,
             egress: None,
+            registry_auth: Vec::new(),
         });
         r.0.insert("dep".into(), (CancellationToken::new(), blocks_update(&deploy)));
         assert!(r.busy());

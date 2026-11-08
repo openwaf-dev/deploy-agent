@@ -1,10 +1,12 @@
 //! Progress of a running command: steps and log lines, batched into `CommandEvent`s so a chatty build does not turn
-//! into one signed frame per line.
+//! into one signed frame per line. Lines and the errors a command returns are scrubbed of the registry credentials
+//! the command holds ([`Events::redact_with`]).
 
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use deploy_proto::msg::{
-    CommandEvent, CommandResult, CommitInfo, Event, LogStream, MAX_EVENT_LINES, MAX_LINE_BYTES, Step,
+    CommandEvent, CommandResult, CommitInfo, Event, LogStream, MAX_EVENT_LINES, MAX_LINE_BYTES, RegistryAuth, Step,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -30,6 +32,8 @@ enum Item {
 #[derive(Clone)]
 pub struct Events {
     tx: mpsc::Sender<Item>,
+    /// Credentials of the command, never sent in a line (shared by the clones).
+    secrets: Arc<RwLock<Vec<RegistryAuth>>>,
 }
 
 impl Events {
@@ -37,7 +41,23 @@ impl Events {
     /// it then has flushed everything, so the command's result can follow its events.
     pub fn start(id: String, out: mpsc::Sender<Outgoing>) -> (Events, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(1024);
-        (Events { tx }, tokio::spawn(batch(id, rx, out)))
+        (Events { tx, secrets: Arc::default() }, tokio::spawn(batch(id, rx, out)))
+    }
+
+    /// From now on, lines and [`Events::scrub`]bed texts never carry these credentials' secrets.
+    pub fn redact_with(&self, auths: &[RegistryAuth]) {
+        if !auths.is_empty() {
+            self.secrets.write().unwrap_or_else(PoisonError::into_inner).extend_from_slice(auths);
+        }
+    }
+
+    /// `text` without the command's credentials (`deploy_proto::registry::redact`); unchanged when it holds none.
+    pub fn scrub(&self, text: &str) -> String {
+        let secrets = self.secrets.read().unwrap_or_else(PoisonError::into_inner);
+        if secrets.is_empty() {
+            return text.to_string();
+        }
+        deploy_proto::registry::redact(text, &secrets.iter().collect::<Vec<_>>())
     }
 
     pub async fn step(&self, step: Step) {
@@ -50,7 +70,13 @@ impl Events {
     }
 
     pub async fn line(&self, stream: LogStream, line: impl Into<String>) {
-        let _ = self.tx.send(Item::Line(stream, line.into())).await;
+        let line = line.into();
+        let line = if self.secrets.read().unwrap_or_else(PoisonError::into_inner).is_empty() {
+            line
+        } else {
+            self.scrub(&line)
+        };
+        let _ = self.tx.send(Item::Line(stream, line)).await;
     }
 
     /// The agent's own message about the command.
@@ -168,6 +194,29 @@ fn decode(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credentials registered on one clone are scrubbed from the lines of every clone and from returned errors.
+    #[tokio::test]
+    async fn registry_secrets_never_leave_in_lines_or_errors() {
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (ev, done) = Events::start("c1".into(), out_tx);
+        let other = ev.clone();
+        assert_eq!(ev.scrub("basic word stays"), "basic word stays", "nothing registered: unchanged");
+        let a = RegistryAuth { server: "ghcr.io".into(), username: "bot".into(), password: "tok-12345678".into() }; // gitleaks:allow (test fixture)
+        ev.redact_with(std::slice::from_ref(&a));
+        other.line(LogStream::Stderr, "denied with tok-12345678").await;
+        other.system("Authorization: Bearer abc.def").await;
+        assert_eq!(other.scrub("pull: tok-12345678"), "pull: [redacted]");
+        drop((ev, other));
+        done.await.unwrap();
+        let mut lines = Vec::new();
+        while let Ok(Outgoing::Event(e)) = out_rx.try_recv() {
+            if let Event::Log { lines: l, .. } = e.event {
+                lines.extend(l);
+            }
+        }
+        assert_eq!(lines, ["denied with [redacted]", "Authorization: Bearer [redacted]"]);
+    }
 
     #[tokio::test]
     async fn batches_by_stream_and_size_then_flushes_before_steps() {
