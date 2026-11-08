@@ -164,7 +164,7 @@ Every release on GitHub publishes these files:
 Each release also has GitHub artifact attestations (SLSA build provenance) for the binaries and SBOMs.
 
 ```sh
-tag=v0.3.0   # the release to check
+tag=v0.3.1   # the release to check
 repo=openwaf-dev/deploy-agent
 gh release download "$tag" -R "$repo"
 
@@ -187,7 +187,7 @@ byte for byte:
 
 ```sh
 git clone https://github.com/openwaf-dev/deploy-agent && cd deploy-agent
-./verify.sh v0.3.0
+./verify.sh v0.3.1
 ```
 
 It checks the signature of `SHA256SUMS` when cosign is installed, builds the tag in a clean worktree with
