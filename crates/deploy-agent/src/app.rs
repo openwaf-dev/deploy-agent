@@ -101,6 +101,8 @@ pub async fn action(resource: &str, action: AppActionKind) -> Result<AppState, S
             for c in &list {
                 remove_container(&d, c.id.as_deref().unwrap_or_default()).await?;
             }
+            // Volumes stay (`VolumeRemove`); file mounts, written again by every deployment, go.
+            crate::volumes::remove_files(resource);
             for (id, name) in networks {
                 match d.remove_network(&id).await {
                     Ok(()) => {}

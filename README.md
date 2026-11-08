@@ -106,6 +106,28 @@ This removes the agent only. The containers, images, volumes and networks it cre
 `dev.openwaf.deploy.*` or named `owd-…`, including the `owd-router` container) and its iptables chains (`OWDEPLOY*`)
 stay until you remove them. The chains also go away at the next reboot, unless your system saves its iptables rules.
 
+## Application data
+
+An application keeps data only in its named volumes: Docker `local` volumes on this server named
+`owd-<resource lowercased>-<name>`, and `owd-<resource lowercased>_<key>` for the volumes of its Compose file. The
+agent:
+
+- never mounts a path of the server into an application. Compose bind mounts, volumes over server paths
+  (`driver_opts` with `type: none` or `bind`, `o: bind`, or a `device` starting with `/`) and `file:` secrets and
+  configs are refused. File mounts are files the agent writes under `/var/lib/owdeploy-agent/files/<resource>/` and
+  bind-mounts read-only;
+- mounts only the application's own volumes. A preview (`<resource>-pr<n>`) is a resource of its own with volumes of
+  its own, and a Compose `external` volume labelled for another resource is refused;
+- keeps volumes across deployments and `app_action` `remove`, and removes them only with `volume_remove`, which is
+  refused while the application has containers. File mounts go with the application's containers;
+- warns in the deployment's log about every anonymous volume (a path the image declares with `VOLUME` and no mount
+  at exactly that path, or a Compose mount without a source): Docker removes it with its container, so its data is
+  gone after the next deployment;
+- with `strategy: recreate`, stops the running container before the new one starts, so two containers never use
+  the same volumes at once (the default, rolling, runs them side by side until the router switches);
+- does not back up volumes. Back them up yourself, for example
+  `docker run --rm -v owd-<resource>-<name>:/data:ro busybox:1.37 tar -czf - -C /data . > backup.tgz`.
+
 ## Upgrade to separated privileges
 
 Servers installed before privilege separation run the agent as one root process (`owdeploy-agent.service` running
@@ -164,7 +186,7 @@ Every release on GitHub publishes these files:
 Each release also has GitHub artifact attestations (SLSA build provenance) for the binaries and SBOMs.
 
 ```sh
-tag=v0.3.1   # the release to check
+tag=v0.3.2   # the release to check
 repo=openwaf-dev/deploy-agent
 gh release download "$tag" -R "$repo"
 
@@ -187,7 +209,7 @@ byte for byte:
 
 ```sh
 git clone https://github.com/openwaf-dev/deploy-agent && cd deploy-agent
-./verify.sh v0.3.1
+./verify.sh v0.3.2
 ```
 
 It checks the signature of `SHA256SUMS` when cosign is installed, builds the tag in a clean worktree with

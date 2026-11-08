@@ -64,7 +64,7 @@ use deploy_proto::msg::{
     AppActionKind, AppDeploy, AppState, BuildEgress, BuildPack, BuildSpec, ComposeDeploy, ComposeOutput, ComposeSource,
     DeployOutput, EgressDecision, EgressMode, Event, ExecOutput, ExecSpec, FileMount, FirewallRules, HealthCheck,
     LABEL_ENVIRONMENT, LogStream, Op, Outcome, RegistryAuth, ResourceRoutes, Route, RouterConfig, RouterState, RunSpec,
-    Source, SshAuth, Step, VolumeMount,
+    Source, SshAuth, Step, UpdateStrategy, VolumeMount,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -141,7 +141,9 @@ async fn exec(op: Op, cancel: CancellationToken) -> Run {
         v
     });
     let (ev, batcher) = Events::start("e2e".into(), tx);
-    let outcome = crate::execute(op, &ev, &cancel).await;
+    // Boxed: a test awaiting many commands would otherwise hold each command's (large, unoptimized) future inline on
+    // the test thread's stack.
+    let outcome = Box::pin(crate::execute(op, &ev, &cancel)).await;
     drop(ev);
     batcher.await.unwrap();
     Run { outcome, events: collect.await.unwrap() }
@@ -182,6 +184,7 @@ fn app_deploy(
         // A phase-2 control plane's command: routed by `publish`.
         routes: None,
         drain_secs: Some(1),
+        strategy: None,
     }
 }
 
@@ -1751,13 +1754,198 @@ async fn volumes_survive_redeploys_and_exec_reports_exit_codes() {
     assert!(e.timed_out && e.output.contains("before"), "{e:?}");
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
 
-    // Volumes outlive the application's containers until removed explicitly (refused while containers exist).
+    // Volumes outlive the application's containers until removed explicitly (refused while containers exist); its
+    // file mounts, which may be secret, go with its containers.
     assert!(run(Op::VolumeRemove { resource: app.into(), names: None }).await.err().contains("still has containers"));
     remove_app(app).await;
+    assert!(!files.exists());
     assert_eq!(docker_cli(&["volume", "ls", "-q", "--filter", "name=owd-app_e2evol-data"]), "owd-app_e2evol-data");
     let v: serde_json::Value = run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok();
     assert_eq!(v["removed"], serde_json::json!(["owd-app_e2evol-data"]));
-    assert!(!files.exists());
+}
+
+/// The output of `cmd` run by `sh` in the current container of `resource`.
+async fn exec_in(resource: &str, cmd: &str) -> String {
+    let spec = ExecSpec {
+        resource: resource.into(),
+        service: None,
+        command: vec!["sh".into(), "-c".into(), cmd.into()],
+        timeout_secs: 10,
+    };
+    let e: ExecOutput = run(Op::Exec(spec)).await.ok();
+    assert_eq!(e.exit_code, Some(0), "{cmd}: {e:?}");
+    e.output.trim().to_string()
+}
+
+/// The volume policy (developers docs, Deploy › Volumes and data): an application's volume keeps its data across
+/// redeploys and rollbacks; an anonymous volume (an image's `VOLUME` without a mount there) does not, and the
+/// deployment's log says so; a preview and another application get volumes of their own; closing a preview removes
+/// only the preview's; removing an application keeps its volume, readable with the documented backup command, until
+/// `VolumeRemove`.
+#[tokio::test]
+async fn volume_policy_persistence_isolation_and_deletion() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let (app, preview, other) = ("app_e2evpol", "app_e2evpol-pr1", "app_e2evpol2");
+    for r in [app, preview, other] {
+        remove_app(r).await;
+        run(Op::VolumeRemove { resource: r.into(), names: None }).await.ok::<serde_json::Value>();
+    }
+    // An image declaring `VOLUME /cache`, as many database and application images declare their data directory,
+    // tagged in each resource's repository (the only one a local source may name).
+    let base = |r: &str| format!("owd/{r}:base");
+    let made = docker_cli(&["create", "busybox:1.37"]);
+    let image_id = docker_cli(&["commit", "-c", "VOLUME /cache", &made, &base(app)]);
+    docker_ok(&["rm", &made]);
+    for r in [preview, other] {
+        docker_ok(&["tag", &base(app), &base(r)]);
+    }
+    let deploy_with_data = |resource: &str, deployment: &str, image: &str, port: u16| {
+        let mut d =
+            app_deploy(resource, deployment, Source::Local { image: image.into() }, 8080, Some(port), Some("/"));
+        d.run.command = busybox_site(resource);
+        d.run.volumes = vec![VolumeMount { name: "data".into(), path: "/data".into(), service: None }];
+        Op::DeployApp(d)
+    };
+
+    let first = run(deploy_with_data(app, "dep_E2EP0001", &base(app), 28141)).await;
+    let out1: DeployOutput = first.ok();
+    let system = first.lines(Some(LogStream::System));
+    assert!(
+        system.iter().any(|l| l.starts_with("Warning: /cache is an anonymous volume: its data is deleted")),
+        "{system:?}"
+    );
+    assert!(!system.iter().any(|l| l.contains("/data is an anonymous volume")), "{system:?}");
+    exec_in(app, "echo v1 > /data/state && echo c1 > /cache/state").await;
+
+    // Redeploy: the volume keeps its data, the anonymous volume went with the previous container.
+    run(deploy_with_data(app, "dep_E2EP0002", &out1.image, 28141)).await.ok::<DeployOutput>();
+    assert_eq!(exec_in(app, "cat /data/state; cat /cache/state 2>/dev/null || echo no-cache").await, "v1\nno-cache");
+    exec_in(app, "echo v2 > /data/state").await;
+
+    // Rollback (the first deployment's image again): the image goes back, the data does not.
+    run(deploy_with_data(app, "dep_E2EP0003", &out1.image, 28141)).await.ok::<DeployOutput>();
+    assert_eq!(exec_in(app, "cat /data/state").await, "v2");
+
+    // A preview (its own resource) and another application mount volumes of the same name: their own, empty.
+    for (resource, deployment, port) in [(preview, "dep_E2EP0101", 28142), (other, "dep_E2EP0201", 28143)] {
+        run(deploy_with_data(resource, deployment, &base(resource), port)).await.ok::<DeployOutput>();
+        assert_eq!(exec_in(resource, "cat /data/state 2>/dev/null || echo empty").await, "empty", "{resource}");
+        exec_in(resource, &format!("echo {resource} > /data/state")).await;
+    }
+    assert_eq!(
+        docker_cli(&[
+            "volume",
+            "inspect",
+            "-f",
+            "{{index .Labels \"dev.openwaf.deploy.resource\"}}",
+            "owd-app_e2evpol-pr1-data"
+        ]),
+        preview
+    );
+    assert_eq!(exec_in(app, "cat /data/state").await, "v2");
+
+    // Closing the preview removes its volume, not the application's.
+    remove_app(preview).await;
+    let v: serde_json::Value = run(Op::VolumeRemove { resource: preview.into(), names: None }).await.ok();
+    assert_eq!(v["removed"], serde_json::json!(["owd-app_e2evpol-pr1-data"]));
+    assert_eq!(exec_in(app, "cat /data/state").await, "v2");
+
+    // Removing the application (DELETE without volumes=true) keeps its volume and data. The documented backup and
+    // restore commands: an archive of the volume, the volume deleted (volumes=true), created again with its labels
+    // and filled from the archive before the next deployment, which finds the data.
+    remove_app(app).await;
+    assert_eq!(docker_cli(&["volume", "ls", "-q", "--filter", "name=^owd-app_e2evpol-data$"]), "owd-app_e2evpol-data");
+    let archive = std::env::temp_dir().join("owd-e2e-vpol-data.tgz");
+    let archive = archive.to_string_lossy();
+    let backup =
+        format!("docker run --rm -v owd-app_e2evpol-data:/data:ro busybox:1.37 tar -czf - -C /data . > {archive}");
+    assert!(sh(&["sh", "-c", &backup]), "{backup}");
+    let v: serde_json::Value = run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok();
+    assert_eq!(v["removed"], serde_json::json!(["owd-app_e2evpol-data"]));
+    docker_ok(&[
+        "volume",
+        "create",
+        "--label",
+        &format!("dev.openwaf.deploy.resource={app}"),
+        "--label",
+        "dev.openwaf.deploy.volume=data",
+        "owd-app_e2evpol-data",
+    ]);
+    let restore =
+        format!("docker run --rm -i -v owd-app_e2evpol-data:/data busybox:1.37 tar -xzf - -C /data < {archive}");
+    assert!(sh(&["sh", "-c", &restore]), "{restore}");
+    let _ = std::fs::remove_file(&*archive);
+    docker_ok(&["tag", &image_id, &base(app)]);
+    run(deploy_with_data(app, "dep_E2EP0004", &base(app), 28141)).await.ok::<DeployOutput>();
+    assert_eq!(exec_in(app, "cat /data/state").await, "v2");
+    remove_app(app).await;
+    let v: serde_json::Value = run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok();
+    assert_eq!(v["removed"], serde_json::json!(["owd-app_e2evpol-data"]));
+    assert_eq!(exec_in(other, "cat /data/state").await, other, "another application's volume is untouched");
+
+    remove_app(other).await;
+    run(Op::VolumeRemove { resource: other.into(), names: None }).await.ok::<serde_json::Value>();
+    for r in [app, preview, other] {
+        let label = format!("label=dev.openwaf.deploy.resource={r}");
+        assert_eq!(docker_cli(&["volume", "ls", "-q", "--filter", &label]), "", "{r}");
+    }
+    // The applications' tags went with them; the committed image is left untagged.
+    docker_cli(&["rmi", &image_id]);
+}
+
+/// `recreate` stops the serving container before the new one starts (never two on the volume), `rolling` starts the
+/// new one first; a recreate whose new container fails starts the previous one again.
+#[tokio::test]
+async fn recreate_stops_the_previous_container_before_the_new_one_starts() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2erecreate";
+    remove_app(app).await;
+    run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok::<serde_json::Value>();
+    // Each container records its start and its stop (SIGTERM) in the volume.
+    let spec = |dep: &str, strategy: Option<UpdateStrategy>, crash: bool| {
+        let mut d = app_spec(app, dep, 8080, Some(28144));
+        let tail = if crash { "exit 3".to_string() } else { "httpd -f -p 8080 -h /www & wait".to_string() };
+        let script = format!(
+            "trap 'echo stop {dep} >> /data/log; exit 0' TERM; echo start {dep} >> /data/log; mkdir -p /www && echo \
+             {dep} > /www/index.html; {tail}"
+        );
+        d.run.command = Some(vec!["sh".into(), "-c".into(), script]);
+        d.run.volumes = vec![VolumeMount { name: "data".into(), path: "/data".into(), service: None }];
+        d.strategy = strategy;
+        Op::DeployApp(d)
+    };
+    let order = async || exec_in(app, "cat /data/log").await;
+
+    run(spec("dep_E2EC0001", None, false)).await.ok::<DeployOutput>();
+    run(spec("dep_E2EC0002", None, false)).await.ok::<DeployOutput>();
+    assert_eq!(order().await, "start dep_E2EC0001\nstart dep_E2EC0002\nstop dep_E2EC0001", "rolling: new one first");
+
+    let r = run(spec("dep_E2EC0003", Some(UpdateStrategy::Recreate), false)).await;
+    r.ok::<DeployOutput>();
+    assert!(r.log().iter().any(|l| l.starts_with("Update strategy recreate: stopping the previous container")));
+    assert!(!r.log().iter().any(|l| l.starts_with("Draining")), "{:?}", r.log());
+    assert_eq!(
+        order().await.lines().skip(3).collect::<Vec<_>>(),
+        ["stop dep_E2EC0002", "start dep_E2EC0003"],
+        "recreate: the previous one stops first"
+    );
+    assert_eq!(http("http://127.0.0.1:28144/").await.unwrap().1.trim(), "dep_E2EC0003");
+
+    // A failed recreate starts the previous container again, which serves.
+    let failed = run(spec("dep_E2EC0004", Some(UpdateStrategy::Recreate), true)).await;
+    assert!(failed.err().contains("exited with code 3"), "{}", failed.err());
+    assert!(failed.log().iter().any(|l| l == "The previous container was started again"), "{:?}", failed.log());
+    let s = status(app).await;
+    assert_eq!((s.containers.len(), s.containers[0].state.as_str()), (1, "running"), "{s:?}");
+    assert_eq!(s.containers[0].deployment.as_deref(), Some("dep_E2EC0003"));
+    assert_eq!(http("http://127.0.0.1:28144/").await.unwrap().1.trim(), "dep_E2EC0003");
+
+    remove_app(app).await;
+    run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok::<serde_json::Value>();
 }
 
 fn app_spec(resource: &str, deployment: &str, port: u16, publish: Option<u16>) -> AppDeploy {

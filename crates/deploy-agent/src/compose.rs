@@ -293,6 +293,15 @@ async fn apply(
     for s in plan.services.iter().filter(|s| s.build.is_none() && s.replicas > 0) {
         pull(d, s, deploy_proto::registry::matching(registry_auth, &s.image), ev, cancel).await?;
     }
+    for s in plan.services.iter().filter(|s| s.replicas > 0) {
+        let declared = match d.inspect_image(&s.image).await {
+            Ok(i) => i.config.and_then(|c| c.volumes).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        for path in s.anonymous_volumes(&declared) {
+            ev.system(volumes::anonymous_warning(Some(&s.name), &path)).await;
+        }
+    }
     // Every container of the project must be the application's before any changes.
     let existing = labelled(d, COMPOSE_PROJECT, &plan.project).await?;
     for c in &existing {
@@ -394,9 +403,10 @@ async fn ensure_network(d: &Docker, project: &str, n: &Network) -> Result<(), St
 }
 
 /// Creates the project volume `v` unless it exists (an existing one is used, as Compose does); external ones must
-/// exist.
-async fn ensure_volume(d: &Docker, _project: &str, v: &Volume) -> Result<(), String> {
+/// exist and not be another resource's ([`volumes::check_external`]).
+async fn ensure_volume(d: &Docker, project: &str, v: &Volume) -> Result<(), String> {
     match d.inspect_volume(&v.name).await {
+        Ok(existing) if v.external => return volumes::check_external(project, &v.name, &existing.labels),
         Ok(_) => return Ok(()),
         Err(e) if is_not_found(&e) && v.external => {
             return Err(format!("the external volume {} does not exist", v.name));

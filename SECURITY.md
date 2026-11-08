@@ -103,7 +103,7 @@ root for these tasks:
 | iptables and ip6tables, in its own chains (`OWDEPLOY*`) plus jumps in `DOCKER-USER`, `INPUT`, `FORWARD` and nat `PREROUTING`/`OUTPUT` | open application ports to the OpenWAF edge only; keep containers off private ranges, cloud metadata and the host. Your own rules are left untouched. |
 | The CSF post hook (`csfpost.sh`), only when CSF is installed | put its rules back after `csf -r` |
 | Its own binary, `/usr/local/bin/owdeploy-agent` | self-update, signed by the pinned update key, with automatic rollback. The relay downloads the binary; the broker checks and installs it |
-| `/var/lib/owdeploy-agent` (mode 0700) | its identity, its pinned keys, the last firewall and router configuration, file mounts of applications, image archives while it checks and loads them, and the SBOMs it generated |
+| `/var/lib/owdeploy-agent` (mode 0700) | its identity, its pinned keys, the last firewall and router configuration, file mounts of applications (removed with the application's containers), image archives while it checks and loads them, and the SBOMs it generated |
 
 What the agent never does:
 
@@ -114,7 +114,9 @@ What the agent never does:
 - run Compose services that are privileged or that use host namespaces, devices, extra capabilities, bind mounts of
   the server's files, security options other than `no-new-privileges`, or logging drivers that send logs from the
   server. These, and any field the agent does not model, are refused before anything is created;
-- give a container it runs for a deployment (helper, builder or application) the Docker Engine's socket.
+- give a container it runs for a deployment (helper, builder or application) the Docker Engine's socket;
+- mount into an application a path of the server (other than the read-only file mounts it writes for that
+  application) or a volume of another application or preview.
 
 ## Threat model
 

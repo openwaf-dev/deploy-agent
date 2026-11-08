@@ -1,7 +1,9 @@
 //! Volumes and file mounts of an application. Named volumes `owd-<resource>-<name>` carry the resource label and
 //! outlive deployments: they go only with `VolumeRemove`. File mounts are written by the agent under its state
 //! directory, one directory per deployment (a running container keeps the content it started with while the next
-//! deployment writes its own), and bind-mounted read-only.
+//! deployment writes its own), and bind-mounted read-only. Anything else a container writes, anonymous volumes
+//! included (an image's `VOLUME` without a mount at that path), goes with the container when the next deployment
+//! replaces it: the deployment's log says so ([`anonymous_paths`]).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -162,6 +164,14 @@ pub fn prune_files(resource: &str, keep: Option<&str>) {
     }
 }
 
+/// Removes every file mount of an application (it has no container left: `AppAction` remove, `VolumeRemove`). File
+/// contents may be secret: they do not outlive the application on the server.
+pub fn remove_files(resource: &str) {
+    if let Ok(root) = files_root(resource) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 /// Mounts of a container: its volumes and written files.
 pub fn mounts(resource: &str, volumes: &[VolumeMount], files: &[(PathBuf, &FileMount)]) -> Vec<Mount> {
     let mut m: Vec<Mount> = volumes
@@ -181,6 +191,39 @@ pub fn mounts(resource: &str, volumes: &[VolumeMount], files: &[(PathBuf, &FileM
         ..Default::default()
     }));
     m
+}
+
+/// Paths an image declares as volumes (`VOLUME`) that no mount of the container is at: Docker gives each an
+/// anonymous volume, removed with the container. A mount at a parent path does not cover a declared path (Docker
+/// still mounts an anonymous volume there, over it).
+pub fn anonymous_paths<'a>(declared: &'a [String], mounted: &[&str]) -> Vec<&'a str> {
+    let norm = |p: &str| p.trim_end_matches('/').to_string();
+    let mounted: BTreeSet<String> = mounted.iter().map(|p| norm(p)).collect();
+    let mut out: Vec<&str> = declared.iter().map(String::as_str).filter(|p| !mounted.contains(&norm(p))).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The deployment log's warning for an anonymous volume at `path` (of `service`, in a Compose application).
+pub fn anonymous_warning(service: Option<&str>, path: &str) -> String {
+    let of = service.map(|s| format!("service {s}: ")).unwrap_or_default();
+    format!(
+        "Warning: {of}{path} is an anonymous volume: its data is deleted with the container when the next deployment \
+         replaces it (mount a volume of the application at exactly {path} to keep it)"
+    )
+}
+
+/// An external volume a Compose file names (`owd-<resource>-…` or `owd-<resource>_…`, see
+/// [`crate::project`]): the application's own or one made by hand, never one labelled for another resource, such as
+/// a preview `<resource>-pr<n>`, whose volumes share the application's prefix.
+pub fn check_external(project: &str, name: &str, labels: &HashMap<String, String>) -> Result<(), String> {
+    let other = labels.get(LABEL_RESOURCE).is_some_and(|r| crate::docker::app_prefix(r) != project)
+        || labels.get(COMPOSE_PROJECT).is_some_and(|p| p != project);
+    match other {
+        true => Err(format!("the external volume {name} belongs to another application or preview: refused")),
+        false => Ok(()),
+    }
 }
 
 /// `VolumeRemove`: the application's volumes (all, or the named ones) and, with all of them, its files and its
@@ -229,10 +272,8 @@ pub async fn remove(resource: &str, names: Option<&[String]>) -> Result<Value, S
             Err(e) => return Err(format!("remove volume {name}: {}", message(&e))),
         }
     }
-    if names.is_none()
-        && let Ok(root) = files_root(resource)
-    {
-        let _ = std::fs::remove_dir_all(root);
+    if names.is_none() {
+        remove_files(resource);
     }
     removed.sort();
     Ok(json!({ "removed": removed }))
@@ -264,5 +305,31 @@ mod tests {
         assert!(validate(&[vol("data", "/d", None)], &[f("/d", None)], false).is_err(), "same target twice");
         assert!(validate(&[vol("data", "/d", None)], &[], true).is_err(), "Compose mounts name their service");
         assert!(validate(&[vol("data", "/d", Some("db"))], &[f("/d", Some("web"))], true).is_ok());
+    }
+
+    #[test]
+    fn image_volumes_without_a_mount_at_their_path_are_anonymous() {
+        let declared = vec!["/var/lib/postgresql/data".to_string(), "/cache/".to_string(), "/srv".to_string()];
+        // A mount at a parent path does not cover a declared path; a trailing slash does not matter.
+        assert_eq!(
+            anonymous_paths(&declared, &["/var/lib/postgresql", "/cache"]),
+            ["/srv", "/var/lib/postgresql/data"]
+        );
+        assert!(anonymous_paths(&declared, &["/var/lib/postgresql/data/", "/cache", "/srv"]).is_empty());
+        assert!(anonymous_warning(Some("db"), "/srv").starts_with("Warning: service db: /srv is an anonymous volume"));
+    }
+
+    #[test]
+    fn external_volumes_labelled_for_another_resource_are_refused() {
+        let labels = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let p = "owd-app_01c";
+        assert!(check_external(p, "owd-app_01c-data", &labels(&[(LABEL_RESOURCE, "app_01C")])).is_ok());
+        assert!(check_external(p, "owd-app_01c_db", &labels(&[(COMPOSE_PROJECT, p)])).is_ok());
+        assert!(check_external(p, "owd-app_01c-manual", &labels(&[])).is_ok(), "made by hand");
+        // A preview's volumes share the application's prefix.
+        assert!(check_external(p, "owd-app_01c-pr3-data", &labels(&[(LABEL_RESOURCE, "app_01C-pr3")])).is_err());
+        assert!(check_external(p, "owd-app_01c-pr3_db", &labels(&[(COMPOSE_PROJECT, "owd-app_01c-pr3")])).is_err());
     }
 }

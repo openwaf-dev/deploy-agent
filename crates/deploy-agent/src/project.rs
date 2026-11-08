@@ -250,6 +250,27 @@ impl Service {
         n
     }
 
+    /// Paths of this service kept in anonymous volumes, deleted with its containers when they are recreated: its
+    /// mounts of type `volume` without a source, and the paths its image declares (`declared`, `VOLUME`) where it has
+    /// no mount. A service with `volumes_from` may get those paths from another container: only its own mounts count.
+    pub fn anonymous_volumes(&self, declared: &[String]) -> Vec<String> {
+        let target = |m: &MountSpec| match m {
+            MountSpec::Volume { target, .. }
+            | MountSpec::Tmpfs { target, .. }
+            | MountSpec::Image { target, .. }
+            | MountSpec::AgentFile { target, .. } => target.clone(),
+        };
+        let mut out: BTreeSet<String> =
+            self.mounts.iter().filter(|m| matches!(m, MountSpec::Volume { source: None, .. })).map(target).collect();
+        if self.volumes_from.is_empty() {
+            let mut mounted: Vec<String> = self.mounts.iter().map(target).collect();
+            mounted.extend(self.tmpfs.keys().cloned());
+            let mounted: Vec<&str> = mounted.iter().map(String::as_str).collect();
+            out.extend(crate::volumes::anonymous_paths(declared, &mounted).into_iter().map(str::to_string));
+        }
+        out.into_iter().collect()
+    }
+
     /// The name of container `number` (from 1).
     pub fn container(&self, project: &str, number: u64) -> String {
         match &self.container_name {
@@ -1718,6 +1739,23 @@ mod tests {
         let a = Plan::new(model.clone(), &spec(), &[]).unwrap();
         assert_eq!(svc(&a, "web").hash(), svc(&Plan::new(model.clone(), &spec(), &[]).unwrap(), "web").hash());
         assert_ne!(svc(&a, "web").hash(), svc(&Plan::new(model, &c2, &[]).unwrap(), "web").hash());
+    }
+
+    #[test]
+    fn anonymous_volumes_are_the_unnamed_mounts_and_unmounted_image_volumes() {
+        let mut c = spec();
+        c.routes.clear();
+        let model = json!({"services": {
+            // The application's volume `data` is mounted at /data; the image's /var/lib/postgresql/data is not covered by
+            // a mount at a parent path.
+            "db": {"image": "postgres", "volumes": [{"type": "volume", "target": "/scratch"}],
+                   "tmpfs": ["/run"]},
+            "logs": {"image": "busybox", "volumes_from": ["db:ro"]},
+        }});
+        let p = Plan::new(model, &c, &[]).unwrap();
+        let declared = ["/var/lib/postgresql/data", "/data", "/run", "/scratch"].map(String::from);
+        assert_eq!(svc(&p, "db").anonymous_volumes(&declared), ["/scratch", "/var/lib/postgresql/data"]);
+        assert!(svc(&p, "logs").anonymous_volumes(&declared).is_empty(), "its paths may be another container's");
     }
 
     #[test]

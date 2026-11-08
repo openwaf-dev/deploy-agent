@@ -94,7 +94,9 @@ pub mod feature {
     /// `ComposeDeploy::registry_auth` and `BuildSpec::registry_auth`: credentials matched per image for Compose pulls,
     /// SBOM lookups and BuildKit's base image pulls.
     pub const REGISTRY_AUTH: &str = "registry_auth";
-    pub const ALL: [&str; 14] = [
+    /// `AppDeploy::strategy` `recreate`: the previous container stops before the new one starts.
+    pub const RECREATE: &str = "recreate";
+    pub const ALL: [&str; 15] = [
         ROUTER,
         BUILD_PACKS,
         COMPOSE,
@@ -109,6 +111,7 @@ pub mod feature {
         SBOM,
         BUILD_EGRESS,
         REGISTRY_AUTH,
+        RECREATE,
     ];
 }
 kind!(Hello, "hello");
@@ -280,7 +283,7 @@ pub enum Op {
     /// `CommandResult` whose output is a [`DeployOutput`]. Cancellable until the router switched.
     DeployApp(AppDeploy),
     /// Start, stop, restart or remove the containers of an application (a Compose application: all its services).
-    /// Remove also drops its router routes; volumes stay (see `VolumeRemove`).
+    /// Remove also drops its router routes and file mounts; named volumes stay (see `VolumeRemove`).
     AppAction { resource: String, action: AppActionKind },
     /// State of the containers of an application (output: [`AppState`]).
     AppStatus { resource: String },
@@ -343,9 +346,26 @@ pub struct AppDeploy {
     /// new one, before it is stopped. None: [`DEFAULT_DRAIN_SECS`].
     #[serde(default)]
     pub drain_secs: Option<u32>,
+    /// How the new container replaces the running one. None: [`UpdateStrategy::Rolling`]. Sent only to agents with
+    /// [`feature::RECREATE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<UpdateStrategy>,
 }
 
 pub const DEFAULT_DRAIN_SECS: u32 = 10;
+
+/// How a deployment replaces an application's running container.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStrategy {
+    /// The new container starts next to the running one; the router switches once it is healthy, then the previous
+    /// one drains and stops. No interruption, but both run on the same volumes for a while.
+    #[default]
+    Rolling,
+    /// The running container stops before the new one starts (and starts again if the new one fails): never two on
+    /// the same volumes, but the application is unavailable until the new one is healthy.
+    Recreate,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1166,6 +1186,7 @@ mod tests {
                 tls: false,
             }]),
             drain_secs: Some(5),
+            strategy: Some(UpdateStrategy::Recreate),
         });
         let v = serde_json::to_value(&op).unwrap();
         assert_eq!(v["op"], "deploy_app");
@@ -1174,6 +1195,7 @@ mod tests {
         assert_eq!(v["build"]["pack"], "railpack");
         assert_eq!(v["build"]["untrusted"], true);
         assert_eq!(v["source"]["commit"], "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(v["strategy"], "recreate");
         assert_eq!(serde_json::from_value::<Op>(v).unwrap(), op);
         let debug = format!("{op:?}");
         assert!(!debug.contains("secret"), "credentials must not reach logs through Debug: {debug}");
@@ -1213,7 +1235,7 @@ mod tests {
         let Op::DeployApp(d) = serde_json::from_value::<Op>(v).unwrap() else { panic!("not a deployment") };
         assert_eq!(d.build.unwrap().pack, BuildPack::Dockerfile);
         assert!(matches!(d.source, Source::Git { ssh: None, .. }));
-        assert_eq!((d.routes, d.drain_secs), (None, None));
+        assert_eq!((d.routes, d.drain_secs, d.strategy), (None, None, None));
         assert!(d.run.volumes.is_empty() && d.run.files.is_empty());
         let logs: Op = serde_json::from_value(serde_json::json!({
             "op": "app_logs", "resource": "app_01", "tail": 10, "follow": false, "since": null
