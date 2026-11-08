@@ -1628,6 +1628,7 @@ mod tests {
             }],
             no_cache: false,
             egress: None,
+            registry_auth: Vec::new(),
         }
     }
 

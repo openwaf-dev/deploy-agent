@@ -25,7 +25,8 @@ Documentation: <https://developers.openwaf.dev/deploy/>
 - **Agent on your servers.** The agent runs on each of your servers and executes typed operations (deploy, start,
   stop, logs, exec, router and firewall changes) against the local Docker Engine. Builds run on the server itself,
   inside rootless BuildKit, in containers without access to the Docker Engine: the agent checks what a build exports
-  before it loads it. It sends an SPDX SBOM of every image it deploys.
+  before it loads it. It sends an SPDX SBOM of every image it deploys. Private registry images and base images are
+  pulled with the credentials the application selected, which never reach build steps ([SECURITY.md](SECURITY.md)).
 - **Outbound only.** The agent dials the control plane and never listens on a port of its own. The control plane holds
   no SSH key or password for your server. Every frame either side sends is signed, and in protocol 2 encrypted end to
   end with keys of that connection only. The agent pins the control plane's keys at enrollment and refuses anything
@@ -69,21 +70,25 @@ The control plane serves [install.sh](install.sh) with its own URL in place of `
 The agent runs as two processes ([SECURITY.md](SECURITY.md#agent-privileges)): the relay (`owdeploy-agent.service`,
 user `owdeploy`, no capabilities) holds the connection to the control plane; the broker
 (`owdeploy-agent-broker.service`, root) holds the keys, checks every frame and executes. The state of the agent (its
-identity and the keys it pinned) lives in `/var/lib/owdeploy-agent`, with mode 0700/0600, readable only by root. Logs:
+identity and the keys it pinned) lives in `/var/lib/owdeploy-agent` (`OWDEPLOY_AGENT_STATE` overrides it), with mode 0700/0600, readable only by root. Logs:
 `journalctl -u owdeploy-agent-broker -u owdeploy-agent`.
 
 ```text
 owdeploy-agent enroll --url URL --token-file PATH [--name NAME]   # what the installer runs
-owdeploy-agent migrate-split                                        # installs the two units (the installer runs it)
+owdeploy-agent migrate-split                                        # installs the two units (the installer runs it; split.rs migrate)
 owdeploy-agent broker                                               # the broker's service (root)
 owdeploy-agent run                                                  # the relay's service (user owdeploy)
-owdeploy-agent status                                               # the broker's relay and session (JSON)
-owdeploy-agent firewall-repair                                      # re-applies missing firewall rules
-owdeploy-agent csf-hook                                             # installs the CSF post hook
-owdeploy-agent pin-keys [--control-key KEY] [--update-key KEY] [--release-key KEY]   # key recovery, see below
-owdeploy-agent capabilities                                         # what this binary supports
+owdeploy-agent status                                               # the broker's relay and session (JSON; split.rs query, ipc.rs Status)
+owdeploy-agent firewall-repair                                      # re-applies missing firewall rules (firewall.rs reconcile)
+owdeploy-agent csf-hook                                             # installs the CSF post hook (firewall.rs install_csf_hook)
+owdeploy-agent pin-keys [--control-key KEY] [--update-key KEY] [--release-key KEY]   # key recovery, see below (keys.rs pin_by_hand)
+owdeploy-agent capabilities                                         # what this binary supports (split.rs CAPABILITY)
+owdeploy-agent build-proxy                                          # the build egress proxy (runs in the owd-build-proxy container)
+owdeploy-agent build-proxy-ctl                                      # control client of that proxy (the agent runs it with docker exec)
 owdeploy-agent version
 ```
+
+The files named above are in `crates/deploy-agent/src/`.
 
 To remove a server, revoke it in the dashboard, then on the server run:
 
@@ -159,7 +164,7 @@ Every release on GitHub publishes these files:
 Each release also has GitHub artifact attestations (SLSA build provenance) for the binaries and SBOMs.
 
 ```sh
-tag=v0.2.0   # the release to check
+tag=v0.3.0   # the release to check
 repo=openwaf-dev/deploy-agent
 gh release download "$tag" -R "$repo"
 
@@ -182,7 +187,7 @@ byte for byte:
 
 ```sh
 git clone https://github.com/openwaf-dev/deploy-agent && cd deploy-agent
-./verify.sh v0.2.0
+./verify.sh v0.3.0
 ```
 
 It checks the signature of `SHA256SUMS` when cosign is installed, builds the tag in a clean worktree with
@@ -211,7 +216,8 @@ release builds are): a local `cargo build` links dynamically, so set `OWDEPLOY_B
 (`cargo zigbuild --release -p deploy-agent --target x86_64-unknown-linux-musl`, or `aarch64-…`) when you run it.
 
 The end-to-end tests in `crates/deploy-agent/src/e2e.rs` drive a real Docker Engine (and, for the firewall tests,
-iptables as root). They skip themselves unless `OWDEPLOY_TEST_DOCKER=1` is set; the module documentation explains how
+iptables as root). They skip themselves unless `OWDEPLOY_TEST_DOCKER=1` is set, and the firewall tests also need
+`OWDEPLOY_TEST_FIREWALL=1`; the module documentation explains how
 to run them in a throwaway Linux container.
 
 Release build (what the release workflow and `verify.sh` run):
@@ -234,13 +240,15 @@ The version embedded in the binary is `<crate version>+<ordinal>.<commit>`. The 
 
 ## Recovering the pinned keys
 
-The agent trusts only the control key, the update key and the release key it pinned. Changes to them arrive signed by the keys already
-pinned ([PROTOCOL.md §8](PROTOCOL.md#8-keys)). If the control plane ever loses or must revoke a key, OpenWAF will
-announce the new public keys through its usual channels. A root user then pins them on each server by hand:
+The agent trusts only the control key, the update key and the release key it pinned. New control and update keys
+arrive signed by the keys already pinned ([PROTOCOL.md §8](PROTOCOL.md#8-keys)); the release key has no rotation
+over the wire: it is pinned at enrollment or by hand with `pin-keys`. If the control plane ever loses or must revoke
+a key, OpenWAF will announce the new public keys through its usual channels. A root user then pins them on each
+server by hand (`crates/deploy-agent/src/keys.rs`, `pin_by_hand`), giving at least one of the three keys:
 
 ```sh
 systemctl stop owdeploy-agent owdeploy-agent-broker   # owdeploy-agent alone on a server with one process
-owdeploy-agent pin-keys --control-key <base64> --update-key <base64> [--release-key <base64>]
+owdeploy-agent pin-keys [--control-key <base64>] [--update-key <base64>] [--release-key <base64>]
 systemctl start owdeploy-agent-broker owdeploy-agent
 ```
 

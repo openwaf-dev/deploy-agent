@@ -22,7 +22,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use bollard::Docker;
 use deploy_proto::msg::{Event, MAX_SBOM_PART_BYTES, MAX_SBOM_PARTS, RegistryAuth};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::Helper;
@@ -233,15 +233,6 @@ fn registry_document(out: &[u8], platforms: &[String]) -> Option<Value> {
     platforms.iter().find_map(|p| v.get(p)?.get("SPDX").cloned())
 }
 
-/// The docker CLI configuration for `auth`: its registry's credentials, or none.
-fn docker_config(auth: Option<&RegistryAuth>) -> Vec<u8> {
-    let auths = auth.map(|a| {
-        let token = B64.encode(format!("{}:{}", a.username, a.password));
-        json!({ a.server.clone(): {"auth": token} })
-    });
-    serde_json::to_vec(&json!({"auths": auths.unwrap_or_else(|| json!({}))})).expect("json")
-}
-
 async fn registry(
     d: &Docker,
     resource: &str,
@@ -257,7 +248,7 @@ async fn registry(
         .output(
             cmd,
             vec![format!("OWD_REF={reference}")],
-            Some(docker_config(auth)),
+            Some(deploy_proto::registry::docker_config(auth)),
             MAX_DOCUMENT_BYTES * 2,
             ev,
             cancel,
@@ -310,6 +301,7 @@ fn decode(parts: &[String]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn documents_are_sent_in_bounded_parts_or_not_at_all() {
@@ -354,9 +346,13 @@ mod tests {
 
     #[test]
     fn registry_credentials_go_to_the_config_of_their_server_only() {
+        let docker_config = deploy_proto::registry::docker_config;
         let a = RegistryAuth { server: "ghcr.io".into(), username: "u".into(), password: "p".into() };
         let c: Value = serde_json::from_slice(&docker_config(Some(&a))).unwrap();
         assert_eq!(c, json!({"auths": {"ghcr.io": {"auth": B64.encode("u:p")}}}));
+        let hub = RegistryAuth { server: deploy_proto::registry::DOCKER_HUB_KEY.into(), ..a.clone() };
+        let c: Value = serde_json::from_slice(&docker_config(Some(&hub))).unwrap();
+        assert!(c["auths"]["https://index.docker.io/v1/"].is_object(), "{c}");
         assert_eq!(serde_json::from_slice::<Value>(&docker_config(None)).unwrap(), json!({"auths": {}}));
     }
 }

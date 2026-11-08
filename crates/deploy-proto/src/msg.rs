@@ -91,7 +91,10 @@ pub mod feature {
     /// the agent's build egress proxy, which applies the deployment's [`super::BuildEgress`] policy and reports the
     /// destinations.
     pub const BUILD_EGRESS: &str = "build_egress";
-    pub const ALL: [&str; 13] = [
+    /// `ComposeDeploy::registry_auth` and `BuildSpec::registry_auth`: credentials matched per image for Compose pulls,
+    /// SBOM lookups and BuildKit's base image pulls.
+    pub const REGISTRY_AUTH: &str = "registry_auth";
+    pub const ALL: [&str; 14] = [
         ROUTER,
         BUILD_PACKS,
         COMPOSE,
@@ -105,6 +108,7 @@ pub mod feature {
         ISOLATED_BUILDS,
         SBOM,
         BUILD_EGRESS,
+        REGISTRY_AUTH,
     ];
 }
 kind!(Hello, "hello");
@@ -396,8 +400,10 @@ impl std::fmt::Debug for SshAuth {
     }
 }
 
+/// Credentials for one registry. Never logged, never in argv.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegistryAuth {
+    /// The Docker config key of the registry (`deploy_proto::registry::config_key`).
     pub server: String,
     pub username: String,
     pub password: String,
@@ -446,6 +452,10 @@ pub struct BuildSpec {
     /// `open`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<BuildEgress>,
+    /// Credentials for the base images the build pulls, matched by registry host. Sent only to agents with
+    /// [`feature::REGISTRY_AUTH`]; never on an untrusted build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_auth: Vec<RegistryAuth>,
 }
 
 /// The egress policy of a deployment's build steps ([`feature::BUILD_EGRESS`]). Whatever the mode, build steps
@@ -803,6 +813,10 @@ pub struct ComposeDeploy {
     /// control planes): `open`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<BuildEgress>,
+    /// Credentials for the service images the agent pulls and the base images it builds from, matched by registry
+    /// host. Sent only to agents with [`feature::REGISTRY_AUTH`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_auth: Vec<RegistryAuth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1125,6 +1139,11 @@ mod tests {
                 spa: false,
                 untrusted: true,
                 egress: Some(BuildEgress { mode: EgressMode::Allowlist, allow: vec!["*.npmjs.org:443".into()] }),
+                registry_auth: vec![RegistryAuth {
+                    server: "ghcr.io".into(),
+                    username: "bot".into(),
+                    password: "secret-registry".into(),
+                }],
             }),
             run: RunSpec {
                 image_tag: "owd/app_01:dep_01".into(),
@@ -1158,6 +1177,26 @@ mod tests {
         assert_eq!(serde_json::from_value::<Op>(v).unwrap(), op);
         let debug = format!("{op:?}");
         assert!(!debug.contains("secret"), "credentials must not reach logs through Debug: {debug}");
+    }
+
+    /// `registry_auth` is new in agent 0.3.0: an older control plane's `ComposeDeploy` without it reads as an empty
+    /// list, and an empty list is not written (older agents never see the field).
+    #[test]
+    fn registry_auth_is_optional_on_the_wire() {
+        let old = serde_json::json!({
+            "resource": "app_01", "deployment": "dep_01", "network": "owd-env",
+            "source": {"kind": "inline", "content": "services: {}"}, "env": {}, "labels": {}, "routes": []
+        });
+        let c: ComposeDeploy = serde_json::from_value(old).unwrap();
+        assert!(c.registry_auth.is_empty());
+        assert!(serde_json::to_value(&c).unwrap().get("registry_auth").is_none());
+        let with = ComposeDeploy {
+            registry_auth: vec![RegistryAuth { server: "ghcr.io".into(), username: "u".into(), password: "p".into() }],
+            ..c
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["registry_auth"][0]["server"], "ghcr.io");
+        assert_eq!(serde_json::from_value::<ComposeDeploy>(v).unwrap(), with);
     }
 
     /// A phase-2 control plane sends none of the phase-3 fields; a phase-3 agent reads its commands with the phase-2

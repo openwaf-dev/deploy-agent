@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub mod msg;
+pub mod registry;
 
 /// First line of every signed message of protocol v1: its frames and the agent's connect request (in both versions).
 pub const CONTEXT: &str = "owdeploy-agent-v1";

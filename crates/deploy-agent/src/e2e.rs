@@ -18,6 +18,10 @@
 //!   (root, iptables, ip6tables, iproute2, curl and python3 on the host; the host's interfaces must not start with
 //!   `owd`, the prefix of Deploy's bridges). They rewrite the host's firewall: run them against a throwaway dockerd
 //!   (as for the classic store below), which has its own network namespace.
+//! - `OWDEPLOY_TEST_REGISTRY=1` as well: private registries, with a `registry:2` asking for Basic credentials at
+//!   `203.0.113.50:5000` (a documentation address the build egress proxy does not refuse), alone in a network
+//!   namespace behind the host (root, iproute2 and nsenter on the host). The Engine must list it in its
+//!   `insecure-registries`; while the test runs, the trusted builder's BuildKit configuration lists it as plain HTTP.
 //!
 //! Requests to the router go to the host's own address (`ip route get`), as its listeners are routed by the agent's
 //! DNAT, which does not apply to loopback.
@@ -35,12 +39,14 @@
 //! ```
 //!
 //! The Engine of colima uses the containerd image store. For the classic store, run the tests against a throwaway
-//! dockerd started with it disabled, sharing its network and PID namespaces, socket and state directory:
+//! dockerd started with it disabled, sharing its network and PID namespaces, socket and state directory (without
+//! `features`, the same dockerd runs the containerd store; `insecure-registries` is for `OWDEPLOY_TEST_REGISTRY`):
 //!
 //! ```text
 //! docker run -d --name owd-e2e-dind --privileged -v owd-e2e-dind-sock:/var/run -v owd-e2e-dind-lib:/var/lib/docker \
 //!   -v owd-e2e-dind-state:/var/lib/owdeploy-e2e -e DOCKER_TLS_CERTDIR= --entrypoint sh docker:29.9.3-dind -c \
-//!   'mkdir -p /etc/docker && echo "{\"features\":{\"containerd-snapshotter\":false}}" > /etc/docker/daemon.json \
+//!   'mkdir -p /etc/docker && echo "{\"features\":{\"containerd-snapshotter\":false}, \
+//!    \"insecure-registries\":[\"203.0.113.50:5000\"]}" > /etc/docker/daemon.json \
 //!    && exec dockerd-entrypoint.sh dockerd --host=unix:///var/run/docker.sock'
 //! docker run --rm --privileged --network container:owd-e2e-dind --pid container:owd-e2e-dind \
 //!   -v owd-e2e-dind-sock:/var/run -v owd-e2e-dind-state:/var/lib/owdeploy-e2e \
@@ -57,8 +63,8 @@ use std::time::Duration;
 use deploy_proto::msg::{
     AppActionKind, AppDeploy, AppState, BuildEgress, BuildPack, BuildSpec, ComposeDeploy, ComposeOutput, ComposeSource,
     DeployOutput, EgressDecision, EgressMode, Event, ExecOutput, ExecSpec, FileMount, FirewallRules, HealthCheck,
-    LABEL_ENVIRONMENT, LogStream, Op, Outcome, ResourceRoutes, Route, RouterConfig, RouterState, RunSpec, Source,
-    SshAuth, Step, VolumeMount,
+    LABEL_ENVIRONMENT, LogStream, Op, Outcome, RegistryAuth, ResourceRoutes, Route, RouterConfig, RouterState, RunSpec,
+    Source, SshAuth, Step, VolumeMount,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -206,6 +212,7 @@ fn build(pack: BuildPack) -> BuildSpec {
         spa: false,
         untrusted: false,
         egress: None,
+        registry_auth: Vec::new(),
     }
 }
 
@@ -1098,6 +1105,368 @@ async fn build_egress_policies_are_enforced_by_the_proxy() {
     docker_cli(&["rm", "-f", GIT_SERVER]);
 }
 
+/// The registry of [`private_registry_pulls_and_builds_with_the_selected_credential_only`]: `registry:2` asking for
+/// Basic credentials (htpasswd), alone in a network namespace behind the host, at a public address (a documentation
+/// range, which the build egress proxy does not refuse), as an outside registry would be.
+const REGISTRY: &str = "203.0.113.50:5000";
+const REGISTRY_IP: &str = "203.0.113.50";
+const REGISTRY_GW: &str = "203.0.113.49";
+const REGISTRY_CONTAINER: &str = "owd-e2e-registry";
+const REGISTRY_IMAGE: &str = "registry:2";
+/// The host's end of the registry's link (not `owd…`, the prefix of Deploy's bridges).
+const REGISTRY_LINK: &str = "ngreg-h";
+const REGISTRY_USER: &str = "robot";
+const REGISTRY_PASSWORD: &str = "e2e-Registry-Passw0rd";
+/// `htpasswd -nbB robot e2e-Registry-Passw0rd`.
+const REGISTRY_HTPASSWD: &str = "robot:$2y$05$EpqFh2VURqO1NAHkDAF7feEZqb1L.UhwW.TnV9iO9M3jQUzaSH5ti";
+const BUILDKITD_CONFIG: &str = "/etc/buildkit/buildkitd.toml";
+/// Appended to the trusted builder's configuration while the test runs: the registry speaks plain HTTP.
+const BUILDKITD_REGISTRY: &str = "\n[registry.\"203.0.113.50:5000\"]\n  http = true\n";
+
+/// Runs `docker args` with `input` on its standard input: (success, standard output).
+fn docker_stdin(args: &[&str], input: &str) -> (bool, String) {
+    use std::io::Write;
+    let mut c = Proc::new("docker")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("docker CLI");
+    c.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let o = c.wait_with_output().unwrap();
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// The private registry, with `base` (busybox with `/base-marker`) pushed to it; removed on drop, with the base
+/// image the tests pulled, and the builder's configuration put back.
+struct PrivateRegistry {
+    base: String,
+    builder_config: Option<String>,
+}
+
+impl PrivateRegistry {
+    fn start(base: &str) -> PrivateRegistry {
+        let index = docker_cli(&["info", "-f", "{{json .RegistryConfig.IndexConfigs}}"]);
+        assert!(index.contains(&format!("\"{REGISTRY}\"")), "the Engine must list {REGISTRY} as an insecure registry");
+        docker_cli(&["rm", "-f", REGISTRY_CONTAINER]);
+        sh(&["ip", "link", "del", REGISTRY_LINK]);
+        let script = "mkdir -p /auth && printf '%s\\n' \"$HTPASSWD\" > /auth/htpasswd \
+            && exec registry serve /etc/docker/registry/config.yml";
+        docker_ok(&[
+            "run",
+            "-d",
+            "--name",
+            REGISTRY_CONTAINER,
+            "--network",
+            "none",
+            "-e",
+            &format!("HTPASSWD={REGISTRY_HTPASSWD}"),
+            "-e",
+            "REGISTRY_AUTH=htpasswd",
+            "-e",
+            "REGISTRY_AUTH_HTPASSWD_REALM=e2e",
+            "-e",
+            "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
+            "--entrypoint",
+            "sh",
+            REGISTRY_IMAGE,
+            "-c",
+            script,
+        ]);
+        let pid = docker_cli(&["inspect", "-f", "{{.State.Pid}}", REGISTRY_CONTAINER]);
+        assert!(sh(&["ip", "link", "add", REGISTRY_LINK, "type", "veth", "peer", "name", "eth1", "netns", &pid]));
+        assert!(sh(&["ip", "addr", "add", &format!("{REGISTRY_GW}/30"), "dev", REGISTRY_LINK]));
+        assert!(sh(&["ip", "link", "set", REGISTRY_LINK, "up"]));
+        for args in [
+            vec!["addr", "add", &format!("{REGISTRY_IP}/30"), "dev", "eth1"],
+            vec!["link", "set", "eth1", "up"],
+            vec!["route", "add", "default", "via", REGISTRY_GW],
+        ] {
+            assert!(sh(&[&["nsenter", "-t", &pid, "-n", "ip"], args.as_slice()].concat()), "{args:?}");
+        }
+        let url = format!("http://{REGISTRY}/v2/");
+        let ready = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(250));
+            let args = ["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "1", &url];
+            Proc::new("curl").args(args).output().is_ok_and(|o| o.stdout == b"401")
+        });
+        assert!(ready, "{url} does not ask for credentials");
+        let reg = PrivateRegistry { base: base.to_string(), builder_config: None };
+        // A base image of our own, pushed with a throwaway client configuration.
+        docker_cli(&["rm", "-f", "owd-e2e-regbase"]);
+        docker_ok(&[
+            "run",
+            "--name",
+            "owd-e2e-regbase",
+            "busybox:1.37",
+            "sh",
+            "-c",
+            "echo private-base > /base-marker",
+        ]);
+        docker_ok(&["commit", "owd-e2e-regbase", base]);
+        docker_ok(&["rm", "owd-e2e-regbase"]);
+        let client = crate::git::TempDir::new().unwrap();
+        let config = client.path().to_str().unwrap();
+        let login = ["--config", config, "login", "-u", REGISTRY_USER, "--password-stdin", REGISTRY];
+        assert!(docker_stdin(&login, REGISTRY_PASSWORD).0, "docker login {REGISTRY}");
+        docker_ok(&["--config", config, "push", base]);
+        docker_ok(&["rmi", base]);
+        reg
+    }
+
+    /// The trusted builder reaches the registry over plain HTTP (BuildKit reads its configuration when it starts).
+    fn trust_in_builder(&mut self) {
+        let name = crate::builder::Builder::Trusted.name();
+        let current = docker_cli(&["exec", name, "cat", BUILDKITD_CONFIG]);
+        let original = current.replace(BUILDKITD_REGISTRY.trim_end(), "").trim_end().to_string();
+        write_builder_config(name, &format!("{original}{BUILDKITD_REGISTRY}"));
+        self.builder_config = Some(original);
+    }
+}
+
+/// Replaces the configuration of builder `name` and restarts it.
+fn write_builder_config(name: &str, config: &str) {
+    let dir = crate::git::TempDir::new().unwrap();
+    let file = dir.path().join("buildkitd.toml");
+    std::fs::write(&file, format!("{}\n", config.trim_end())).unwrap();
+    docker_ok(&["cp", file.to_str().unwrap(), &format!("{name}:{BUILDKITD_CONFIG}")]);
+    docker_ok(&["restart", name]);
+}
+
+impl Drop for PrivateRegistry {
+    fn drop(&mut self) {
+        if let Some(config) = &self.builder_config {
+            write_builder_config(crate::builder::Builder::Trusted.name(), config);
+        }
+        docker_cli(&["rm", "-f", REGISTRY_CONTAINER]);
+        docker_cli(&["rmi", &self.base]);
+        sh(&["ip", "link", "del", REGISTRY_LINK]);
+    }
+}
+
+/// What a build helper shows of its Docker configuration: `$HOME/.docker/config.json` (`link <target>`, `file` or
+/// `none`), `keyed` when the config on the secrets tmpfs has the registry's entry, and `copy <path>` for each regular
+/// file of `$HOME/.docker` holding the password or its base64 pair (both read from stdin).
+const CONFIG_PROBE: &str = r#"IFS= read -r p
+IFS= read -r b
+f="$HOME/.docker/config.json"
+if [ -L "$f" ]; then echo "link $(readlink "$f")"; elif [ -e "$f" ]; then echo file; else echo none; fi
+grep -qF '"203.0.113.50:5000"' /run/owd/docker-config.json 2>/dev/null && echo keyed
+find "$HOME/.docker" -type f -exec grep -lF -e "$p" -e "$b" {} + 2>/dev/null | sed 's/^/copy /'
+true
+"#;
+
+/// Watches the build helpers while a deployment runs (every 100 ms) with [`CONFIG_PROBE`]: every distinct answer.
+struct ConfigWatch {
+    stop: Arc<AtomicBool>,
+    task: std::thread::JoinHandle<BTreeSet<String>>,
+}
+
+impl ConfigWatch {
+    fn start(secrets: String) -> ConfigWatch {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let task = std::thread::spawn(move || {
+            let mut seen = BTreeSet::new();
+            while !flag.load(Ordering::Relaxed) {
+                let filter = format!("network={}", crate::builder::BUILD_NETWORK);
+                let ids = docker_cli(&["ps", "-q", "--filter", "label=dev.openwaf.deploy.helper", "--filter", &filter]);
+                for id in ids.lines().filter(|l| !l.is_empty()) {
+                    let (_, out) = docker_stdin(&["exec", "-i", id, "sh", "-c", CONFIG_PROBE], &secrets);
+                    seen.extend(out.lines().map(str::to_string));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            seen
+        });
+        ConfigWatch { stop, task }
+    }
+
+    fn stop(self) -> BTreeSet<String> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.join().unwrap()
+    }
+}
+
+/// Everything a command sent: its events and its outcome.
+fn sent(r: &Run) -> String {
+    format!("{:?}\n{:?}", r.outcome, r.events)
+}
+
+/// Private registries: an image deployment and a Compose project pull with the selected credential, a build `FROM`
+/// the registry gets it from its build helper, and each fails with the agent's text without it (or with a wrong
+/// one). A second application without the credential cannot use the base image the first one's build left in the
+/// builder's cache (`--pull`). The credential never shows in what the agent sends, in the build egress proxy's or
+/// BuildKit's logs, or in an image; in the build helper it stays on the secrets tmpfs, which goes with the helper.
+#[tokio::test]
+async fn private_registry_pulls_and_builds_with_the_selected_credential_only() {
+    use base64::Engine;
+    if !enabled("OWDEPLOY_TEST_DOCKER") || !enabled("OWDEPLOY_TEST_REGISTRY") {
+        return;
+    }
+    let base = format!("{REGISTRY}/e2e/base:1");
+    let mut reg = PrivateRegistry::start(&base);
+    let auth =
+        RegistryAuth { server: REGISTRY.into(), username: REGISTRY_USER.into(), password: REGISTRY_PASSWORD.into() };
+    let wrong = RegistryAuth { password: "not-the-Passw0rd".into(), ..auth.clone() };
+    let pair = base64::engine::general_purpose::STANDARD.encode(format!("{REGISTRY_USER}:{REGISTRY_PASSWORD}"));
+    let secrets = [REGISTRY_PASSWORD.to_string(), pair.clone(), wrong.password.clone()];
+    let assert_secret_free = |what: &str, text: &str| {
+        for s in &secrets {
+            assert!(!text.contains(s.as_str()), "{what} carries a credential: {text}");
+        }
+    };
+    let anonymous = format!(
+        "{REGISTRY} refused the anonymous pull of e2e/base (401): the application selects no credential for {REGISTRY}"
+    );
+    let rejected = format!(
+        "{REGISTRY} rejected the selected credential (401): the username or token is wrong or expired; update it in \
+         the organization's registry credentials"
+    );
+    let mut runs = Vec::new();
+
+    // The builder reaches the registry over plain HTTP (made by a first build when missing: it cannot pull yet).
+    let srv = git_server();
+    let repo = format!(
+        "set -e\nrm -rf /tmp/private /srv/git/private.git && mkdir /tmp/private && cd /tmp/private && git init -q\n\
+         printf 'FROM {base}\\nRUN mkdir /www && cp /base-marker /www/index.html\\nCMD [\"httpd\", \"-f\", \"-p\", \
+         \"8080\", \"-h\", \"/www\"]\\n' > Dockerfile\n\
+         git add -A && git commit -qm private && git clone -q --bare . /srv/git/private.git\n"
+    );
+    docker_ok(&["exec", "-u", "git", GIT_SERVER, "sh", "-c", &repo]);
+    let build_op = |app: &str, deployment: &str, publish: u16, registry_auth: Vec<RegistryAuth>| {
+        let source = Source::Git {
+            url: format!("ssh://git@{}:22/srv/git/private.git", srv.ip),
+            reference: "main".into(),
+            auth: None,
+            ssh: Some(SshAuth { private_key: srv.key.clone(), known_hosts: vec![srv.host_key.clone()] }),
+            commit: None,
+        };
+        let mut d = app_deploy(app, deployment, source, 8080, Some(publish), Some("/"));
+        d.build = Some(BuildSpec { registry_auth, ..build(BuildPack::Dockerfile) });
+        Op::DeployApp(d)
+    };
+    let (first, second) = ("app_e2eregbuild", "app_e2eregbuild2");
+    remove_app(first).await;
+    remove_app(second).await;
+    let builder = crate::builder::Builder::Trusted.name();
+    if docker_cli(&["ps", "-aq", "--filter", &format!("name=^{builder}$")]).is_empty() {
+        runs.push(run(build_op(second, "dep_E2ER0010", 28098, vec![])).await);
+    }
+    reg.trust_in_builder();
+
+    // An image deployment: refused without the credential and with a wrong one, pulled with it.
+    let image_app = "app_e2eregimage";
+    remove_app(image_app).await;
+    let image_op = |deployment: &str, auth: Option<RegistryAuth>| {
+        let source = Source::Image { image: base.clone(), auth };
+        let mut d = app_deploy(image_app, deployment, source, 8080, Some(28096), Some("/"));
+        d.run.command = busybox_site("private-image");
+        Op::DeployApp(d)
+    };
+    let r = run(image_op("dep_E2ER0001", None)).await;
+    assert_eq!(r.err(), anonymous, "{:?}", r.log());
+    runs.push(r);
+    let r = run(image_op("dep_E2ER0002", Some(wrong.clone()))).await;
+    assert_eq!(r.err(), rejected, "{:?}", r.log());
+    runs.push(r);
+    let r = run(image_op("dep_E2ER0003", Some(auth.clone()))).await;
+    r.ok::<DeployOutput>();
+    assert_eq!(http("http://127.0.0.1:28096/").await.unwrap().1.trim(), "private-image");
+    runs.push(r);
+    remove_app(image_app).await;
+
+    // A Compose project: a service pulled from the registry (every time), another built from it.
+    let compose_app = "app_e2eregcompose";
+    remove_app(compose_app).await;
+    let compose = format!(
+        "services:\n  web:\n    image: {base}\n    pull_policy: always\n    command: [\"sh\", \"-c\", \"mkdir -p /www \
+         && cp /base-marker /www/index.html && exec httpd -f -p 8080 -h /www\"]\n  api:\n    build:\n      context: .\n      \
+         dockerfile_inline: |\n        FROM {base}\n        RUN cp /base-marker /built-marker\n    command: [\"sleep\", \
+         \"3600\"]\n"
+    );
+    let compose_op = |deployment: &str, registry_auth: Vec<RegistryAuth>| {
+        Op::DeployCompose(ComposeDeploy {
+            resource: compose_app.into(),
+            deployment: deployment.into(),
+            network: NETWORK.into(),
+            source: ComposeSource::Inline { content: compose.clone() },
+            env: Default::default(),
+            volumes: vec![],
+            files: vec![],
+            labels: [(LABEL_ENVIRONMENT.to_string(), "e2e-env".to_string())].into(),
+            routes: vec![Route {
+                listen: Some(28100),
+                hosts: vec![],
+                service: Some("web".into()),
+                port: 8080,
+                tls: false,
+            }],
+            no_cache: false,
+            egress: None,
+            registry_auth,
+        })
+    };
+    let r = run(compose_op("dep_E2ER0004", vec![])).await;
+    let err = r.err();
+    assert!(err == anonymous || r.log().contains(&anonymous), "{err}: {:?}", r.log());
+    runs.push(r);
+    let r = run(compose_op("dep_E2ER0005", vec![auth.clone()])).await;
+    r.ok::<ComposeOutput>();
+    assert!(r.log().iter().any(|l| l == &format!("registry credentials for: {REGISTRY}")), "{:?}", r.log());
+    assert_eq!(http("http://127.0.0.1:28100/").await.unwrap().1.trim(), "private-base");
+    runs.push(r);
+    remove_app(compose_app).await;
+
+    // A build FROM the registry: without the credential and with a wrong one it fails at FROM, with the agent's
+    // text after BuildKit's; with it, it builds and runs.
+    let r = run(build_op(first, "dep_E2ER0011", 28097, vec![])).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    assert!(r.log().contains(&anonymous), "{:?}", r.log());
+    runs.push(r);
+    let r = run(build_op(first, "dep_E2ER0012", 28097, vec![wrong.clone()])).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    assert!(r.log().contains(&rejected), "{:?}", r.log());
+    runs.push(r);
+    let watch = ConfigWatch::start(format!("{REGISTRY_PASSWORD}\n{pair}\n"));
+    let r = run(build_op(first, "dep_E2ER0013", 28097, vec![auth.clone()])).await;
+    let seen = watch.stop();
+    let out: DeployOutput = r.ok();
+    assert_eq!(http("http://127.0.0.1:28097/").await.unwrap().1.trim(), "private-base");
+    runs.push(r);
+    // The helper's Docker config stayed a link to the secrets tmpfs, with the registry's entry, and no file of
+    // `~/.docker` (buildx's state) ever held the credential.
+    assert!(seen.contains("link /run/owd/docker-config.json") && seen.contains("keyed"), "{seen:?}");
+    assert!(!seen.iter().any(|l| l == "file" || l.starts_with("copy ")), "{seen:?}");
+
+    // A second application without the credential, after the first one's build cached the base image: BuildKit
+    // resolves it at the registry again and is refused.
+    let r = run(build_op(second, "dep_E2ER0014", 28098, vec![])).await;
+    assert!(r.err().contains("build failed"), "{}", r.err());
+    assert!(r.log().contains(&anonymous), "{:?}", r.log());
+    assert_eq!(docker_cli(&["images", "-q", "owd/app_e2eregbuild2:dep_e2er0014"]), "");
+    runs.push(r);
+
+    // Nowhere else: what the agent sent, the proxy's and BuildKit's logs, the built image.
+    for (i, r) in runs.iter().enumerate() {
+        assert_secret_free(&format!("command {i}"), &sent(r));
+    }
+    for c in [crate::egress::CONTAINER, builder] {
+        let o = Proc::new("docker").args(["logs", c]).output().unwrap();
+        let logs = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_secret_free(&format!("the logs of {c}"), &logs);
+    }
+    assert_secret_free("the built image", &docker_cli(&["image", "inspect", &out.image]));
+    assert_secret_free("the built image's history", &docker_cli(&["history", "--no-trunc", &out.image]));
+    // The helpers, their secrets tmpfs with them, are gone.
+    assert_eq!(leftovers(), (String::new(), 0));
+    remove_app(first).await;
+    remove_app(second).await;
+    docker_cli(&["rm", "-f", GIT_SERVER]);
+    drop(reg);
+}
+
 const COMPOSE: &str = r#"
 services:
   web:
@@ -1147,6 +1516,7 @@ async fn compose_app_routes_one_of_two_services() {
         }],
         no_cache: false,
         egress: None,
+        registry_auth: Vec::new(),
     };
     let watch = HelperWatch::start();
     let r = run(Op::DeployCompose(spec("dep_E2EC0001"))).await;
@@ -1302,6 +1672,7 @@ async fn compose_apps_of_earlier_agents_are_updated_in_place() {
         routes: vec![Route { listen: Some(28094), hosts: vec![], service: Some("web".into()), port: 8080, tls: false }],
         no_cache: false,
         egress: None,
+        registry_auth: Vec::new(),
     };
     let r = run(Op::DeployCompose(spec)).await;
     let out: ComposeOutput = r.ok();

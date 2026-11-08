@@ -23,7 +23,7 @@ use bollard::models::{ContainerSummary, EndpointSettings, NetworkConnectRequest,
 use bollard::query_parameters::{CreateContainerOptionsBuilder, LogsOptionsBuilder};
 use deploy_proto::msg::{
     ComposeDeploy, ComposeOutput, ComposeService, ComposeSource, FileMount, LABEL_DEPLOYMENT, LABEL_ENVIRONMENT,
-    LogStream, Step,
+    LogStream, RegistryAuth, Step,
 };
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -66,8 +66,19 @@ fn validate(c: &ComposeDeploy) -> Result<(), String> {
     volumes::validate(&c.volumes, &c.files, true)
 }
 
+/// Deploys a Compose project. Its log lines and its error never carry the registry credentials it holds.
 pub async fn deploy(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) -> Result<ComposeOutput, String> {
+    ev.redact_with(&c.registry_auth);
+    deploy_project(c, ev, cancel).await.map_err(|e| ev.scrub(&e))
+}
+
+async fn deploy_project(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) -> Result<ComposeOutput, String> {
     validate(c)?;
+    if !c.registry_auth.is_empty() {
+        let hosts: Vec<String> =
+            c.registry_auth.iter().map(|a| deploy_proto::registry::server_host(&a.server)).collect();
+        ev.system(format!("registry credentials for: {}", hosts.join(", "))).await;
+    }
     let d = client()?;
     let project = project(&c.resource);
     crate::deploy::ensure_network(&d, &c.network, c.labels.get(LABEL_ENVIRONMENT).map(String::as_str)).await?;
@@ -134,7 +145,7 @@ async fn run(
     src.remove().await;
     let built = built?;
     ev.step(Step::Starting).await;
-    apply(d, &plan, &c.resource, &built, ev, cancel).await?;
+    apply(d, &plan, &c.resource, &built, &c.registry_auth, ev, cancel).await?;
     Ok((commit, known_hosts, plan))
 }
 
@@ -208,7 +219,7 @@ async fn build(
     let Some((file, targets)) = plan.bake_file() else { return Ok(BTreeMap::new()) };
     let policy = crate::egress::policy(c.egress.as_ref())?;
     let builder = Builder::Trusted;
-    let h = Helper::build(d, &c.resource, builder, ev, cancel).await?;
+    let h = Helper::build(d, &c.resource, builder, &c.registry_auth, ev, cancel).await?;
     let r = async {
         match inline {
             // Build contexts and Dockerfiles of the services are files of the repository.
@@ -244,7 +255,8 @@ async fn pulled_sboms(d: &Docker, c: &ComposeDeploy, plan: &Plan, ev: &Events, c
     for s in plan.services.iter().filter(|s| s.build.is_none() && s.replicas > 0) {
         let Ok(image) = d.inspect_image(&s.image).await else { continue };
         let Some(id) = image.id else { continue };
-        let pulled = crate::sbom::Pulled { reference: &s.image, auth: None };
+        let auth = deploy_proto::registry::matching(&c.registry_auth, &s.image);
+        let pulled = crate::sbom::Pulled { reference: &s.image, auth };
         crate::sbom::of_image(d, &c.resource, &id, &s.image, Some(pulled), Some(&s.name), ev, cancel).await;
     }
 }
@@ -264,6 +276,7 @@ async fn apply(
     plan: &Plan,
     resource: &str,
     built: &BTreeMap<String, Loaded>,
+    registry_auth: &[RegistryAuth],
     ev: &Events,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
@@ -278,7 +291,7 @@ async fn apply(
         ensure_volume(d, &plan.project, v).await?;
     }
     for s in plan.services.iter().filter(|s| s.build.is_none() && s.replicas > 0) {
-        pull(d, s, ev, cancel).await?;
+        pull(d, s, deploy_proto::registry::matching(registry_auth, &s.image), ev, cancel).await?;
     }
     // Every container of the project must be the application's before any changes.
     let existing = labelled(d, COMPOSE_PROJECT, &plan.project).await?;
@@ -401,8 +414,14 @@ async fn ensure_volume(d: &Docker, _project: &str, v: &Volume) -> Result<(), Str
     d.create_volume(req).await.map(|_| ()).map_err(|e| format!("create volume {}: {}", v.name, message(&e)))
 }
 
-/// The image of a service without a build, per its pull policy.
-async fn pull(d: &Docker, s: &Service, ev: &Events, cancel: &CancellationToken) -> Result<(), String> {
+/// The image of a service without a build, per its pull policy, with the selected credential for its registry.
+async fn pull(
+    d: &Docker,
+    s: &Service,
+    auth: Option<&RegistryAuth>,
+    ev: &Events,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
     let present = d.inspect_image(&s.image).await.is_ok();
     match s.pull {
         Pull::Missing if present => Ok(()),
@@ -411,7 +430,7 @@ async fn pull(d: &Docker, s: &Service, ev: &Events, cancel: &CancellationToken) 
             Err(format!("service {}: the image {} is not on this server (pull_policy: never)", s.name, s.image))
         }
         Pull::Missing | Pull::Always => {
-            crate::deploy::pull(d, &s.image, None, s.platform.as_deref(), ev, cancel).await.map(|_| ())
+            crate::deploy::pull(d, &s.image, auth, s.platform.as_deref(), ev, cancel).await.map(|_| ())
         }
     }
 }
