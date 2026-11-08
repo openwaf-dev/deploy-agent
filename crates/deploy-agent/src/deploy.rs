@@ -25,7 +25,7 @@ use bollard::query_parameters::{
 };
 use deploy_proto::msg::{
     AppDeploy, BuildPack, BuildSpec, DEFAULT_DRAIN_SECS, DeployOutput, HealthCheck, LABEL_DEPLOYMENT,
-    LABEL_ENVIRONMENT, LABEL_RESOURCE, LogStream, RegistryAuth, Route, Source, Step,
+    LABEL_ENVIRONMENT, LABEL_RESOURCE, LogStream, RegistryAuth, Route, Source, Step, UpdateStrategy,
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -235,9 +235,15 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
             sbom_later = Some(None);
         }
     }
-    let image_id = docker.inspect_image(tag).await.map_err(|e| format!("inspect {tag}: {}", message(&e)))?.id;
-    let image_id = image_id.unwrap_or_default();
+    let inspected = docker.inspect_image(tag).await.map_err(|e| format!("inspect {tag}: {}", message(&e)))?;
+    let image_id = inspected.id.unwrap_or_default();
     ev.system(format!("Image {tag} ({})", short(&image_id))).await;
+    let declared = inspected.config.and_then(|c| c.volumes).unwrap_or_default();
+    let mounted: Vec<&str> =
+        d.run.volumes.iter().map(|v| v.path.as_str()).chain(d.run.files.iter().map(|f| f.path.as_str())).collect();
+    for path in volumes::anonymous_paths(&declared, &mounted) {
+        ev.system(volumes::anonymous_warning(None, path)).await;
+    }
     if cancel.is_cancelled() {
         return Err(CANCELLED.into());
     }
@@ -268,14 +274,32 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
         }
     };
     drop(files);
+    // Recreate: the running containers stop before the new one starts, so two never use the volumes at once.
+    let stopped: Vec<String> = match d.strategy {
+        Some(UpdateStrategy::Recreate) => running.iter().filter_map(|c| c.id.clone()).collect(),
+        _ => Vec::new(),
+    };
     let undo = async |e: String| -> Result<DeployOutput, String> {
         remove_container(&docker, &new_id).await.ok();
         volumes::prune_files(&d.resource, current_deployment(&previous).as_deref());
-        if !running.is_empty() {
-            ev.system("The previous container keeps serving").await;
+        for id in &stopped {
+            if let Err(e) = start_again(&docker, id).await {
+                ev.system(format!("Could not restart {}: {e}", short(id))).await;
+            }
+        }
+        match (running.is_empty(), stopped.is_empty()) {
+            (true, _) => {}
+            (false, true) => ev.system("The previous container keeps serving").await,
+            (false, false) => ev.system("The previous container was started again").await,
         }
         Err(e)
     };
+    for id in &stopped {
+        ev.system(format!("Update strategy recreate: stopping the previous container {} first", short(id))).await;
+        if let Err(e) = stop(&docker, id).await {
+            return undo(e).await;
+        }
+    }
     if let Err(e) = start(&docker, d, &new_id, ev, cancel).await {
         return undo(e).await;
     }
@@ -301,7 +325,7 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
     ev.system(format!("{name} is now serving")).await;
 
     ev.step(Step::Cleaning).await;
-    if running.iter().any(|c| !publishes(c)) {
+    if stopped.is_empty() && running.iter().any(|c| !publishes(c)) {
         // The router moves new requests to the new slot within its settle time; the previous container then only
         // finishes the requests it has.
         tokio::time::sleep(router::SWITCH_SETTLE).await;
@@ -337,6 +361,16 @@ fn current_deployment(list: &[ContainerSummary]) -> Option<String> {
 fn short(id: &str) -> &str {
     let id = id.strip_prefix("sha256:").unwrap_or(id);
     &id[..id.len().min(12)]
+}
+
+/// Starts a container this deployment stopped (`recreate`) again; one already running is not an error.
+async fn start_again(d: &Docker, id: &str) -> Result<(), String> {
+    match d.start_container(id, None).await {
+        Ok(()) => Ok(()),
+        // 304: already running.
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => Ok(()),
+        Err(e) => Err(message(&e)),
+    }
 }
 
 async fn stop(d: &Docker, id: &str) -> Result<(), String> {
@@ -764,6 +798,7 @@ mod tests {
             },
             routes: None,
             drain_secs: None,
+            strategy: None,
         }
     }
 

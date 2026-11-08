@@ -1108,6 +1108,7 @@ mod tests {
             },
             routes: None,
             drain_secs: None,
+            strategy: None,
         });
         Command { id: "cmd_1".into(), op }
     }

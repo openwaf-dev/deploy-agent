@@ -52,7 +52,7 @@ then:
 
    ```json
    {"token": "owde_…", "public_key": "<agent public key>", "name": "web-1",
-    "hostname": "…", "os": "…", "arch": "…", "kernel": "…", "agent_version": "0.3.1+…", "protocol": 2}
+    "hostname": "…", "os": "…", "arch": "…", "kernel": "…", "agent_version": "0.3.2+…", "protocol": 2}
    ```
 
    `protocol` is the highest protocol version the agent speaks (absent: 1). The control plane holds a server enrolled
@@ -422,9 +422,12 @@ Notes on specific operations:
 - **`deploy_app`** fetches the source (Git) or pulls the image, builds it, and starts the new container next to the
   current one. It then waits until the container is healthy, points the router at it, drains the old container and
   removes it. Progress is streamed as `step` and `log` events. The deployment can be cancelled until the router
-  switches, and a cancelled deployment restores the previous container.
-- **`app_action`** with `remove` deletes the application's containers, images and router routes. Volumes stay
-  (`volume_remove`).
+  switches, and a cancelled deployment restores the previous container. A path the image declares as a volume
+  (`VOLUME`) without a mount at exactly that path gets a `system` log line: it is an anonymous volume, removed with
+  the container when the next deployment replaces it (`deploy_compose` reports those of each service, and its mounts
+  of type `volume` without a source).
+- **`app_action`** with `remove` deletes the application's containers (with their anonymous volumes), images, router
+  routes and file mounts. Named volumes stay (`volume_remove`).
 - **`volume_remove`** is refused while any container of the application exists. It also removes the application's
   file mounts.
 - **`firewall_sync`** replaces the agent's rules. Published ports become reachable only from `allow`, which is the
@@ -445,6 +448,7 @@ Notes on specific operations:
 | `run` | `RunSpec`: `image_tag`, `env`, `port`, `publish`, `health` (`path`, `interval_secs`, `timeout_secs`, `retries`), `command`, `memory_bytes`, `cpus`, `labels`, `volumes` (`name`, `path`, `service`), `files` (`path`, `content`, `service`) |
 | `routes` | router routes applied when the new container takes over (null: one route on `run.publish`) |
 | `drain_secs` | seconds the previous container keeps serving requests in flight (default 10) |
+| `strategy` | `rolling` (absent: the new container starts next to the running one, the router switches once it is healthy, then the previous one drains and stops) or `recreate` (the running container stops before the new one starts, so two never use the volumes at once; if the new one fails, the previous one is started again) (`recreate`) |
 
 Notes on `AppDeploy` fields:
 
@@ -620,6 +624,7 @@ If a key is lost or leaked, a root user on the server can replace the pinned key
 | `sbom` | `sbom` events of `deploy_app` and `deploy_compose` |
 | `build_egress` | builds only through the build egress proxy, `BuildSpec.egress`, `ComposeDeploy.egress`, `egress` events |
 | `registry_auth` | `ComposeDeploy.registry_auth`, `BuildSpec.registry_auth`, redaction of credentials from the operation's logs and errors (agent 0.3.0) |
+| `recreate` | `AppDeploy.strategy` `recreate` |
 
 ## 10. Self-update
 

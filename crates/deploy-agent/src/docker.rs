@@ -192,7 +192,7 @@ pub fn check_volume(resource: &str, name: &str, labels: Option<&HashMap<String, 
         true => Ok(()),
         false => Err(format!(
             "volume {name} is not a volume of {resource} (named {prefix}-… or {prefix}_…, with its label): refusing \
-             to remove it"
+             to use or remove it"
         )),
     }
 }
