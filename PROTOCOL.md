@@ -52,7 +52,7 @@ then:
 
    ```json
    {"token": "owde_…", "public_key": "<agent public key>", "name": "web-1",
-    "hostname": "…", "os": "…", "arch": "…", "kernel": "…", "agent_version": "0.3.2+…", "protocol": 2}
+    "hostname": "…", "os": "…", "arch": "…", "kernel": "…", "agent_version": "0.3.3+…", "protocol": 2}
    ```
 
    `protocol` is the highest protocol version the agent speaks (absent: 1). The control plane holds a server enrolled

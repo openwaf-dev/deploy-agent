@@ -159,9 +159,12 @@ fn short(id: &str) -> &str {
 
 /// Sends the SBOM of an image the deployment built and loaded ([`crate::oci::Loaded`]).
 pub async fn built(ev: &Events, image: &crate::oci::Loaded, service: Option<&str>) {
-    match &image.sbom {
-        Some(doc) => send(ev, &image.id, service, doc, "BuildKit attestation").await,
-        None => ev.system(format!("No SBOM for {}: the build made no SBOM attestation", short(&image.id))).await,
+    match (&image.sbom, &image.sbom_skipped) {
+        (Some(doc), _) => send(ev, &image.id, service, doc, "BuildKit attestation").await,
+        (None, Some(why)) => ev.system(format!("No SBOM for {}: {why}", short(&image.id))).await,
+        (None, None) => {
+            ev.system(format!("No SBOM for {}: the build made no SBOM attestation", short(&image.id))).await
+        }
     }
 }
 

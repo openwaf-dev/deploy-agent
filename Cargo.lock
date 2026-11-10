@@ -321,7 +321,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "deploy-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "bollard",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-proto"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",

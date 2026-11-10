@@ -64,6 +64,8 @@ pub struct Loaded {
     pub id: String,
     /// The SPDX JSON document of its SBOM attestation, if the build made one.
     pub sbom: Option<Vec<u8>>,
+    /// Why the build's SBOM attestation was not read (it is too large to keep), if so: the image loads without it.
+    pub sbom_skipped: Option<String>,
 }
 
 /// What the checks found in the layout: the image to load.
@@ -77,6 +79,7 @@ struct Selected {
     /// Digests (hex) of the layers, in order.
     layers: Vec<String>,
     sbom: Option<Vec<u8>>,
+    sbom_skipped: Option<String>,
 }
 
 /// The blobs of a layout as read: every digest with its size, and the content of the small ones.
@@ -179,14 +182,25 @@ fn select(index: &[u8], blobs: &Blobs, expect: Expect<'_>) -> Result<Selected, S
     }
     let subject = format!("sha256:{hex}");
     let mut sbom = None;
+    let mut sbom_skipped = None;
     for (_, att) in attestations.iter().filter(|(s, _)| *s == subject) {
         for l in att.get("layers").and_then(Value::as_array).into_iter().flatten() {
             let predicate =
                 l.get("annotations").and_then(|a| a.get("in-toto.io/predicate-type")).and_then(Value::as_str);
-            if sbom.is_some() || predicate != Some(SPDX_PREDICATE) {
+            if sbom.is_some() || sbom_skipped.is_some() || predicate != Some(SPDX_PREDICATE) {
                 continue;
             }
-            let (_, digest, _) = descriptor(l, blobs, "attestation")?;
+            let (_, digest, size) = descriptor(l, blobs, "attestation")?;
+            // The SBOM is metadata about the image, not part of it: one too large to keep in memory never fails the
+            // deployment (the image is checked and loaded without it, and the log says why there is no SBOM).
+            if !blobs.kept.contains_key(&digest) {
+                sbom_skipped = Some(format!(
+                    "its SBOM attestation sha256:{digest} ({:.1} MiB) is larger than the {} MiB the agent reads",
+                    size as f64 / (1 << 20) as f64,
+                    MAX_METADATA_BYTES >> 20
+                ));
+                continue;
+            }
             let statement = parse(blobs.get(&format!("sha256:{digest}"), "attestation")?, "attestation")?;
             if statement.get("predicateType").and_then(Value::as_str) == Some(SPDX_PREDICATE)
                 && let Some(p) = statement.get("predicate")
@@ -195,7 +209,7 @@ fn select(index: &[u8], blobs: &Blobs, expect: Expect<'_>) -> Result<Selected, S
             }
         }
     }
-    Ok(Selected { manifest: (hex, size), manifest_type: media, config, layers, sbom })
+    Ok(Selected { manifest: (hex, size), manifest_type: media, config, layers, sbom, sbom_skipped })
 }
 
 /// The resource and deployment labels of the build, exactly.
@@ -479,7 +493,7 @@ pub async fn load(
     let opts =
         bollard::query_parameters::TagImageOptionsBuilder::default().repo(repo).tag(t.unwrap_or("latest")).build();
     d.tag_image(&id, Some(opts)).await.map_err(|e| format!("tag {id} as {tag}: {}", message(&e)))?;
-    Ok(Loaded { id, sbom: selected.sbom })
+    Ok(Loaded { id, sbom: selected.sbom, sbom_skipped: selected.sbom_skipped })
 }
 
 #[cfg(test)]
@@ -501,6 +515,11 @@ mod tests {
     }
 
     fn layout(labels: Value, layers: usize) -> Layout {
+        layout_with_sbom(labels, layers, 0)
+    }
+
+    /// [`layout`] whose SPDX document carries `padding` more bytes (a large image's SBOM).
+    fn layout_with_sbom(labels: Value, layers: usize, padding: usize) -> Layout {
         let mut blobs = Vec::new();
         let mut add = |b: Vec<u8>| {
             let h = sha(&b);
@@ -523,7 +542,7 @@ mod tests {
         let (mh, ml) = add(manifest);
         let statement = serde_json::to_vec(&json!({
             "_type": "https://in-toto.io/Statement/v1", "predicateType": SPDX_PREDICATE, "subject": [],
-            "predicate": {"spdxVersion": "SPDX-2.3", "name": "sbom"},
+            "predicate": {"spdxVersion": "SPDX-2.3", "name": "sbom", "comment": "x".repeat(padding)},
         }))
         .unwrap();
         let (sh, sl) = add(statement);
@@ -626,6 +645,27 @@ mod tests {
         // A manifest.json of the helper (it could tag any image) is refused, not passed on.
         let tagged = l.archive(|b| append(b, "img/manifest.json", 2, &b"[]"[..]).unwrap());
         assert!(run(&tagged, EXPECT).unwrap_err().contains("manifest.json"));
+    }
+
+    #[test]
+    fn an_sbom_attestation_too_large_to_read_is_skipped_and_the_image_still_loads() {
+        let big = MAX_METADATA_BYTES as usize + 1;
+        let l = layout_with_sbom(labels("app_01J", "dep_01X"), 2, big);
+        let (s, out) = run(&l.archive(|_| {}), EXPECT).unwrap();
+        assert_eq!(s.manifest.0, l.manifest);
+        assert_eq!(s.layers.len(), 2);
+        assert_eq!(s.sbom, None);
+        let why = s.sbom_skipped.as_deref().unwrap();
+        assert!(why.contains("SBOM attestation") && why.contains("larger than the 4 MiB"), "{why}");
+        let out = entries(&out);
+        let index: Value = serde_json::from_slice(&out.iter().find(|(n, _)| n == "index.json").unwrap().1).unwrap();
+        assert_eq!(index["manifests"][0]["digest"], format!("sha256:{}", l.manifest));
+        // The 4 MiB cap still holds for what the load needs: an oversized image configuration is refused.
+        let huge = labels("app_01J", "dep_01X");
+        let mut huge = huge.as_object().unwrap().clone();
+        huge.insert("padding".into(), json!("x".repeat(big)));
+        let l = layout(Value::Object(huge), 1);
+        assert!(run(&l.archive(|_| {}), EXPECT).unwrap_err().contains("larger than 4 MiB"));
     }
 
     #[test]
