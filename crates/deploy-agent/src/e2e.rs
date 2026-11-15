@@ -63,8 +63,8 @@ use std::time::Duration;
 use deploy_proto::msg::{
     AppActionKind, AppDeploy, AppState, BuildEgress, BuildPack, BuildSpec, ComposeDeploy, ComposeOutput, ComposeSource,
     DeployOutput, EgressDecision, EgressMode, Event, ExecOutput, ExecSpec, FileMount, FirewallRules, HealthCheck,
-    LABEL_ENVIRONMENT, LogStream, Op, Outcome, RegistryAuth, ResourceRoutes, Route, RouterConfig, RouterState, RunSpec,
-    Source, SshAuth, Step, UpdateStrategy, VolumeMount,
+    LABEL_ENVIRONMENT, LogStream, Op, Outcome, PortProbe, RegistryAuth, ResourceRoutes, Route, RouterConfig,
+    RouterState, RunSpec, Source, SshAuth, Step, UpdateStrategy, VolumeMount, cause,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -103,9 +103,30 @@ impl Run {
 
     fn err(&self) -> String {
         match &self.outcome {
-            Outcome::Error { message } => message.clone(),
+            Outcome::Error { message, .. } => message.clone(),
             o => panic!("expected an error, got {o:?}"),
         }
+    }
+
+    /// The code of the failure's cause, if it has one.
+    fn cause(&self) -> Option<String> {
+        match &self.outcome {
+            Outcome::Error { cause, .. } => cause.as_ref().map(|c| c.code.clone()),
+            o => panic!("expected an error, got {o:?}"),
+        }
+    }
+
+    /// Parameter `name` of the failure's cause.
+    fn param(&self, name: &str) -> Option<String> {
+        match &self.outcome {
+            Outcome::Error { cause: Some(c), .. } => c.params.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Asserts the failure's cause is `code`.
+    fn assert_cause(&self, code: &str) {
+        assert_eq!(self.cause().as_deref(), Some(code), "{}; log:\n{}", self.err(), self.log().join("\n"));
     }
 
     fn steps(&self) -> Vec<Step> {
@@ -233,7 +254,7 @@ async fn remove_app(resource: &str) {
 }
 
 async fn status(resource: &str) -> AppState {
-    run(Op::AppStatus { resource: resource.into() }).await.ok()
+    run(Op::AppStatus { resource: resource.into(), probes: Vec::new() }).await.ok()
 }
 
 async fn http(url: &str) -> Result<(u16, String), String> {
@@ -342,6 +363,8 @@ async fn image_deploy_switch_rollback_and_logs() {
     assert!(failed.err().contains("health check failed"), "{}", failed.err());
     assert!(failed.log().iter().any(|l| l.contains("HTTP 404")));
     assert!(failed.log().iter().any(|l| l == "The previous container keeps serving"));
+    failed.assert_cause(cause::HEALTH_BAD_STATUS);
+    assert_eq!((failed.param("status").as_deref(), failed.param("path").as_deref()), (Some("404"), Some("/missing")));
     let s = status(app).await;
     assert_eq!(s.containers.len(), 1, "{s:?}");
     assert_eq!((s.containers[0].id.as_str(), s.containers[0].state.as_str()), (out2.container_id.as_str(), "running"));
@@ -355,6 +378,8 @@ async fn image_deploy_switch_rollback_and_logs() {
     let crashed = run(crash).await;
     assert!(crashed.err().contains("exited with code 3"), "{}", crashed.err());
     assert!(crashed.lines(Some(LogStream::Stderr)).contains(&"boom".to_string()));
+    crashed.assert_cause(cause::CONTAINER_EXITED);
+    assert_eq!(crashed.param("exit_code").as_deref(), Some("3"));
     assert_eq!(http("http://127.0.0.1:28081/").await.unwrap().0, 200);
 
     // Logs: the tail, with Docker's timestamps.
@@ -733,7 +758,7 @@ async fn git_deploy_builds_the_commit_and_cancel_cleans_up() {
     }
     assert!(saw_building);
     let o = tokio::time::timeout(Duration::from_secs(30), task).await.expect("cancel is prompt").unwrap();
-    assert_eq!(o, Outcome::Error { message: "cancelled".into() });
+    assert_eq!(o, Outcome::Error { message: "cancelled".into(), cause: None });
     assert_eq!(leftovers(), (String::new(), 0));
     assert_eq!(docker_cli(&["images", "-q", "owd/app_e2egit:dep_e2eg0003"]), "");
     // The build session closes with the helper: BuildKit stops the step it was running.
@@ -849,7 +874,7 @@ cat > Dockerfile <<'EOF'
 FROM curlimages/curl:8.17.0 AS probe
 ARG URLS
 USER root
-RUN mkdir /out && for u in $URLS; do curl -fsS --max-time 20 -o /dev/null "$u" || exit 1; done
+RUN mkdir /out && for u in $URLS; do curl -fsS --max-time 20 -o /dev/null "$u" || { echo "could not fetch $u" >&2; exit 1; }; done
 RUN rc=0; curl -sS --noproxy '*' --max-time 10 -o /dev/null http://192.0.2.1/ || rc=$?; echo "$rc" > /out/direct
 RUN if nslookup example.org >/dev/null 2>&1; then echo resolved; else echo refused; fi > /out/dns
 FROM busybox:1.37
@@ -857,6 +882,10 @@ COPY --from=probe /out /www
 CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]
 EOF
 git add -A && git commit -qm egress && git clone -q --bare . /srv/git/egress.git
+mkdir /tmp/broken && cd /tmp/broken && git init -q
+printf 'FROM busybox:1.37\nRUN echo building && exit 1\n' > Dockerfile
+printf 'FROM busybox:1.37\nRUN sh -c "exit 137"\n' > Killed.Dockerfile
+git add -A && git commit -qm broken && git clone -q --bare . /srv/git/broken.git
 "#;
     docker_ok(&["exec", "-u", "git", GIT_SERVER, "sh", "-c", script]);
     let ip = docker_cli(&["inspect", "-f", "{{.NetworkSettings.IPAddress}}", GIT_SERVER]);
@@ -912,6 +941,8 @@ async fn deploy_keys_clone_over_ssh_and_static_sites_build() {
     let refused = run(Op::DeployApp(d)).await;
     assert!(refused.err().contains("git fetch failed"), "{}", refused.err());
     assert!(refused.log().iter().any(|l| l.contains("Host key verification failed")), "{:?}", refused.log());
+    refused.assert_cause(cause::GIT_HOST_KEY_CHANGED);
+    assert_eq!(refused.param("host"), Some(srv.ip.clone()));
     assert_eq!(status(app).await.containers[0].id, pinned.container_id);
     remove_app(app).await;
 
@@ -980,6 +1011,7 @@ async fn untrusted_builds_are_rootless_pinned_and_skip_submodules() {
     let moved = run(spec("dep_E2EF0002", Some("0123456789abcdef0123456789abcdef01234567"), true)).await;
     assert!(moved.err().contains("git fetch failed"), "{}", moved.err());
     assert!(moved.log().iter().any(|l| l.contains("not at the commit to deploy")), "{:?}", moved.log());
+    moved.assert_cause(cause::GIT_COMMIT_MISMATCH);
     assert_eq!(docker_cli(&["images", "-q", "owd/app_e2efork:dep_e2ef0002"]), "");
     let r = run(spec("dep_E2EF0003", Some(&head), true)).await;
     let out: DeployOutput = r.ok();
@@ -1074,6 +1106,8 @@ async fn build_egress_policies_are_enforced_by_the_proxy() {
     let r = run(spec("dep_E2EX0002", "https://example.org/", allowlist.clone())).await;
     assert!(r.err().contains("build failed"), "{}", r.err());
     assert!(r.log().iter().any(|l| l == "Build egress denied: example.org:443 (not_allowed)"), "{:?}", r.log());
+    r.assert_cause(cause::BUILD_EGRESS_DENIED);
+    assert_eq!((r.param("host").as_deref(), r.param("port").as_deref()), (Some("example.org"), Some("443")));
     let (_, _, entries) = egress_report(&r);
     assert!(entries.contains(&("example.org".into(), 443, EgressDecision::Denied, Some("not_allowed".into()))));
     // An address instead of a name is refused in allowlist mode.
@@ -1370,9 +1404,12 @@ async fn private_registry_pulls_and_builds_with_the_selected_credential_only() {
     };
     let r = run(image_op("dep_E2ER0001", None)).await;
     assert_eq!(r.err(), anonymous, "{:?}", r.log());
+    r.assert_cause(cause::REGISTRY_ANONYMOUS_REFUSED);
+    assert_eq!((r.param("host"), r.param("repo").as_deref()), (Some(REGISTRY.to_string()), Some("e2e/base")));
     runs.push(r);
     let r = run(image_op("dep_E2ER0002", Some(wrong.clone()))).await;
     assert_eq!(r.err(), rejected, "{:?}", r.log());
+    r.assert_cause(cause::REGISTRY_CREDENTIAL_REJECTED);
     runs.push(r);
     let r = run(image_op("dep_E2ER0003", Some(auth.clone()))).await;
     r.ok::<DeployOutput>();
@@ -1427,10 +1464,12 @@ async fn private_registry_pulls_and_builds_with_the_selected_credential_only() {
     let r = run(build_op(first, "dep_E2ER0011", 28097, vec![])).await;
     assert!(r.err().contains("build failed"), "{}", r.err());
     assert!(r.log().contains(&anonymous), "{:?}", r.log());
+    r.assert_cause(cause::REGISTRY_ANONYMOUS_REFUSED);
     runs.push(r);
     let r = run(build_op(first, "dep_E2ER0012", 28097, vec![wrong.clone()])).await;
     assert!(r.err().contains("build failed"), "{}", r.err());
     assert!(r.log().contains(&rejected), "{:?}", r.log());
+    r.assert_cause(cause::REGISTRY_CREDENTIAL_REJECTED);
     runs.push(r);
     let watch = ConfigWatch::start(format!("{REGISTRY_PASSWORD}\n{pair}\n"));
     let r = run(build_op(first, "dep_E2ER0013", 28097, vec![auth.clone()])).await;
@@ -1948,6 +1987,36 @@ async fn recreate_stops_the_previous_container_before_the_new_one_starts() {
     run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok::<serde_json::Value>();
 }
 
+/// The health check's early probe passes a container that is ready at once, without waiting an interval; the
+/// container runs under the Engine's init, so a process an `exec` leaves behind is reaped instead of staying a zombie.
+#[tokio::test]
+async fn the_health_check_starts_early_and_init_reaps_exec_orphans() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2einit";
+    remove_app(app).await;
+    let mut d = app_spec(app, "dep_E2EI0001", 8080, Some(28146));
+    d.run.health = Some(HealthCheck { path: "/".into(), interval_secs: 5, timeout_secs: 2, retries: 3 });
+    let started = std::time::Instant::now();
+    let r = run(Op::DeployApp(d)).await;
+    r.ok::<DeployOutput>();
+    assert!(r.log().iter().any(|l| l == "Health check passed: HTTP 200"), "{:?}", r.log());
+    assert!(
+        !r.log().iter().any(|l| l.starts_with("Health check 1/3")),
+        "passed before the first interval: {:?}",
+        r.log()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+    assert_eq!(exec_in(app, "cat /proc/1/comm").await, "docker-init");
+    // The subshell exits at once; its `sleep` is orphaned to PID 1 and, once done, must not stay a zombie.
+    exec_in(app, "(sleep 1 &); true").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(exec_in(app, "grep -l '^State:.*Z' /proc/[0-9]*/status | wc -l").await, "0");
+    remove_app(app).await;
+}
+
 fn app_spec(resource: &str, deployment: &str, port: u16, publish: Option<u16>) -> AppDeploy {
     let mut d = app_deploy(resource, deployment, image("busybox:1.37"), port, publish, Some("/"));
     // The image source is retagged per deployment; busybox has no web server of its own running.
@@ -2033,6 +2102,345 @@ async fn prune_keeps_listed_and_used_images() {
     docker_cli(&["rm", "-f", "owd-e2e-prune-user"]);
     remove_app(app).await;
     assert_eq!(docker_cli(&["images", "-q", &format!("owd/{app}")]), "");
+}
+
+/// Waits up to `secs` for `f` to return Some.
+async fn within<T>(secs: u64, mut f: impl AsyncFnMut() -> Option<T>) -> T {
+    for _ in 0..secs * 2 {
+        if let Some(v) = f().await {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("not within {secs} s");
+}
+
+/// Typed failures (PROTOCOL.md §5) of a deployment's container and health check, the port check's warning after a
+/// deployment without a health check, a rollback to an image no longer on the server, and the facts and port probes
+/// of `AppStatus`.
+#[tokio::test]
+async fn container_and_health_failures_name_their_cause() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2ediag";
+    remove_app(app).await;
+    let first = run(deploy(app, "dep_E2ED0001", image("nginx:1.29-alpine"), 80, 28150, Some("/"))).await;
+    let out: DeployOutput = first.ok();
+    assert_eq!(out.warning, None);
+    let nginx = out.image.clone();
+    let local = |deployment: &str, image: &str, port: u16, health: Option<&str>| {
+        app_deploy(app, deployment, Source::Local { image: image.into() }, port, Some(28150), health)
+    };
+
+    // Port probes at the current container's address on the named network; any HTTP answer passes.
+    let probe = |port: u16, network: &str| PortProbe { service: None, port, network: network.into() };
+    let probes = vec![probe(80, NETWORK), probe(8081, NETWORK), probe(80, "owd-e2enonet")];
+    let s: AppState = run(Op::AppStatus { resource: app.into(), probes }).await.ok();
+    let got: Vec<_> = s.probes.iter().map(|p| (p.port, p.status, p.error.as_deref())).collect();
+    assert_eq!(got, [(80, Some(200), None), (8081, None, Some("refused")), (80, None, Some("no_address"))]);
+    // The facts of the inspect.
+    let c = &s.containers[0];
+    assert_eq!(
+        (c.exit_code, c.oom_killed, c.restart_count, c.service.as_deref()),
+        (Some(0), Some(false), Some(0), None)
+    );
+    assert!(c.started_at.is_some() && c.finished_at.is_none(), "{c:?}");
+
+    // Out of memory before the deployment's checks pass.
+    let mut oom = local("dep_E2ED0002", &nginx, 80, None);
+    oom.run.command = Some(vec!["tail".into(), "/dev/zero".into()]);
+    oom.run.memory_bytes = Some(16 << 20);
+    let r = run(Op::DeployApp(oom)).await;
+    r.assert_cause(cause::CONTAINER_OOM_KILLED);
+    assert!(r.err().ends_with("(out of memory)"), "{}", r.err());
+
+    // A command that does not exist: the Engine refuses the start.
+    let bb = "owd/app_e2ediag:busybox";
+    docker_ok(&["tag", "busybox:1.37", bb]);
+    let mut missing = local("dep_E2ED0003", bb, 80, Some("/"));
+    missing.run.command = Some(vec!["/nonexistent".into()]);
+    let r = run(Op::DeployApp(missing)).await;
+    r.assert_cause(cause::CONTAINER_START_FAILED);
+    assert!(r.param("detail").unwrap().contains("/nonexistent"), "{:?}", r.param("detail"));
+
+    // A port nothing listens on: with a health check, the deployment fails.
+    let r = run(Op::DeployApp(local("dep_E2ED0004", &nginx, 8081, Some("/")))).await;
+    r.assert_cause(cause::HEALTH_NO_ANSWER);
+    let params = ["port", "path", "error", "tries"].map(|p| r.param(p));
+    assert_eq!(params.each_ref().map(Option::as_deref), [Some("8081"), Some("/"), Some("refused"), Some("5")]);
+    assert_eq!(http("http://127.0.0.1:28150/").await.unwrap().0, 200, "the previous container keeps serving");
+
+    // Without one, it serves anyway, with the port check's warning; on the right port, without.
+    let r = run(Op::DeployApp(local("dep_E2ED0005", &nginx, 8081, None))).await;
+    let warning = r.ok::<DeployOutput>().warning.expect("the port check's warning");
+    assert_eq!(warning.code, cause::RUNTIME_NOT_LISTENING);
+    assert_eq!((warning.params["port"].as_str(), warning.params["error"].as_str()), ("8081", "refused"));
+    assert!(r.log().iter().any(|l| l.starts_with("Warning: nothing answered GET / on port 8081")), "{:?}", r.log());
+    let r = run(Op::DeployApp(local("dep_E2ED0006", &nginx, 80, None))).await;
+    assert_eq!(r.ok::<DeployOutput>().warning, None);
+    assert_eq!(http("http://127.0.0.1:28150/").await.unwrap().0, 200);
+
+    // A rollback to one of the application's images, removed since.
+    let gone = "owd/app_e2ediag:dep_e2ed0000";
+    docker_ok(&["tag", &nginx, gone]);
+    docker_ok(&["rmi", gone]);
+    let r = run(Op::DeployApp(local("dep_E2ED0007", gone, 80, Some("/")))).await;
+    r.assert_cause(cause::IMAGE_MISSING_ON_SERVER);
+    assert_eq!(r.param("image").as_deref(), Some(gone));
+    remove_app(app).await;
+}
+
+/// What `AppStatus` reports of containers Docker restarts after a good deployment: one exiting at once on every
+/// restart (a crash loop), and one crashing after 15 s, running between its restarts.
+#[tokio::test]
+async fn restarting_containers_report_their_restarts() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2ecrash";
+    remove_app(app).await;
+    let base = "owd/app_e2ecrash:dep_base";
+    docker_ok(&["tag", "busybox:1.37", base]);
+    let site = "mkdir -p /www && echo ok > /www/index.html && httpd -p 8080 -h /www";
+    let spec = |deployment: &str, script: String| {
+        let mut d = app_deploy(app, deployment, Source::Local { image: base.into() }, 8080, Some(28152), Some("/"));
+        d.run.command = Some(vec!["sh".into(), "-c".into(), script]);
+        Op::DeployApp(d)
+    };
+    // Its first run passes the health check; every restart exits at once (the file stays with the container).
+    let once = format!("if [ -e /tmp/ran ]; then exit 7; fi; touch /tmp/ran; {site} && sleep 5; exit 7");
+    run(spec("dep_E2EK0001", once)).await.ok::<DeployOutput>();
+    let c = within(60, async || {
+        let c = status(app).await.containers.into_iter().next()?;
+        (c.restart_count >= Some(3) && c.state != "running").then_some(c)
+    })
+    .await;
+    assert_eq!((c.exit_code, c.oom_killed), (Some(7), Some(false)), "{c:?}");
+    assert!(c.finished_at.is_some(), "{c:?}");
+
+    // Crashing after 15 s: Docker's restart delay resets, so it runs between restarts.
+    run(spec("dep_E2EK0002", format!("{site} && sleep 15; exit 9"))).await.ok::<DeployOutput>();
+    for n in [1, 2] {
+        let c = within(40, async || {
+            let c = status(app).await.containers.into_iter().next()?;
+            (c.restart_count >= Some(n)).then_some(c)
+        })
+        .await;
+        assert_eq!((c.state.as_str(), c.restart_count), ("running", Some(n)), "{c:?}");
+    }
+    remove_app(app).await;
+    docker_cli(&["rmi", base]);
+}
+
+/// Typed failures of builds and Git fetches (`BuildWatch`, `GitWatch`), and of a Compose file missing from its
+/// repository.
+#[tokio::test]
+async fn build_and_git_failures_name_their_cause() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let srv = git_server();
+    let app = "app_e2ediagb";
+    remove_app(app).await;
+    let ssh = |key: &str| Some(SshAuth { private_key: key.into(), known_hosts: vec![srv.host_key.clone()] });
+    let spec = |deployment: &str, url: String, reference: &str, dockerfile: &str, key: &str| {
+        let source = Source::Git { url, reference: reference.into(), auth: None, ssh: ssh(key), commit: None };
+        let mut d = app_deploy(app, deployment, source, 8080, Some(28153), Some("/"));
+        d.build = Some(BuildSpec { dockerfile: dockerfile.into(), no_cache: true, ..build(BuildPack::Dockerfile) });
+        Op::DeployApp(d)
+    };
+    let repo = |name: &str| format!("ssh://git@{}:22/srv/git/{name}", srv.ip);
+
+    let r = run(spec("dep_E2EB0001", repo("broken.git"), "main", "Dockerfile", &srv.key)).await;
+    r.assert_cause(cause::BUILD_PROJECT_FAILED);
+    assert_eq!((r.param("exit_code").as_deref(), r.param("pack").as_deref()), (Some("1"), Some("dockerfile")));
+    let r = run(spec("dep_E2EB0002", repo("broken.git"), "main", "Nope.Dockerfile", &srv.key)).await;
+    r.assert_cause(cause::BUILD_DOCKERFILE_MISSING);
+    assert_eq!(r.param("path").as_deref(), Some("Nope.Dockerfile"));
+    let r = run(spec("dep_E2EB0003", repo("broken.git"), "main", "Killed.Dockerfile", &srv.key)).await;
+    r.assert_cause(cause::BUILD_KILLED);
+
+    let r = run(spec("dep_E2EB0004", repo("hello.git"), "nope-branch", "Dockerfile", &srv.key)).await;
+    r.assert_cause(cause::GIT_REF_NOT_FOUND);
+    assert_eq!(r.param("reference").as_deref(), Some("nope-branch"));
+    // A deploy key the server does not authorize.
+    let dir = crate::git::TempDir::new().unwrap();
+    let other = dir.path().join("other");
+    let o = Proc::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&other).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let other = std::fs::read_to_string(&other).unwrap();
+    drop(dir);
+    let r = run(spec("dep_E2EB0005", repo("hello.git"), "master", "Dockerfile", &other)).await;
+    r.assert_cause(cause::GIT_DEPLOY_KEY_REFUSED);
+    assert_eq!(r.param("host"), Some(srv.ip.clone()));
+    let r = run(spec("dep_E2EB0006", "ssh://git@nonexistent.test/x.git".into(), "main", "Dockerfile", &srv.key)).await;
+    r.assert_cause(cause::GIT_HOST_UNREACHABLE);
+    assert_eq!(r.param("host").as_deref(), Some("nonexistent.test"));
+    assert_eq!(leftovers(), (String::new(), 0));
+
+    // A Compose file that is not in the repository.
+    let compose = ComposeDeploy {
+        resource: app.into(),
+        deployment: "dep_E2EB0007".into(),
+        network: NETWORK.into(),
+        source: ComposeSource::Git {
+            url: repo("hello.git"),
+            reference: "master".into(),
+            auth: None,
+            ssh: ssh(&srv.key),
+            file: "deploy/compose.yaml".into(),
+        },
+        env: Default::default(),
+        volumes: vec![],
+        files: vec![],
+        labels: [(LABEL_ENVIRONMENT.to_string(), "e2e-env".to_string())].into(),
+        routes: vec![],
+        no_cache: false,
+        egress: None,
+        registry_auth: Vec::new(),
+    };
+    let r = run(Op::DeployCompose(compose)).await;
+    r.assert_cause(cause::COMPOSE_FILE_MISSING);
+    assert_eq!(r.param("path").as_deref(), Some("deploy/compose.yaml"));
+    remove_app(app).await;
+    docker_cli(&["rm", "-f", GIT_SERVER]);
+}
+
+/// Typed failures of Compose projects: the file, the networks and volumes it names, its images and its services.
+#[tokio::test]
+async fn compose_failures_name_their_cause() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2ediagc";
+    remove_app(app).await;
+    let spec = |deployment: &str, content: &str| {
+        Op::DeployCompose(ComposeDeploy {
+            resource: app.into(),
+            deployment: deployment.into(),
+            network: NETWORK.into(),
+            source: ComposeSource::Inline { content: content.into() },
+            env: Default::default(),
+            volumes: vec![],
+            files: vec![],
+            labels: [(LABEL_ENVIRONMENT.to_string(), "e2e-env".to_string())].into(),
+            routes: vec![],
+            no_cache: false,
+            egress: None,
+            registry_auth: Vec::new(),
+        })
+    };
+    let r = run(spec("dep_E2EC0101", "services:\n  web:\n    image: [busybox\n")).await;
+    r.assert_cause(cause::COMPOSE_INVALID);
+    let r = run(spec("dep_E2EC0102", "services:\n  web:\n    image: owd-e2e-absent:1\n    pull_policy: never\n")).await;
+    r.assert_cause(cause::COMPOSE_IMAGE_NOT_ON_SERVER);
+    assert_eq!((r.param("service").as_deref(), r.param("image").as_deref()), (Some("web"), Some("owd-e2e-absent:1")));
+    let r = run(spec(
+        "dep_E2EC0103",
+        "services:\n  web:\n    image: busybox:1.37\n    command: [\"sh\", \"-c\", \"exit 4\"]\n",
+    ))
+    .await;
+    r.assert_cause(cause::COMPOSE_SERVICE_EXITED);
+    let params = ["service", "exit_code", "oom"].map(|p| r.param(p));
+    assert_eq!(params.each_ref().map(Option::as_deref), [Some("web"), Some("4"), Some("false")]);
+    let unhealthy = "services:\n  web:\n    image: busybox:1.37\n    command: [\"sleep\", \"600\"]\n    healthcheck:\n      \
+                     test: [\"CMD\", \"false\"]\n      interval: 1s\n      retries: 1\n";
+    let r = run(spec("dep_E2EC0104", unhealthy)).await;
+    r.assert_cause(cause::COMPOSE_SERVICE_UNHEALTHY);
+    let waits = "services:\n  db:\n    image: busybox:1.37\n    command: [\"sleep\", \"600\"]\n  web:\n    image: \
+                 busybox:1.37\n    command: [\"sleep\", \"600\"]\n    depends_on:\n      db:\n        condition: \
+                 service_healthy\n";
+    let r = run(spec("dep_E2EC0105", waits)).await;
+    r.assert_cause(cause::COMPOSE_NO_HEALTHCHECK);
+    assert_eq!(r.param("service").as_deref(), Some("db"));
+    let external = |name: &str| {
+        format!(
+            "services:\n  web:\n    image: busybox:1.37\n    command: [\"sleep\", \"600\"]\n    volumes: \
+             [\"data:/data\"]\nvolumes:\n  data:\n    external: true\n    name: {name}\n"
+        )
+    };
+    let r = run(spec("dep_E2EC0106", &external("owd-app_e2ediagc-missing"))).await;
+    r.assert_cause(cause::COMPOSE_EXTERNAL_MISSING);
+    assert_eq!(
+        (r.param("kind").as_deref(), r.param("name").as_deref()),
+        (Some("volume"), Some("owd-app_e2ediagc-missing"))
+    );
+    // A preview's volume shares the application's prefix but is not the application's.
+    let foreign = "owd-app_e2ediagc-pr1-data";
+    docker_ok(&["volume", "create", "--label", "dev.openwaf.deploy.resource=app_e2ediagc-pr1", foreign]);
+    let r = run(spec("dep_E2EC0107", &external(foreign))).await;
+    docker_ok(&["volume", "rm", foreign]);
+    r.assert_cause(cause::COMPOSE_EXTERNAL_FOREIGN);
+    // The project's default network, made by someone else.
+    remove_app(app).await;
+    docker_ok(&["network", "create", "owd-app_e2ediagc_default"]);
+    let r =
+        run(spec("dep_E2EC0108", "services:\n  web:\n    image: busybox:1.37\n    command: [\"sleep\", \"600\"]\n"))
+            .await;
+    docker_ok(&["network", "rm", "owd-app_e2ediagc_default"]);
+    r.assert_cause(cause::COMPOSE_NETWORK_CONFLICT);
+    assert_eq!(r.param("network").as_deref(), Some("owd-app_e2ediagc_default"));
+    remove_app(app).await;
+}
+
+/// Every code an agent sends (`AGENT_CODES`) is produced by one of the diagnosis cases above with real Docker, or
+/// is listed here with the reason it is not.
+#[test]
+fn every_agent_code_has_an_end_to_end_case_or_a_reason() {
+    use deploy_proto::msg::cause::*;
+    let cases: &[(&str, &str)] = &[
+        (REGISTRY_ANONYMOUS_REFUSED, "private_registry_pulls_and_builds_with_the_selected_credential_only"),
+        (REGISTRY_CREDENTIAL_REJECTED, "private_registry_pulls_and_builds_with_the_selected_credential_only"),
+        (IMAGE_MISSING_ON_SERVER, "container_and_health_failures_name_their_cause"),
+        (GIT_DEPLOY_KEY_REFUSED, "build_and_git_failures_name_their_cause"),
+        (GIT_HOST_KEY_CHANGED, "deploy_keys_clone_over_ssh_and_static_sites_build"),
+        (GIT_REF_NOT_FOUND, "build_and_git_failures_name_their_cause"),
+        (GIT_HOST_UNREACHABLE, "build_and_git_failures_name_their_cause"),
+        (GIT_COMMIT_MISMATCH, "untrusted_builds_are_rootless_pinned_and_skip_submodules"),
+        (BUILD_PROJECT_FAILED, "build_and_git_failures_name_their_cause"),
+        (BUILD_DOCKERFILE_MISSING, "build_and_git_failures_name_their_cause"),
+        (BUILD_KILLED, "build_and_git_failures_name_their_cause"),
+        (BUILD_EGRESS_DENIED, "build_egress_policies_are_enforced_by_the_proxy"),
+        (COMPOSE_INVALID, "compose_failures_name_their_cause"),
+        (COMPOSE_FILE_MISSING, "build_and_git_failures_name_their_cause"),
+        (COMPOSE_NETWORK_CONFLICT, "compose_failures_name_their_cause"),
+        (COMPOSE_EXTERNAL_MISSING, "compose_failures_name_their_cause"),
+        (COMPOSE_EXTERNAL_FOREIGN, "compose_failures_name_their_cause"),
+        (COMPOSE_IMAGE_NOT_ON_SERVER, "compose_failures_name_their_cause"),
+        (COMPOSE_SERVICE_EXITED, "compose_failures_name_their_cause"),
+        (COMPOSE_SERVICE_UNHEALTHY, "compose_failures_name_their_cause"),
+        (COMPOSE_NO_HEALTHCHECK, "compose_failures_name_their_cause"),
+        (CONTAINER_EXITED, "image_deploy_switch_rollback_and_logs"),
+        (CONTAINER_OOM_KILLED, "container_and_health_failures_name_their_cause"),
+        (CONTAINER_START_FAILED, "container_and_health_failures_name_their_cause"),
+        (HEALTH_NO_ANSWER, "container_and_health_failures_name_their_cause"),
+        (HEALTH_BAD_STATUS, "image_deploy_switch_rollback_and_logs"),
+        (RUNTIME_NOT_LISTENING, "container_and_health_failures_name_their_cause"),
+    ];
+    let reasons: &[(&str, &str)] = &[
+        (DISK_FULL, "filling the Engine's disk is not safe on a shared host; Git, BuildKit and Engine unit tests"),
+        (REGISTRY_ACCESS_DENIED, "the test registry has no per-repository rules; PullFailure unit tests"),
+        (REGISTRY_RATE_LIMITED, "the test registry has no limits; PullFailure unit tests"),
+        (GIT_AUTH_FAILED, "needs a private HTTPS Git host; GitWatch unit tests"),
+        (GIT_REPOSITORY_NOT_FOUND, "needs a private HTTPS Git host; GitWatch unit tests"),
+        (GIT_FETCH_FAILED, "the family's fallback, with no reproducible trigger; GitWatch unit tests"),
+        (HEALTH_FAILED, "the family's fallback, with no reproducible trigger"),
+        (CONTAINER_NO_ADDRESS, "Docker does not omit an address on demand"),
+        (CONTAINER_STOP_FAILED, "the Engine does not refuse a stop on demand"),
+        (
+            CONTAINER_PORT_IN_USE,
+            "the router owns the host ports and the agent routes them, so a bound port only fails a router that \
+             Docker publishes (no iptables integration); Engine unit tests",
+        ),
+        (ROUTER_CONFLICT, "router.rs unit tests"),
+        (COMPOSE_SERVICE_NOT_READY, "waits 300 s; compose.rs unit tests"),
+    ];
+    let mut listed: Vec<&str> = cases.iter().chain(reasons).map(|(c, _)| *c).collect();
+    listed.sort();
+    let mut all = AGENT_CODES.to_vec();
+    all.sort();
+    assert_eq!(listed, all, "each code once, as a case or with a reason");
 }
 
 fn sh(cmd: &[&str]) -> bool {

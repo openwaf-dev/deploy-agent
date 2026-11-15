@@ -23,8 +23,14 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, LogsOptionsBuilder, StopContainerOptionsBuilder,
     TagImageOptionsBuilder,
 };
+use deploy_proto::msg::cause::{
+    CONTAINER_EXITED, CONTAINER_NO_ADDRESS, CONTAINER_OOM_KILLED, CONTAINER_PORT_IN_USE, CONTAINER_START_FAILED,
+    CONTAINER_STOP_FAILED, DISK_FULL, HEALTH_BAD_STATUS, HEALTH_FAILED, HEALTH_NO_ANSWER, IMAGE_MISSING_ON_SERVER,
+    REGISTRY_ACCESS_DENIED, REGISTRY_ANONYMOUS_REFUSED, REGISTRY_CREDENTIAL_REJECTED, REGISTRY_RATE_LIMITED,
+    RUNTIME_NOT_LISTENING,
+};
 use deploy_proto::msg::{
-    AppDeploy, BuildPack, BuildSpec, DEFAULT_DRAIN_SECS, DeployOutput, HealthCheck, LABEL_DEPLOYMENT,
+    AppDeploy, BuildPack, BuildSpec, Cause, DEFAULT_DRAIN_SECS, DeployOutput, HealthCheck, LABEL_DEPLOYMENT,
     LABEL_ENVIRONMENT, LABEL_RESOURCE, LogStream, RegistryAuth, Route, Source, Step, UpdateStrategy,
 };
 use futures_util::StreamExt;
@@ -36,6 +42,7 @@ use crate::docker::{
     split_tag, valid_id,
 };
 use crate::events::{Events, Lines};
+use crate::failure::Failure;
 use crate::git::{self, Credentials, Repo};
 use crate::router::{self, Slot, Upstream};
 use crate::volumes;
@@ -44,14 +51,24 @@ use crate::volumes;
 const STOP_TIMEOUT_SECS: i32 = 15;
 /// Without a health check, a new container must still be running after this long.
 const SETTLE: Duration = Duration::from_secs(3);
+/// With a health check: one early probe this long after the start, before the scheduled tries, so a container that
+/// is ready at once (the usual case) takes traffic without waiting a whole interval. A miss is not counted as a try.
+const EARLY_PROBE: Duration = Duration::from_millis(750);
+/// While the health check waits for its next try, the container's exit is noticed this often.
+const EXIT_POLL: Duration = Duration::from_secs(1);
+/// The port check after a deployment without a health check: `GET /` this many times, this far apart, each within
+/// [`PORT_TIMEOUT`] (PROTOCOL.md §7, `deploy_app`).
+const PORT_TRIES: u32 = 3;
+const PORT_INTERVAL: Duration = Duration::from_secs(2);
+const PORT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longest drain accepted from the control plane.
 const MAX_DRAIN_SECS: u32 = 600;
 
 /// Resolves when `cancel` fires, as an error, or with `f`.
-pub async fn cancellable<T>(
+pub async fn cancellable<T, E: From<&'static str>>(
     cancel: &CancellationToken,
-    f: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
+    f: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(CANCELLED.into()),
@@ -134,18 +151,18 @@ fn publishes(c: &ContainerSummary) -> bool {
     c.ports.iter().flatten().any(|p| p.public_port.is_some())
 }
 
-/// Runs a `DeployApp`. Its log lines and its error never carry the registry credentials it holds.
-pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Result<DeployOutput, String> {
+/// Runs a `DeployApp`. Its log lines, its error and its error's cause never carry the registry credentials it holds.
+pub async fn run(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Result<DeployOutput, Failure> {
     if let Source::Image { auth: Some(a), .. } = &d.source {
         ev.redact_with(std::slice::from_ref(a));
     }
     if let Some(b) = &d.build {
         ev.redact_with(&b.registry_auth);
     }
-    deploy(d, ev, cancel).await.map_err(|e| ev.scrub(&e))
+    deploy(d, ev, cancel).await.map_err(|e| e.scrubbed(ev))
 }
 
-async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Result<DeployOutput, String> {
+async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Result<DeployOutput, Failure> {
     validate(d)?;
     let docker = crate::docker::client()?;
     let tag = &d.run.image_tag;
@@ -225,8 +242,12 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
         Source::Local { image } => {
             ev.step(Step::Pulling).await;
             docker.inspect_image(image).await.map_err(|e| match is_not_found(&e) {
-                true => format!("image {image} is not on this server"),
-                false => format!("inspect {image}: {}", message(&e)),
+                true => Failure::new(
+                    IMAGE_MISSING_ON_SERVER,
+                    [("image", image.clone())],
+                    format!("image {image} is not on this server"),
+                ),
+                false => format!("inspect {image}: {}", message(&e)).into(),
             })?;
             ev.system(format!("Using {image}, already on this server")).await;
             if image != tag {
@@ -266,7 +287,12 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
     let slot = serving.map_or(Slot::A, Slot::other);
 
     ev.step(Step::Starting).await;
-    let new_id = match create(&docker, d, &name, slot, &files).await {
+    let init = engine_has_init(&docker).await;
+    if !init {
+        ev.system("This server's Docker has no init binary (docker-init): the container runs without an init process")
+            .await;
+    }
+    let new_id = match create(&docker, d, &name, slot, &files, init).await {
         Ok(id) => id,
         Err(e) => {
             volumes::prune_files(&d.resource, current_deployment(&previous).as_deref());
@@ -279,7 +305,7 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
         Some(UpdateStrategy::Recreate) => running.iter().filter_map(|c| c.id.clone()).collect(),
         _ => Vec::new(),
     };
-    let undo = async |e: String| -> Result<DeployOutput, String> {
+    let undo = async |e: Failure| -> Result<DeployOutput, Failure> {
         remove_container(&docker, &new_id).await.ok();
         volumes::prune_files(&d.resource, current_deployment(&previous).as_deref());
         for id in &stopped {
@@ -297,12 +323,13 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
     for id in &stopped {
         ev.system(format!("Update strategy recreate: stopping the previous container {} first", short(id))).await;
         if let Err(e) = stop(&docker, id).await {
-            return undo(e).await;
+            return undo(Failure::new(CONTAINER_STOP_FAILED, [("detail", e.clone())], e)).await;
         }
     }
-    if let Err(e) = start(&docker, d, &new_id, ev, cancel).await {
-        return undo(e).await;
-    }
+    let warning = match start(&docker, d, &new_id, ev, cancel).await {
+        Ok(w) => w,
+        Err(e) => return undo(e).await,
+    };
 
     // Past this point the deployment completes even if cancelled: the router is about to serve the new container.
     ev.step(Step::Switching).await;
@@ -310,7 +337,7 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
     for id in &legacy {
         ev.system(format!("Moving the application behind the router: stopping {}", short(id))).await;
         if let Err(e) = stop(&docker, id).await {
-            return undo(e).await;
+            return undo(e.into()).await;
         }
     }
     let up = Upstream::Slot { slot };
@@ -320,7 +347,12 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
                 ev.system(format!("Could not restart {}: {}", short(id), message(&e))).await;
             }
         }
-        return undo(format!("router: {e}")).await;
+        // Where the router publishes its listeners itself (no agent routing), a host port in use fails its start.
+        let e = match e.cause {
+            None => engine_failure(&e.message, &e.message, d.run.publish, "switching").unwrap_or(e),
+            Some(_) => e,
+        };
+        return undo(e.prefixed("router: ")).await;
     }
     ev.system(format!("{name} is now serving")).await;
 
@@ -350,7 +382,7 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
         let pulled = reference.as_deref().map(|reference| crate::sbom::Pulled { reference, auth });
         crate::sbom::of_image(&docker, &d.resource, &image_id, tag, pulled, None, ev, cancel).await;
     }
-    Ok(DeployOutput { image: tag.clone(), image_id, container_id: new_id, commit, known_hosts })
+    Ok(DeployOutput { image: tag.clone(), image_id, container_id: new_id, commit, known_hosts, warning })
 }
 
 /// The deployment of the newest container, whose files stay.
@@ -444,6 +476,19 @@ impl PullFailure {
             PullFailure::RateLimited => format!("{host} is rate limiting pulls (429)"),
         }
     }
+
+    /// The failure for `image`: [`PullFailure::message`] with its `registry.*` cause.
+    pub fn failure(self, image: &str, with_auth: bool) -> Failure {
+        let host = ("host", deploy_proto::registry::image_host(image));
+        let repo = ("repo", deploy_proto::registry::image_repo(image));
+        let (code, params) = match self {
+            PullFailure::Anonymous => (REGISTRY_ANONYMOUS_REFUSED, vec![host, repo]),
+            PullFailure::Rejected => (REGISTRY_CREDENTIAL_REJECTED, vec![host]),
+            PullFailure::Denied => (REGISTRY_ACCESS_DENIED, vec![host, repo]),
+            PullFailure::RateLimited => (REGISTRY_RATE_LIMITED, vec![host]),
+        };
+        Failure::new(code, params, self.message(image, with_auth))
+    }
 }
 
 /// Pulls `image` (for `platform`, when given), its progress in the deployment's log. Returns the reference pulled
@@ -456,7 +501,7 @@ pub async fn pull(
     platform: Option<&str>,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<String, String> {
+) -> Result<String, Failure> {
     let reference = pull_reference(image);
     ev.system(format!("Pulling {reference}")).await;
     let creds = auth.map(|a| DockerCredentials {
@@ -469,14 +514,17 @@ pub async fn pull(
     if let Some(p) = platform {
         opts = opts.platform(p);
     }
-    let failed = async |text: String| -> Result<String, String> {
+    let failed = async |text: String| -> Result<String, Failure> {
         let text = format!("pull {reference}: {text}");
         match PullFailure::of_engine(&text, auth.is_some()) {
             Some(f) => {
                 ev.system(&text).await;
-                Err(ev.scrub(&f.message(image, auth.is_some())))
+                Err(f.failure(image, auth.is_some()).scrubbed(ev))
             }
-            None => Err(ev.scrub(&text)),
+            None if text.contains("no space left on device") => {
+                Err(Failure::new(DISK_FULL, [("step", "pulling".to_string())], ev.scrub(&text)))
+            }
+            None => Err(ev.scrub(&text).into()),
         }
     };
     let mut s = d.create_image(Some(opts.build()), None, creds);
@@ -554,13 +602,35 @@ pub async fn ensure_network(d: &Docker, network: &str, environment: Option<&str>
     crate::firewall::guard_new_network().await
 }
 
+/// Whether the Engine can run containers with its init process (`--init`): it reports the init binary's version,
+/// or `N/A` when it has none (some distribution packages ship it apart). Asked once per agent process; a failed
+/// question is asked again next time.
+async fn engine_has_init(d: &Docker) -> bool {
+    static HAS_INIT: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    let ask = || async {
+        let info = d.info().await.map_err(|e| message(&e))?;
+        Ok::<_, String>(info.init_commit.and_then(|c| c.id).is_some_and(|id| !id.is_empty() && id != "N/A"))
+    };
+    match HAS_INIT.get_or_try_init(ask).await {
+        Ok(has) => *has,
+        Err(e) => {
+            tracing::warn!("docker info: {e}");
+            false
+        }
+    }
+}
+
+/// Creates the new container. `init`: Docker's init process runs as PID 1, forwarding signals and reaping the
+/// orphaned processes that `exec`s of scheduled tasks leave behind (without it they stay zombies until the
+/// container's process limit is reached).
 async fn create(
     d: &Docker,
     dep: &AppDeploy,
     name: &str,
     slot: Slot,
     files: &[(std::path::PathBuf, &deploy_proto::msg::FileMount)],
-) -> Result<String, String> {
+    init: bool,
+) -> Result<String, Failure> {
     let r = &dep.run;
     let mut labels: HashMap<String, String> = r.labels.clone().into_iter().collect();
     labels.insert(LABEL_RESOURCE.into(), dep.resource.clone());
@@ -592,6 +662,7 @@ async fn create(
             }),
             mounts: (!mounts.is_empty()).then_some(mounts),
             network_mode: Some(dep.network.clone()),
+            init: init.then_some(true),
             ..Default::default()
         }),
         networking_config: Some(NetworkingConfig {
@@ -608,26 +679,52 @@ async fn create(
         ..Default::default()
     };
     let opts = CreateContainerOptionsBuilder::default().name(name).build();
-    let c = d.create_container(Some(opts), body).await.map_err(|e| format!("create {name}: {}", message(&e)))?;
+    let c = d.create_container(Some(opts), body).await.map_err(|e| {
+        let detail = message(&e);
+        start_failure(format!("create {name}: {detail}"), &detail, r.publish)
+    })?;
     Ok(c.id)
 }
 
+/// What an Engine error says whatever the call: a host port in use (`publish`: the application's published port),
+/// or a full disk during `step`.
+fn engine_failure(message: &str, detail: &str, publish: Option<u16>, step: &str) -> Option<Failure> {
+    let d = detail.to_ascii_lowercase();
+    if d.contains("port is already allocated") || d.contains("address already in use") {
+        Some(Failure::new(CONTAINER_PORT_IN_USE, publish.map(|p| ("port", p.to_string())), message))
+    } else if d.contains("no space left on device") {
+        Some(Failure::new(DISK_FULL, [("step", step.to_string())], message))
+    } else {
+        None
+    }
+}
+
+/// The failure of creating or starting the new container: [`engine_failure`], else `container.start_failed` with the
+/// Engine's message.
+fn start_failure(message: String, detail: &str, publish: Option<u16>) -> Failure {
+    engine_failure(&message, detail, publish, "starting")
+        .unwrap_or_else(|| Failure::new(CONTAINER_START_FAILED, [("detail", detail.to_string())], message))
+}
+
 /// Starts the new container and waits until it is healthy. Its log goes to the deployment log meanwhile, so a crash
-/// at start-up is visible there.
+/// at start-up is visible there. Returns the port check's warning ([`port_check`]).
 async fn start(
     d: &Docker,
     dep: &AppDeploy,
     new_id: &str,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
-    d.start_container(new_id, None).await.map_err(|e| format!("start: {}", message(&e)))?;
+) -> Result<Option<Cause>, Failure> {
+    d.start_container(new_id, None).await.map_err(|e| {
+        let detail = message(&e);
+        start_failure(format!("start: {detail}"), &detail, dep.run.publish)
+    })?;
     ev.system(format!("Started {}", short(new_id))).await;
     let follow = tokio::spawn(follow_logs(d.clone(), new_id.to_string(), ev.clone()));
     let r = cancellable(cancel, wait_healthy(d, dep, new_id, ev)).await;
     follow.abort();
     let _ = follow.await;
-    r?;
+    let warning = r?;
     // Only a container that passed its checks restarts by itself: one crashing at start-up stays down, with its exit
     // code, while the previous container keeps serving.
     let promote = ContainerUpdateBody {
@@ -637,7 +734,8 @@ async fn start(
         }),
         ..Default::default()
     };
-    d.update_container(new_id, promote).await.map_err(|e| format!("restart policy: {}", message(&e)))
+    d.update_container(new_id, promote).await.map_err(|e| format!("restart policy: {}", message(&e)))?;
+    Ok(warning)
 }
 
 async fn follow_logs(d: Docker, id: String, ev: Events) {
@@ -657,71 +755,231 @@ async fn follow_logs(d: Docker, id: String, ev: Events) {
     }
 }
 
-/// Why the new container is not up, if it is not.
-async fn exited(d: &Docker, id: &str) -> Result<Option<String>, String> {
-    let c = d.inspect_container(id, None).await.map_err(|e| format!("inspect: {}", message(&e)))?;
-    let s = c.state.unwrap_or_default();
-    let down = !s.running.unwrap_or(false);
-    Ok(down.then(|| {
-        let mut m = format!("the container exited with code {}", s.exit_code.unwrap_or(-1));
-        if s.oom_killed == Some(true) {
+/// How the new container ended. `start_error`: the init process could not run the command (its own error line),
+/// which without init is Docker's start error.
+struct Exit {
+    code: i64,
+    oom: bool,
+    start_error: Option<String>,
+}
+
+impl Exit {
+    /// `container.start_failed` when init could not run the command, else `container.exited`, or
+    /// `container.oom_killed`, with `prefix` before the message.
+    fn failure(&self, prefix: &str) -> Failure {
+        if let Some(detail) = &self.start_error {
+            return Failure::new(
+                CONTAINER_START_FAILED,
+                [("detail", detail.clone())],
+                format!("{prefix}the container could not start its command: {detail}"),
+            );
+        }
+        let mut m = format!("{prefix}the container exited with code {}", self.code);
+        if self.oom {
             m.push_str(" (out of memory)");
         }
-        m
-    }))
+        let code = if self.oom { CONTAINER_OOM_KILLED } else { CONTAINER_EXITED };
+        Failure::new(code, [("exit_code", self.code.to_string())], m)
+    }
 }
 
-async fn wait_healthy(d: &Docker, dep: &AppDeploy, id: &str, ev: &Events) -> Result<(), String> {
+/// The error line Docker's init (tini) prints when it cannot run the command (`[FATAL tini (7)] exec /x failed: …`,
+/// exit 126 or 127), without its prefix.
+fn init_exec_error(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("[FATAL tini (")?;
+    let rest = &rest[rest.find(")] ")? + 3..];
+    (rest.starts_with("exec ") && rest.contains(" failed")).then_some(rest)
+}
+
+/// How the new container ended, if it is not up.
+async fn exited(d: &Docker, id: &str) -> Result<Option<Exit>, String> {
+    let c = d.inspect_container(id, None).await.map_err(|e| format!("inspect: {}", message(&e)))?;
+    let s = c.state.unwrap_or_default();
+    if s.running.unwrap_or(false) {
+        return Ok(None);
+    }
+    let code = s.exit_code.unwrap_or(-1);
+    let mut start_error = None;
+    let under_init = c.host_config.and_then(|h| h.init) == Some(true);
+    if under_init && (code == 126 || code == 127) {
+        let opts = LogsOptionsBuilder::default().stdout(true).stderr(true).tail("5").build();
+        let mut logs = d.logs(id, Some(opts));
+        while let Some(Ok(o)) = logs.next().await {
+            let text = String::from_utf8_lossy(&o.into_bytes()).into_owned();
+            if let Some(e) = text.lines().find_map(init_exec_error) {
+                start_error = Some(e.to_string());
+            }
+        }
+    }
+    Ok(Some(Exit { code, oom: s.oom_killed == Some(true), start_error }))
+}
+
+/// The container's address on `network`, if it has one.
+async fn address(d: &Docker, id: &str, network: &str) -> Result<Option<String>, String> {
+    let c = d.inspect_container(id, None).await.map_err(|e| format!("inspect: {}", message(&e)))?;
+    Ok(c.network_settings
+        .and_then(|n| n.networks)
+        .and_then(|mut n| n.remove(network))
+        .and_then(|e| e.ip_address)
+        .filter(|ip| !ip.is_empty()))
+}
+
+/// Waits until the new container is healthy: its health check passes or, without one, it still runs after
+/// [`SETTLE`]. Without a health check, returns the port check's warning.
+async fn wait_healthy(d: &Docker, dep: &AppDeploy, id: &str, ev: &Events) -> Result<Option<Cause>, Failure> {
     let Some(h) = &dep.run.health else {
         tokio::time::sleep(SETTLE).await;
-        return match exited(d, id).await? {
-            Some(m) => Err(m),
-            None => Ok(()),
-        };
+        if let Some(x) = exited(d, id).await? {
+            return Err(x.failure(""));
+        }
+        return Ok(port_check(d, dep, id, ev).await);
     };
     ev.step(Step::HealthCheck).await;
-    let c = d.inspect_container(id, None).await.map_err(|e| format!("inspect: {}", message(&e)))?;
-    let ip = c
-        .network_settings
-        .and_then(|n| n.networks)
-        .and_then(|mut n| n.remove(&dep.network))
-        .and_then(|e| e.ip_address)
-        .filter(|ip| !ip.is_empty());
-    let Some(ip) = ip else {
+    let Some(ip) = address(d, id, &dep.network).await? else {
         // A container that already crashed has no address: its exit is the error worth reporting.
         return Err(match exited(d, id).await? {
-            Some(m) => format!("health check failed: {m}"),
-            None => format!("the container has no address on {}", dep.network),
+            Some(x) => x.failure("health check failed: "),
+            None => Failure::new(
+                CONTAINER_NO_ADDRESS,
+                [("network", dep.network.clone())],
+                format!("the container has no address on {}", dep.network),
+            ),
         });
     };
-    probe(d, id, &format!("http://{ip}:{}{}", dep.run.port, h.path), h, ev).await
+    probe(d, id, &ip, dep.run.port, h, ev).await.map(|()| None)
 }
 
-async fn probe(d: &Docker, id: &str, url: &str, h: &HealthCheck, ev: &Events) -> Result<(), String> {
-    let timeout = Duration::from_secs(u64::from(h.timeout_secs.max(1)));
-    // Redirects count as an answer: following one would leave the container (to its public HTTPS URL).
-    let client = reqwest::Client::builder()
+/// A client for requests to a container: redirects count as an answer (following one would leave the container, to
+/// its public HTTPS URL).
+pub fn container_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()
-        .map_err(|e| e.to_string())?;
-    let tries = h.retries.max(1);
-    ev.system(format!("Health check: GET {url} (every {}s, {tries} tries)", h.interval_secs)).await;
-    for n in 1..=tries {
-        tokio::time::sleep(Duration::from_secs(u64::from(h.interval_secs.max(1)))).await;
-        if let Some(m) = exited(d, id).await? {
-            return Err(format!("health check failed: {m}"));
+        .map_err(|e| e.to_string())
+}
+
+/// Waits `total`, checking every [`EXIT_POLL`] that the container still runs: its exit is the failure, at once.
+async fn wait_running(d: &Docker, id: &str, total: Duration) -> Result<(), Failure> {
+    let until = tokio::time::Instant::now() + total;
+    loop {
+        if let Some(x) = exited(d, id).await? {
+            return Err(x.failure("health check failed: "));
         }
-        match client.get(url).send().await {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(left.min(EXIT_POLL)).await;
+    }
+}
+
+/// The health check: one early probe after [`EARLY_PROBE`] (a miss stays out of the log and the count), then
+/// `retries` tries `interval_secs` apart, the first one `interval_secs` after the start as before, so an application
+/// gets at least the time it got from earlier agents. The container's exit is checked every [`EXIT_POLL`] meanwhile.
+async fn probe(d: &Docker, id: &str, ip: &str, port: u16, h: &HealthCheck, ev: &Events) -> Result<(), Failure> {
+    let url = format!("http://{ip}:{port}{}", h.path);
+    let client = container_client(Duration::from_secs(u64::from(h.timeout_secs.max(1))))?;
+    let tries = h.retries.max(1);
+    let interval = Duration::from_secs(u64::from(h.interval_secs.max(1)));
+    ev.system(format!("Health check: GET {url} (every {}s, {tries} tries)", h.interval_secs)).await;
+    let started = tokio::time::Instant::now();
+    wait_running(d, id, EARLY_PROBE).await?;
+    if let Ok(r) = client.get(&url).send().await
+        && r.status().as_u16() < 400
+    {
+        ev.system(format!("Health check passed: HTTP {}", r.status().as_u16())).await;
+        return Ok(());
+    }
+    // The last try's outcome: its status, or the kind of its error.
+    let mut last: Option<Result<u16, &'static str>> = None;
+    for n in 1..=tries {
+        // As before: the first try an interval after the start, each next one an interval after the previous one.
+        let wait = if n == 1 { interval.saturating_sub(started.elapsed()) } else { interval };
+        wait_running(d, id, wait).await?;
+        match client.get(&url).send().await {
             Ok(r) if r.status().as_u16() < 400 => {
                 ev.system(format!("Health check passed: HTTP {}", r.status().as_u16())).await;
                 return Ok(());
             }
-            Ok(r) => ev.system(format!("Health check {n}/{tries}: HTTP {}", r.status().as_u16())).await,
-            Err(e) => ev.system(format!("Health check {n}/{tries}: {}", cause(&e))).await,
+            Ok(r) => {
+                last = Some(Ok(r.status().as_u16()));
+                ev.system(format!("Health check {n}/{tries}: HTTP {}", r.status().as_u16())).await;
+            }
+            Err(e) => {
+                last = Some(Err(error_kind(&e)));
+                ev.system(format!("Health check {n}/{tries}: {}", cause(&e))).await;
+            }
         }
     }
-    Err(format!("health check failed after {tries} tries"))
+    let message = format!("health check failed after {tries} tries");
+    let tries = ("tries", tries.to_string());
+    Err(match last {
+        Some(Ok(status)) => {
+            Failure::new(HEALTH_BAD_STATUS, [tries, ("path", h.path.clone()), ("status", status.to_string())], message)
+        }
+        Some(Err(kind)) => Failure::new(
+            HEALTH_NO_ANSWER,
+            [tries, ("port", port.to_string()), ("path", h.path.clone()), ("error", kind.to_string())],
+            message,
+        ),
+        None => Failure::new(HEALTH_FAILED, [tries], message),
+    })
+}
+
+/// After a deployment without a health check: `GET /` on the application's port at the new container's address,
+/// [`PORT_TRIES`] times [`PORT_INTERVAL`] apart, each within [`PORT_TIMEOUT`]. Any HTTP answer passes. A miss never
+/// fails the deployment: it is logged and returned as the warning `runtime.not_listening` (PROTOCOL.md §7).
+async fn port_check(d: &Docker, dep: &AppDeploy, id: &str, ev: &Events) -> Option<Cause> {
+    let port = dep.run.port;
+    let error = match (address(d, id, &dep.network).await, container_client(PORT_TIMEOUT)) {
+        (Ok(Some(ip)), Ok(client)) => {
+            let url = format!("http://{ip}:{port}/");
+            let mut error = "other";
+            for n in 0..PORT_TRIES {
+                if n > 0 {
+                    tokio::time::sleep(PORT_INTERVAL).await;
+                }
+                match client.get(&url).send().await {
+                    Ok(_) => return None,
+                    Err(e) => error = error_kind(&e),
+                }
+            }
+            error
+        }
+        (Ok(None), _) => "no_address",
+        _ => "other",
+    };
+    ev.system(format!(
+        "Warning: nothing answered GET / on port {port} of the new container ({error}): it serves anyway, and requests \
+         to the application fail until something listens on that port"
+    ))
+    .await;
+    let params = [("port", port.to_string()), ("error", error.to_string())];
+    Some(Cause { code: RUNTIME_NOT_LISTENING.into(), params: params.into_iter().map(|(k, v)| (k.into(), v)).collect() })
+}
+
+/// How an HTTP request to a container failed, as causes and port probes report it: `refused`, `timeout` or
+/// `other`.
+pub fn error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        return "timeout";
+    }
+    let mut s: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = s {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => return "refused",
+                std::io::ErrorKind::TimedOut => return "timeout",
+                _ => {}
+            }
+        }
+        s = err.source();
+    }
+    match cause(e).to_ascii_lowercase().contains("connection refused") {
+        true => "refused",
+        false => "other",
+    }
 }
 
 /// The innermost cause of an HTTP error ("connection refused", "operation timed out").
@@ -851,5 +1109,56 @@ mod tests {
         b.untrusted = false;
         d.build = Some(b);
         assert!(validate(&d).is_ok(), "a trusted build may use them");
+    }
+
+    /// Engine errors (Docker Engine 28.3.3) name their cause; anything else is the family's fallback, with the
+    /// Engine's text.
+    #[test]
+    fn engine_errors_name_their_cause() {
+        use deploy_proto::msg::cause::*;
+        let allocated = "failed to set up container networking: driver failed programming external connectivity on \
+                         endpoint owd-router (b9d7ee73954a): Bind for 0.0.0.0:28199 failed: port is already allocated";
+        let f = start_failure(format!("start: {allocated}"), allocated, Some(28199));
+        assert_eq!((f.code(), f.param("port")), (Some(CONTAINER_PORT_IN_USE), Some("28199")));
+        assert_eq!(f.message, format!("start: {allocated}"));
+        let full = "write /var/lib/docker/containers/1/hostconfig.json: no space left on device";
+        let f = start_failure(format!("create x: {full}"), full, None);
+        assert_eq!((f.code(), f.param("step")), (Some(DISK_FULL), Some("starting")));
+        let missing = "failed to create task for container: failed to create shim task: OCI runtime create failed: \
+                       runc create failed: unable to start container process: error during container init: exec: \
+                       \"/nonexistent\": stat /nonexistent: no such file or directory: unknown";
+        let f = start_failure(format!("start: {missing}"), missing, Some(80));
+        assert_eq!((f.code(), f.param("detail")), (Some(CONTAINER_START_FAILED), Some(missing)));
+        // Elsewhere (the router's own start) only what the text names: nothing else is a container failure.
+        assert_eq!(
+            engine_failure("router: x", allocated, Some(1), "switching").unwrap().code(),
+            Some(CONTAINER_PORT_IN_USE)
+        );
+        assert!(engine_failure("router: x", "the router did not answer", Some(1), "switching").is_none());
+    }
+
+    /// Under Docker's init a command that cannot run is init's exit (126, 127), named as the start failure it is
+    /// without init (tini 0.19 in Docker Engine 29.9.3).
+    #[test]
+    fn an_init_that_cannot_run_the_command_is_a_start_failure() {
+        use deploy_proto::msg::cause::*;
+        let line = "[FATAL tini (7)] exec /nonexistent failed: No such file or directory";
+        let detail = init_exec_error(line).unwrap();
+        assert_eq!(detail, "exec /nonexistent failed: No such file or directory");
+        let f = Exit { code: 127, oom: false, start_error: Some(detail.into()) }.failure("health check failed: ");
+        assert_eq!((f.code(), f.param("detail")), (Some(CONTAINER_START_FAILED), Some(detail)));
+        assert_eq!(init_exec_error("[WARN  tini (7)] Tini is not running as PID 1"), None);
+        assert_eq!(init_exec_error("sh: exec /nonexistent failed"), None);
+        let f = Exit { code: 127, oom: false, start_error: None }.failure("");
+        assert_eq!((f.code(), f.param("exit_code")), (Some(CONTAINER_EXITED), Some("127")));
+    }
+
+    /// A refused connection is told apart from other request failures (the kinds of health checks and port probes).
+    #[tokio::test]
+    async fn refused_connections_are_classified() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let c = container_client(Duration::from_secs(2)).unwrap();
+        let e = c.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap_err();
+        assert_eq!(error_kind(&e), "refused");
     }
 }

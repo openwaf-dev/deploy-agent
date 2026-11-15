@@ -10,7 +10,9 @@ use bollard::models::ImageSummary;
 use bollard::query_parameters::{
     ListImagesOptionsBuilder, LogsOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
 };
-use deploy_proto::msg::{AppActionKind, AppState, ContainerState, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream};
+use deploy_proto::msg::{
+    AppActionKind, AppState, ContainerState, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, PortProbe, PortProbeResult,
+};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -27,30 +29,83 @@ fn check(resource: &str) -> Result<(), String> {
     if valid_id(resource) { Ok(()) } else { Err("invalid resource id".into()) }
 }
 
-pub async fn status(resource: &str) -> Result<AppState, String> {
+/// `AppStatus`: the state of the application's containers, and the `probes` asked for (PROTOCOL.md §7).
+pub async fn status(resource: &str, probes: &[PortProbe]) -> Result<AppState, String> {
     check(resource)?;
-    state(&client()?, resource).await
+    let d = client()?;
+    let (mut st, addresses) = inspect(&d, resource).await?;
+    st.probes = futures_util::future::join_all(probes.iter().map(|p| probe(p, &st.containers, &addresses))).await;
+    Ok(st)
+}
+
+/// How long a port probe waits for an answer.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `GET /` on `p.port` at the address the current container of `p.service` (the newest: `containers` lists them
+/// newest first) has on `p.network`. Any HTTP answer passes: only that something listens is tested. Redirects are
+/// not followed.
+async fn probe(p: &PortProbe, containers: &[ContainerState], addresses: &[HashMap<String, String>]) -> PortProbeResult {
+    let result = |status: Option<u16>, error: Option<&str>| PortProbeResult {
+        service: p.service.clone(),
+        port: p.port,
+        status,
+        error: error.map(str::to_string),
+    };
+    let current = containers.iter().position(|c| p.service.is_none() || c.service == p.service);
+    let Some(ip) = current.and_then(|i| addresses[i].get(&p.network)) else {
+        return result(None, Some("no_address"));
+    };
+    let client = match crate::deploy::container_client(PROBE_TIMEOUT) {
+        Ok(c) => c,
+        Err(_) => return result(None, Some("other")),
+    };
+    match client.get(format!("http://{ip}:{}/", p.port)).send().await {
+        Ok(r) => result(Some(r.status().as_u16()), None),
+        Err(e) => result(None, Some(crate::deploy::error_kind(&e))),
+    }
 }
 
 async fn state(d: &Docker, resource: &str) -> Result<AppState, String> {
+    Ok(inspect(d, resource).await?.0)
+}
+
+/// The application's containers, newest first, with the facts of their inspect, and each one's addresses by
+/// network.
+async fn inspect(d: &Docker, resource: &str) -> Result<(AppState, Vec<HashMap<String, String>>), String> {
     let mut containers = Vec::new();
+    let mut addresses = Vec::new();
     for c in app_containers(d, resource).await? {
-        let id = c.id.unwrap_or_default();
-        let started_at = match d.inspect_container(&id, None).await {
-            Ok(i) => i.state.and_then(|s| s.started_at).filter(|s| !s.starts_with("0001-")),
+        let id = c.id.clone().unwrap_or_default();
+        let i = match d.inspect_container(&id, None).await {
+            Ok(i) => i,
             Err(e) if is_not_found(&e) => continue,
             Err(e) => return Err(format!("inspect {id}: {}", message(&e))),
         };
+        let s = i.state.unwrap_or_default();
+        let time = |t: Option<String>| t.filter(|t| !t.is_empty() && !t.starts_with("0001-"));
+        addresses.push(
+            i.network_settings
+                .and_then(|n| n.networks)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(net, e)| Some((net, e.ip_address.filter(|ip| !ip.is_empty())?)))
+                .collect(),
+        );
         containers.push(ContainerState {
             deployment: c.labels.as_ref().and_then(|l| l.get(LABEL_DEPLOYMENT)).cloned(),
+            service: service_of(&c).map(str::to_string),
             image: c.image.unwrap_or_default(),
             state: c.state.map(|s| s.to_string()).unwrap_or_default(),
             health: c.health.and_then(|h| h.status).map(|s| s.to_string()).filter(|s| !s.is_empty() && s != "none"),
-            started_at,
+            started_at: time(s.started_at),
+            exit_code: s.exit_code,
+            oom_killed: s.oom_killed,
+            restart_count: i.restart_count,
+            finished_at: time(s.finished_at),
             id,
         });
     }
-    Ok(AppState { containers })
+    Ok((AppState { containers, probes: Vec::new() }, addresses))
 }
 
 pub async fn action(resource: &str, action: AppActionKind) -> Result<AppState, String> {

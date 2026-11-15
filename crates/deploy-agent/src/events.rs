@@ -52,6 +52,8 @@ impl Events {
     }
 
     /// `text` without the command's credentials (`deploy_proto::registry::redact`); unchanged when it holds none.
+    /// It also runs on the parameters of a failure's cause ([`crate::failure::Failure::scrubbed`]), so neither the
+    /// error nor its cause carries the operation's registry credentials.
     pub fn scrub(&self, text: &str) -> String {
         let secrets = self.secrets.read().unwrap_or_else(PoisonError::into_inner);
         if secrets.is_empty() {

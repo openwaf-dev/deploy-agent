@@ -18,6 +18,10 @@ use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, DownloadFromContainerOptionsBuilder,
 };
+use deploy_proto::msg::cause::{
+    DISK_FULL, GIT_AUTH_FAILED, GIT_COMMIT_MISMATCH, GIT_DEPLOY_KEY_REFUSED, GIT_FETCH_FAILED, GIT_HOST_KEY_CHANGED,
+    GIT_HOST_UNREACHABLE, GIT_REF_NOT_FOUND, GIT_REPOSITORY_NOT_FOUND,
+};
 use deploy_proto::msg::{CommitInfo, GitAuth, LogStream, SshAuth};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -28,6 +32,7 @@ use crate::docker::{LABEL_HELPER, ensure_image, message, remove_container};
 use crate::dockerfile::declare_args;
 use crate::dockerignore::{Ignore, clean};
 use crate::events::{Events, Lines};
+use crate::failure::Failure;
 
 /// Small maintained image with git, ssh and a POSIX shell, pinned so a clone behaves the same on every server.
 pub const HELPER_IMAGE: &str = "alpine/git:v2.52.0";
@@ -227,8 +232,105 @@ pub fn prepare(r: &Repo<'_>) -> Result<Clone, String> {
     Ok(Clone { env, stdin })
 }
 
+/// The lines Git and OpenSSH write when a fetch fails (case-sensitive substrings, as `alpine/git:v2.52.0` with its
+/// OpenSSH 10.2 prints them), with the code each names, in precedence order. `git.ref_not_found` is last: the
+/// script's shallow fetch prints `couldn't find remote ref` before it falls back to a full fetch.
+const GIT_FAILURES: &[(&[&str], &str)] = &[
+    // Git writes strerror's capitalized text, the Engine Go's lowercase one.
+    (&["no space left on device", "No space left on device"], DISK_FULL),
+    (&["Host key verification failed"], GIT_HOST_KEY_CHANGED),
+    (&["Permission denied (publickey"], GIT_DEPLOY_KEY_REFUSED),
+    (&["Authentication failed for", "could not read Username for", "could not read Password for"], GIT_AUTH_FAILED),
+    (&["Repository not found", "does not appear to be a git repository"], GIT_REPOSITORY_NOT_FOUND),
+    (
+        &[
+            "Could not resolve host",
+            "Could not resolve hostname",
+            "Connection refused",
+            "Connection timed out",
+            "Operation timed out",
+            "Network is unreachable",
+            "Network unreachable",
+            "Failed to connect to",
+        ],
+        GIT_HOST_UNREACHABLE,
+    ),
+    (&["couldn't find remote ref", "did not match any file(s) known to git"], GIT_REF_NOT_FOUND),
+];
+
+/// What the clone script's output says about why it failed: the codes of [`GIT_FAILURES`] its lines matched. It is
+/// fed every line but the script's markers, from both streams (OpenSSH and Git write their errors to stderr), and
+/// read only when the script failed.
+#[derive(Debug, Default)]
+pub struct GitWatch {
+    seen: Vec<&'static str>,
+}
+
+impl GitWatch {
+    pub fn line(&mut self, line: &str) {
+        for (subs, code) in GIT_FAILURES {
+            // Git's own text for a missing repository: `fatal: repository 'URL' not found`.
+            let missing_repo = *code == GIT_REPOSITORY_NOT_FOUND
+                && line.find("repository '").is_some_and(|i| line[i + 12..].contains("' not found"));
+            if (missing_repo || subs.iter().any(|s| line.contains(s))) && !self.seen.contains(code) {
+                self.seen.push(code);
+            }
+        }
+    }
+
+    /// The failure of a script that ended with `exit_code`: its own exit 3 (the checkout is not at the expected
+    /// commit), else the first code of [`GIT_FAILURES`] seen, else `git.fetch_failed`. Parameters come from the
+    /// deployment, never from a line.
+    pub fn failure(&self, exit_code: i64, repo: &Repo<'_>) -> Failure {
+        let message = format!("git fetch failed (exit code {exit_code})");
+        let reference = || ("reference", repo.reference.to_string());
+        let host = || ("host", url_host(repo.url));
+        if exit_code == 3 {
+            return Failure::new(GIT_COMMIT_MISMATCH, [reference()], message);
+        }
+        let code = GIT_FAILURES.iter().map(|(_, c)| *c).find(|c| self.seen.contains(c));
+        match code {
+            Some(DISK_FULL) => Failure::new(DISK_FULL, [("step", "fetching".to_string())], message),
+            Some(GIT_REPOSITORY_NOT_FOUND) => {
+                Failure::new(GIT_REPOSITORY_NOT_FOUND, [("url", url_without_user(repo.url))], message)
+            }
+            Some(GIT_REF_NOT_FOUND) => Failure::new(GIT_REF_NOT_FOUND, [reference()], message),
+            Some(code) => Failure::new(code, [host()], message),
+            None => Failure::new(GIT_FETCH_FAILED, [("exit_code", exit_code.to_string())], message),
+        }
+    }
+}
+
+/// The host of a repository URL (`https://`, `ssh://` or scp-like `user@host:path`), lowercased.
+fn url_host(url: &str) -> String {
+    let authority = match url.split_once("://") {
+        Some((_, rest)) => rest.split(['/', '?', '#']).next().unwrap_or_default(),
+        None => url.split(':').next().unwrap_or_default(),
+    };
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    host.to_ascii_lowercase()
+}
+
+/// The repository URL without its user information (a token written into the URL never reaches a cause).
+fn url_without_user(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+            format!("{scheme}://{}{path}", authority.rsplit_once('@').map_or(authority, |(_, h)| h))
+        }
+        None => match url.split_once(':') {
+            Some((user_host, path)) => format!("{}:{path}", user_host.rsplit_once('@').map_or(user_host, |(_, h)| h)),
+            None => url.to_string(),
+        },
+    }
+}
+
 /// What the clone script reported: the commit checked out, its author and subject, and the host keys accepted on
-/// first use.
+/// first use; and what its other lines say about a failure ([`GitWatch`]).
 #[derive(Default)]
 pub struct Cloned {
     pub commit: Option<String>,
@@ -236,6 +338,7 @@ pub struct Cloned {
     pub author_email: Option<String>,
     pub subject: Option<String>,
     pub known_hosts: Vec<String>,
+    watch: GitWatch,
 }
 
 /// A commit's author or subject as stored: control characters dropped, at most `max` characters, None when empty.
@@ -246,8 +349,18 @@ fn meta(value: &str, max: usize) -> Option<String> {
 }
 
 impl Cloned {
+    /// Takes a line of the script's output; false for a marker, which stays out of the log. The others feed the
+    /// failure watch.
+    pub fn line(&mut self, stream: LogStream, line: &str) -> bool {
+        if stream != LogStream::Stderr && self.marker(line) {
+            return false;
+        }
+        self.watch.line(line);
+        true
+    }
+
     /// Takes a marker line of the script; false for an ordinary line, which belongs in the log.
-    pub fn marker(&mut self, line: &str) -> bool {
+    fn marker(&mut self, line: &str) -> bool {
         if let Some(c) = line.strip_prefix("OWD_COMMIT=") {
             self.commit = Some(c.trim().to_string());
         } else if let Some(k) = line.strip_prefix("OWD_KNOWN_HOST=") {
@@ -264,11 +377,11 @@ impl Cloned {
         true
     }
 
-    /// The commit, once the script ended with `code`.
-    pub fn commit(&self, code: i64) -> Result<String, String> {
+    /// The commit, once the script fetching `repo` ended with `code`.
+    pub fn commit(&self, code: i64, repo: &Repo<'_>) -> Result<String, Failure> {
         match (code, &self.commit) {
             (0, Some(c)) if c.len() >= 40 && c.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(c.clone()),
-            _ => Err(format!("git fetch failed (exit code {code})")),
+            _ => Err(self.watch.failure(code, repo)),
         }
     }
 
@@ -390,7 +503,7 @@ pub fn inside(p: &str, what: &str) -> Result<String, String> {
     Ok(if c == "." { String::new() } else { c })
 }
 
-pub async fn fetch(d: &Docker, f: Fetch<'_>, ev: &Events, cancel: &CancellationToken) -> Result<Context, String> {
+pub async fn fetch(d: &Docker, f: Fetch<'_>, ev: &Events, cancel: &CancellationToken) -> Result<Context, Failure> {
     let clone = prepare(&f.repo)?;
     let context = inside(f.context, "build context")?;
     let dockerfile = inside(f.dockerfile, "Dockerfile path")?;
@@ -421,7 +534,7 @@ pub async fn fetch(d: &Docker, f: Fetch<'_>, ev: &Events, cancel: &CancellationT
         .await
         .map_err(|e| format!("create the Git helper: {}", message(&e)))?;
     let helper = created.id;
-    let r = clone_and_pack(d, &helper, clone, &context, &dockerfile, &f.args, &dir, ev, cancel).await;
+    let r = clone_and_pack(d, &helper, clone, &f.repo, &context, &dockerfile, &f.args, &dir, ev, cancel).await;
     // The helper goes on success, failure and cancel alike; the temporary directory goes with `dir` on error.
     remove_container(d, &helper).await.ok();
     let cloned = r?;
@@ -455,13 +568,14 @@ async fn clone_and_pack(
     d: &Docker,
     helper: &str,
     clone: Clone,
+    repo: &Repo<'_>,
     context: &str,
     dockerfile: &str,
     args: &[&str],
     dir: &TempDir,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<Cloned, String> {
+) -> Result<Cloned, Failure> {
     let opts = AttachContainerOptionsBuilder::default().stdin(true).stdout(true).stderr(true).stream(true).build();
     let mut io = d.attach_container(helper, Some(opts)).await.map_err(|e| format!("attach: {}", message(&e)))?;
     d.start_container(helper, None).await.map_err(|e| format!("start the Git helper: {}", message(&e)))?;
@@ -480,13 +594,14 @@ async fn clone_and_pack(
         match item.map_err(|e| format!("Git helper output: {e}"))? {
             LogOutput::StdOut { message } | LogOutput::Console { message } => {
                 for l in out.push(&message) {
-                    if !cloned.marker(&l) {
+                    if cloned.line(LogStream::Stdout, &l) {
                         ev.line(LogStream::Stdout, l).await;
                     }
                 }
             }
             LogOutput::StdErr { message } => {
                 for l in err.push(&message) {
+                    cloned.line(LogStream::Stderr, &l);
                     ev.line(LogStream::Stderr, l).await;
                 }
             }
@@ -494,15 +609,16 @@ async fn clone_and_pack(
         }
     }
     if let Some(l) = err.finish() {
+        cloned.line(LogStream::Stderr, &l);
         ev.line(LogStream::Stderr, l).await;
     }
     if let Some(l) = out.finish()
-        && !cloned.marker(&l)
+        && cloned.line(LogStream::Stdout, &l)
     {
         ev.line(LogStream::Stdout, l).await;
     }
     let state = d.inspect_container(helper, None).await.map_err(|e| format!("inspect: {}", message(&e)))?.state;
-    let commit = cloned.commit(state.and_then(|s| s.exit_code).unwrap_or(-1))?;
+    let commit = cloned.commit(state.and_then(|s| s.exit_code).unwrap_or(-1), repo)?;
     ev.system(format!("Checked out commit {commit}")).await;
     for k in &cloned.known_hosts {
         ev.system(format!("Accepted the host key on first use: {k}")).await;
@@ -530,13 +646,21 @@ async fn clone_and_pack(
     drop(file);
     let out = dir.path().join("context.tar");
     let dockerfile = dockerfile.to_string();
+    let df = dockerfile.clone();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let stats = tokio::task::spawn_blocking(move || {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        pack(&raw, &out, &dockerfile, &args)
+        pack(&raw, &out, &df, &args)
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| Failure::from(e.to_string()))?
+    .map_err(|e| {
+        if e.ends_with("not found in the build context") {
+            Failure::new(deploy_proto::msg::cause::BUILD_DOCKERFILE_MISSING, [("path", dockerfile.clone())], e)
+        } else {
+            Failure::from(e)
+        }
+    })?;
     ev.system(format!(
         "Build context: {} files, {} KiB ({} left out by .dockerignore)",
         stats.files,
@@ -845,20 +969,150 @@ mod tests {
 
     #[test]
     fn clone_markers_are_taken_out_of_the_log() {
+        let repo = Repo {
+            url: "https://h/o/r",
+            reference: "main",
+            creds: Credentials::Public,
+            commit: None,
+            untrusted: false,
+        };
         let mut c = Cloned::default();
-        assert!(!c.marker("Cloning into /src"));
-        assert!(c.marker("OWD_KNOWN_HOST=[h]:2222 ssh-ed25519 AAAA"));
-        assert!(c.marker(&format!("OWD_COMMIT={}", "a".repeat(40))));
-        assert!(c.marker("OWD_AUTHOR_NAME=Ana \u{1b}[31mGarcía"));
-        assert!(c.marker("OWD_AUTHOR_EMAIL="));
-        assert!(c.marker(&format!("OWD_SUBJECT=Fix the {}", "x".repeat(400))));
-        assert_eq!(c.commit(0).unwrap(), "a".repeat(40));
-        assert!(c.commit(1).is_err());
+        let mut line = |l: &str| c.line(LogStream::Stdout, l);
+        assert!(line("Cloning into /src"));
+        assert!(!line("OWD_KNOWN_HOST=[h]:2222 ssh-ed25519 AAAA"));
+        assert!(!line(&format!("OWD_COMMIT={}", "a".repeat(40))));
+        assert!(!line("OWD_AUTHOR_NAME=Ana \u{1b}[31mGarcía"));
+        assert!(!line("OWD_AUTHOR_EMAIL="));
+        assert!(!line(&format!("OWD_SUBJECT=Fix the {}", "x".repeat(400))));
+        // Standard error never carries a marker.
+        assert!(c.line(LogStream::Stderr, "OWD_COMMIT=0"));
+        assert_eq!(c.commit(0, &repo).unwrap(), "a".repeat(40));
+        assert!(c.commit(1, &repo).is_err());
         assert_eq!(c.known_hosts, ["[h]:2222 ssh-ed25519 AAAA"]);
         let info = c.info();
         assert_eq!(info.sha, "a".repeat(40));
         assert_eq!(info.author_name.as_deref(), Some("Ana [31mGarcía"));
         assert_eq!(info.author_email, None);
         assert_eq!(info.subject.as_ref().map(|s| s.chars().count()), Some(300));
+    }
+
+    /// The fetch failure of a script whose output had `lines`, ended with `code`.
+    fn fetch_failure(url: &str, lines: &[&str], code: i64) -> Failure {
+        let repo = Repo { url, reference: "release/2", creds: Credentials::Public, commit: None, untrusted: false };
+        let mut c = Cloned::default();
+        for l in lines {
+            c.line(LogStream::Stderr, l);
+        }
+        let f = c.commit(code, &repo).unwrap_err();
+        assert_eq!(f.message, format!("git fetch failed (exit code {code})"));
+        f
+    }
+
+    /// Each row of the table against a line the pinned image printed (`alpine/git:v2.52.0`: `git --version` git
+    /// version 2.52.0, `ssh -V` OpenSSH_10.2p1, OpenSSL 3.5.6 7 Apr 2026). Parameters come from the deployment.
+    #[test]
+    fn git_and_ssh_failures_get_their_cause() {
+        use deploy_proto::msg::cause::*;
+        let https = "https://x-access-token:tok@git.test:443/o/r.git";
+        let ssh = "ssh://git@203.0.113.7:2222/srv/git/hello.git";
+        let rows: [(&str, &str, &str, (&str, &str)); 13] = [
+            (
+                ssh,
+                "fatal: cannot copy '/usr/share/git-core/templates/hooks/post-update.sample' to \
+                 '/src/.git/hooks/post-update.sample': No space left on device",
+                DISK_FULL,
+                ("step", "fetching"),
+            ),
+            (ssh, "Host key verification failed.", GIT_HOST_KEY_CHANGED, ("host", "203.0.113.7")),
+            (
+                ssh,
+                "git@203.0.113.7: Permission denied (publickey,password,keyboard-interactive).",
+                GIT_DEPLOY_KEY_REFUSED,
+                ("host", "203.0.113.7"),
+            ),
+            (
+                https,
+                "fatal: Authentication failed for 'https://gitlab.com/gitlab-org/nonexistent-zz-private.git/'",
+                GIT_AUTH_FAILED,
+                ("host", "git.test"),
+            ),
+            (
+                https,
+                "fatal: could not read Username for 'https://bitbucket.org': No such device or address",
+                GIT_AUTH_FAILED,
+                ("host", "git.test"),
+            ),
+            (
+                https,
+                "fatal: repository 'https://codeberg.org/nonexistent-zz-owd/nope.git/' not found",
+                GIT_REPOSITORY_NOT_FOUND,
+                ("url", "https://git.test:443/o/r.git"),
+            ),
+            (
+                "git@example.com:o/r.git",
+                "fatal: '/srv/git/nope.git' does not appear to be a git repository",
+                GIT_REPOSITORY_NOT_FOUND,
+                ("url", "example.com:o/r.git"),
+            ),
+            (
+                https,
+                "fatal: unable to access 'https://nonexistent.invalid/x.git/': Could not resolve host: \
+                 nonexistent.invalid (Domain name not found)",
+                GIT_HOST_UNREACHABLE,
+                ("host", "git.test"),
+            ),
+            (
+                ssh,
+                "ssh: Could not resolve hostname nonexistent.invalid: Name does not resolve",
+                GIT_HOST_UNREACHABLE,
+                ("host", "203.0.113.7"),
+            ),
+            (
+                ssh,
+                "ssh: connect to host 127.0.0.1 port 1: Connection refused",
+                GIT_HOST_UNREACHABLE,
+                ("host", "203.0.113.7"),
+            ),
+            (
+                ssh,
+                "ssh: connect to host 192.0.2.1 port 22: Operation timed out",
+                GIT_HOST_UNREACHABLE,
+                ("host", "203.0.113.7"),
+            ),
+            (
+                https,
+                "fatal: unable to access 'https://127.0.0.1:1/x.git/': Failed to connect to 127.0.0.1 port 1 after 0 \
+                 ms: Could not connect to server",
+                GIT_HOST_UNREACHABLE,
+                ("host", "git.test"),
+            ),
+            (https, "fatal: couldn't find remote ref nope-branch", GIT_REF_NOT_FOUND, ("reference", "release/2")),
+        ];
+        for (url, line, code, (k, v)) in rows {
+            let f = fetch_failure(url, &[line], 128);
+            assert_eq!((f.code(), f.param(k)), (Some(code), Some(v)), "{line}");
+        }
+        assert_eq!(
+            fetch_failure(ssh, &["ssh: connect to host 2001:db8::1 port 22: Network unreachable"], 128).code(),
+            Some(GIT_HOST_UNREACHABLE)
+        );
+        // The shallow fetch's miss comes before the full fetch's authentication failure: the latter is the cause.
+        let both = fetch_failure(
+            https,
+            &[
+                "fatal: couldn't find remote ref nope-branch",
+                "shallow fetch of nope-branch failed; fetching the whole repository",
+                "fatal: Authentication failed for 'https://git.test/o/r.git/'",
+            ],
+            128,
+        );
+        assert_eq!(both.code(), Some(GIT_AUTH_FAILED));
+        // The script's own exit 3: the checkout is not at the commit to deploy.
+        let moved = fetch_failure(ssh, &["fatal: couldn't find remote ref release/2"], 3);
+        assert_eq!((moved.code(), moved.param("reference")), (Some(GIT_COMMIT_MISMATCH), Some("release/2")));
+        // Nothing recognized: the family's fallback, with the exit code.
+        let other = fetch_failure(ssh, &["fatal: early EOF"], 128);
+        assert_eq!((other.code(), other.param("exit_code")), (Some(GIT_FETCH_FAILED), Some("128")));
+        assert!(!format!("{:?}", fetch_failure(https, &["Repository not found"], 128)).contains("tok"));
     }
 }

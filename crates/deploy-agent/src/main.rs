@@ -54,6 +54,7 @@ mod e2e;
 mod egress;
 mod events;
 mod exec;
+mod failure;
 mod firewall;
 mod git;
 mod host;
@@ -307,21 +308,30 @@ async fn execute(op: Op, ev: &Events, cancel: &CancellationToken) -> Outcome {
     fn value<T: Serialize>(r: Result<T, String>) -> Result<serde_json::Value, String> {
         r.map(|v| serde_json::to_value(v).expect("serializable output"))
     }
+    /// Deployments name the cause of their failure (PROTOCOL.md §5); other operations send none.
+    fn outcome<T: Serialize>(r: Result<T, failure::Failure>) -> Outcome {
+        match r {
+            Ok(v) => Outcome::Ok { output: serde_json::to_value(v).expect("serializable output") },
+            Err(failure::Failure { message, cause }) => Outcome::Error { message, cause },
+        }
+    }
     let r = match op {
         // Deployments and log streams watch the token themselves (a deployment restores the previous container
         // before it reports the cancel); short operations are simply abandoned.
-        Op::DeployApp(d) => value(deploy::run(&d, ev, cancel).await),
+        Op::DeployApp(d) => return outcome(deploy::run(&d, ev, cancel).await),
         Op::AppLogs { resource, tail, follow, since, service } => {
             app::logs(&resource, tail, follow, since, service.as_deref(), ev, cancel).await
         }
-        Op::DeployCompose(c) => value(compose::deploy(&c, ev, cancel).await),
+        Op::DeployCompose(c) => return outcome(compose::deploy(&c, ev, cancel).await),
         Op::Exec(spec) => value(exec::exec(&spec, ev, cancel).await),
         Op::DockerInfo => deploy::cancellable(cancel, async { value(docker::info().await) }).await,
         Op::ContainerList { managed_only } => deploy::cancellable(cancel, docker::containers(managed_only)).await,
         Op::AppAction { resource, action } => {
             deploy::cancellable(cancel, async { value(app::action(&resource, action).await) }).await
         }
-        Op::AppStatus { resource } => deploy::cancellable(cancel, async { value(app::status(&resource).await) }).await,
+        Op::AppStatus { resource, probes } => {
+            deploy::cancellable(cancel, async { value(app::status(&resource, &probes).await) }).await
+        }
         Op::ImagePrune { resource, keep } => deploy::cancellable(cancel, app::prune(&resource, &keep)).await,
         Op::FirewallSync(rules) => deploy::cancellable(cancel, firewall::sync(&rules)).await,
         // Router changes are not abandoned halfway: a cancel would leave the router between two configurations.
@@ -330,10 +340,7 @@ async fn execute(op: Op, ev: &Events, cancel: &CancellationToken) -> Outcome {
             deploy::cancellable(cancel, volumes::remove(&resource, names.as_deref())).await
         }
     };
-    match r {
-        Ok(output) => Outcome::Ok { output },
-        Err(message) => Outcome::Error { message },
-    }
+    outcome(r.map_err(failure::Failure::from))
 }
 
 fn usage() -> ExitCode {
