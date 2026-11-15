@@ -21,6 +21,11 @@ use std::time::{Duration, Instant};
 use bollard::Docker;
 use bollard::models::{ContainerSummary, EndpointSettings, NetworkConnectRequest, NetworkCreateRequest};
 use bollard::query_parameters::{CreateContainerOptionsBuilder, LogsOptionsBuilder};
+use deploy_proto::msg::cause::{
+    COMPOSE_EXTERNAL_MISSING, COMPOSE_FILE_MISSING, COMPOSE_IMAGE_NOT_ON_SERVER, COMPOSE_INVALID,
+    COMPOSE_NETWORK_CONFLICT, COMPOSE_NO_HEALTHCHECK, COMPOSE_SERVICE_EXITED, COMPOSE_SERVICE_NOT_READY,
+    COMPOSE_SERVICE_UNHEALTHY,
+};
 use deploy_proto::msg::{
     ComposeDeploy, ComposeOutput, ComposeService, ComposeSource, FileMount, LABEL_DEPLOYMENT, LABEL_ENVIRONMENT,
     LogStream, RegistryAuth, Step,
@@ -35,6 +40,7 @@ use crate::docker::{
     remove_container, valid_id,
 };
 use crate::events::{Events, Lines};
+use crate::failure::Failure;
 use crate::git::{self, Credentials, Repo};
 use crate::oci::{Expect, Loaded};
 use crate::project::{
@@ -66,13 +72,14 @@ fn validate(c: &ComposeDeploy) -> Result<(), String> {
     volumes::validate(&c.volumes, &c.files, true)
 }
 
-/// Deploys a Compose project. Its log lines and its error never carry the registry credentials it holds.
-pub async fn deploy(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) -> Result<ComposeOutput, String> {
+/// Deploys a Compose project. Its log lines, its error and its error's cause never carry the registry credentials
+/// it holds.
+pub async fn deploy(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) -> Result<ComposeOutput, Failure> {
     ev.redact_with(&c.registry_auth);
-    deploy_project(c, ev, cancel).await.map_err(|e| ev.scrub(&e))
+    deploy_project(c, ev, cancel).await.map_err(|e| e.scrubbed(ev))
 }
 
-async fn deploy_project(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) -> Result<ComposeOutput, String> {
+async fn deploy_project(c: &ComposeDeploy, ev: &Events, cancel: &CancellationToken) -> Result<ComposeOutput, Failure> {
     validate(c)?;
     if !c.registry_auth.is_empty() {
         let hosts: Vec<String> =
@@ -127,7 +134,7 @@ async fn run(
     files: &[(PathBuf, &FileMount)],
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(Option<String>, Vec<String>, Plan), String> {
+) -> Result<(Option<String>, Vec<String>, Plan), Failure> {
     // Repository content and the Compose file are handled in a helper without the Engine; only the agent's plan
     // reaches the Engine, and only the tree and the plan's bake file reach a build helper.
     let src = Helper::source(d, &c.resource, ev).await?;
@@ -157,7 +164,7 @@ async fn resolve(
     files: &[(PathBuf, &FileMount)],
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(Plan, Option<String>, Vec<String>, Option<String>), String> {
+) -> Result<(Plan, Option<String>, Vec<String>, Option<String>), Failure> {
     let (file, dir, fetched, known_hosts, inline) = match &c.source {
         ComposeSource::Git { url, reference, auth, ssh, file } => {
             let path = git::inside(file, "Compose file")?;
@@ -199,7 +206,15 @@ async fn resolve(
     let env: Vec<String> = c.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let (code, out) = src.output(cmd, env, None, MAX_CONFIG_BYTES, ev, cancel).await?;
     if code != 0 {
-        return Err(format!("the Compose file is invalid (exit code {code})"));
+        let message = format!("the Compose file is invalid (exit code {code})");
+        // A file of the repository that is not there, rather than a file Compose refused.
+        if let ComposeSource::Git { file: path, .. } = &c.source {
+            let test = vec!["test".to_string(), "-f".to_string(), file.clone()];
+            if let Ok((1, _)) = src.output(test, Vec::new(), None, 0, ev, cancel).await {
+                return Err(Failure::new(COMPOSE_FILE_MISSING, [("path", path.clone())], message));
+            }
+        }
+        return Err(Failure::new(COMPOSE_INVALID, [("exit_code", code.to_string())], message));
     }
     let model: Value = serde_json::from_slice(&out).map_err(|e| format!("docker compose config: {e}"))?;
     let plan = Plan::new(model, c, files)?;
@@ -215,12 +230,12 @@ async fn build(
     inline: Option<&str>,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<BTreeMap<String, Loaded>, String> {
+) -> Result<BTreeMap<String, Loaded>, Failure> {
     let Some((file, targets)) = plan.bake_file() else { return Ok(BTreeMap::new()) };
     let policy = crate::egress::policy(c.egress.as_ref())?;
     let builder = Builder::Trusted;
     let h = Helper::build(d, &c.resource, builder, &c.registry_auth, ev, cancel).await?;
-    let r = async {
+    let r: Result<BTreeMap<String, Loaded>, Failure> = async {
         match inline {
             // Build contexts and Dockerfiles of the services are files of the repository.
             None => h.copy_from(src, "/src", cancel).await?,
@@ -230,11 +245,16 @@ async fn build(
         }
         ev.system(format!("Building on the rootless BuildKit builder {}", builder.name())).await;
         let names: Vec<&str> = targets.iter().map(String::as_str).collect();
+        // The services' Dockerfiles, for a build that cannot read one.
+        let dockerfiles: Vec<&str> =
+            names.iter().map(|t| file["target"][*t]["dockerfile"].as_str().unwrap_or("Dockerfile")).collect();
+        let dockerfiles = dockerfiles.join(", ");
         let egress = crate::egress::Session::start(d, &c.deployment, &policy, ev).await?;
         let built = crate::builder::bake(&h, builder, file, &names, &names, Vec::new(), &egress, ev, cancel).await;
-        egress.finish(ev).await;
-        if let Err(code) = built? {
-            return Err(format!("the build failed (exit code {code})"));
+        let denied = egress.finish(ev).await;
+        if let Err(failed) = built? {
+            let message = format!("the build failed (exit code {})", failed.code);
+            return Err(failed.failure(message, "compose", &dockerfiles, &denied, cancel.is_cancelled()));
         }
         let mut built = BTreeMap::new();
         for s in plan.services.iter().filter(|s| s.build.is_some()) {
@@ -279,7 +299,7 @@ async fn apply(
     registry_auth: &[RegistryAuth],
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
     // The networks the services join (`default` only exists when used, as with Compose).
     let used: BTreeSet<String> =
@@ -369,21 +389,14 @@ fn name_of(c: &ContainerSummary) -> String {
 
 /// Creates the project network `n` unless it exists: a bridge named for the firewall's guard, with Compose's
 /// labels. An existing one must be the project's. External ones must exist.
-async fn ensure_network(d: &Docker, project: &str, n: &Network) -> Result<(), String> {
-    match d.inspect_network(&n.name, None).await {
-        Ok(_) if n.external => return Ok(()),
-        Ok(x) => {
-            let labels = x.labels.unwrap_or_default();
-            return match labels.get(COMPOSE_PROJECT).map(String::as_str) == Some(project) {
-                true => Ok(()),
-                false => Err(format!("network {} exists and is not of the project {project}: refused", n.name)),
-            };
-        }
-        Err(e) if is_not_found(&e) && n.external => {
-            return Err(format!("the external network {} does not exist", n.name));
-        }
-        Err(e) if is_not_found(&e) => {}
-        Err(e) => return Err(format!("inspect network {}: {}", n.name, message(&e))),
+async fn ensure_network(d: &Docker, project: &str, n: &Network) -> Result<(), Failure> {
+    let existing = match d.inspect_network(&n.name, None).await {
+        Ok(x) => Some(x.labels.unwrap_or_default()),
+        Err(e) if is_not_found(&e) => None,
+        Err(e) => return Err(format!("inspect network {}: {}", n.name, message(&e)).into()),
+    };
+    if !network_missing(project, n, existing.as_ref())? {
+        return Ok(());
     }
     let req = NetworkCreateRequest {
         name: n.name.clone(),
@@ -397,22 +410,48 @@ async fn ensure_network(d: &Docker, project: &str, n: &Network) -> Result<(), St
     match d.create_network(req).await {
         Ok(_) => {}
         Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => {}
-        Err(e) => return Err(format!("create network {}: {}", n.name, message(&e))),
+        Err(e) => return Err(format!("create network {}: {}", n.name, message(&e)).into()),
     }
-    crate::firewall::guard_new_network().await
+    Ok(crate::firewall::guard_new_network().await?)
+}
+
+/// Whether project network `n` is to be created, given the labels of the network of its name, if one exists. One
+/// that exists must be external or the project's; an external one must exist.
+fn network_missing(
+    project: &str,
+    n: &Network,
+    existing: Option<&std::collections::HashMap<String, String>>,
+) -> Result<bool, Failure> {
+    match existing {
+        Some(_) if n.external => Ok(false),
+        Some(labels) if labels.get(COMPOSE_PROJECT).map(String::as_str) == Some(project) => Ok(false),
+        Some(_) => Err(Failure::new(
+            COMPOSE_NETWORK_CONFLICT,
+            [("network", n.name.clone())],
+            format!("network {} exists and is not of the project {project}: refused", n.name),
+        )),
+        None if n.external => Err(external_missing("network", &n.name)),
+        None => Ok(true),
+    }
+}
+
+fn external_missing(kind: &str, name: &str) -> Failure {
+    Failure::new(
+        COMPOSE_EXTERNAL_MISSING,
+        [("kind", kind.to_string()), ("name", name.to_string())],
+        format!("the external {kind} {name} does not exist"),
+    )
 }
 
 /// Creates the project volume `v` unless it exists (an existing one is used, as Compose does); external ones must
 /// exist and not be another resource's ([`volumes::check_external`]).
-async fn ensure_volume(d: &Docker, project: &str, v: &Volume) -> Result<(), String> {
+async fn ensure_volume(d: &Docker, project: &str, v: &Volume) -> Result<(), Failure> {
     match d.inspect_volume(&v.name).await {
         Ok(existing) if v.external => return volumes::check_external(project, &v.name, &existing.labels),
         Ok(_) => return Ok(()),
-        Err(e) if is_not_found(&e) && v.external => {
-            return Err(format!("the external volume {} does not exist", v.name));
-        }
+        Err(e) if is_not_found(&e) && v.external => return Err(external_missing("volume", &v.name)),
         Err(e) if is_not_found(&e) => {}
-        Err(e) => return Err(format!("inspect volume {}: {}", v.name, message(&e))),
+        Err(e) => return Err(format!("inspect volume {}: {}", v.name, message(&e)).into()),
     }
     let req = bollard::models::VolumeCreateRequest {
         name: Some(v.name.clone()),
@@ -421,7 +460,7 @@ async fn ensure_volume(d: &Docker, project: &str, v: &Volume) -> Result<(), Stri
         labels: Some(v.labels.clone().into_iter().collect()),
         ..Default::default()
     };
-    d.create_volume(req).await.map(|_| ()).map_err(|e| format!("create volume {}: {}", v.name, message(&e)))
+    d.create_volume(req).await.map(|_| ()).map_err(|e| format!("create volume {}: {}", v.name, message(&e)).into())
 }
 
 /// The image of a service without a build, per its pull policy, with the selected credential for its registry.
@@ -431,17 +470,23 @@ async fn pull(
     auth: Option<&RegistryAuth>,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
-    let present = d.inspect_image(&s.image).await.is_ok();
-    match s.pull {
-        Pull::Missing if present => Ok(()),
-        Pull::Never if present => Ok(()),
-        Pull::Never => {
-            Err(format!("service {}: the image {} is not on this server (pull_policy: never)", s.name, s.image))
-        }
-        Pull::Missing | Pull::Always => {
-            crate::deploy::pull(d, &s.image, auth, s.platform.as_deref(), ev, cancel).await.map(|_| ())
-        }
+) -> Result<(), Failure> {
+    if pull_needed(&s.name, &s.image, s.pull, d.inspect_image(&s.image).await.is_ok())? {
+        crate::deploy::pull(d, &s.image, auth, s.platform.as_deref(), ev, cancel).await?;
+    }
+    Ok(())
+}
+
+/// Whether `image` of `service` is pulled per its `pull` policy, `present` or not on the server.
+fn pull_needed(service: &str, image: &str, pull: Pull, present: bool) -> Result<bool, Failure> {
+    match pull {
+        Pull::Missing | Pull::Never if present => Ok(false),
+        Pull::Never => Err(Failure::new(
+            COMPOSE_IMAGE_NOT_ON_SERVER,
+            [("service", service.to_string()), ("image", image.to_string())],
+            format!("service {service}: the image {image} is not on this server (pull_policy: never)"),
+        )),
+        Pull::Missing | Pull::Always => Ok(true),
     }
 }
 
@@ -510,69 +555,106 @@ async fn create(
 }
 
 /// The state of a container, as a waiting step sees it.
+#[derive(Debug)]
 enum State {
     Starting,
-    Ready,
-    Failed(String),
+    Ready(bool),
+    Failed(Failure),
 }
 
-/// Where container `id` stands: running (and healthy, when it has a health check), still starting, or failed.
-async fn state(d: &Docker, id: &str, completes: bool) -> Result<State, String> {
+/// Where container `id` (of `service`) stands: running (and healthy, when it has a health check), still starting,
+/// or failed.
+async fn state(d: &Docker, id: &str, service: &str, completes: bool) -> Result<State, String> {
     let c = d.inspect_container(id, None).await.map_err(|e| format!("inspect {id}: {}", message(&e)))?;
-    let s = c.state.unwrap_or_default();
     let name = c.name.unwrap_or_default().trim_start_matches('/').to_string();
+    Ok(classify(&c.state.unwrap_or_default(), &name, service, completes))
+}
+
+/// Where container `name` of `service` stands, in state `s`. `completes`: it must exit with code 0.
+fn classify(s: &bollard::models::ContainerState, name: &str, service: &str, completes: bool) -> State {
     let running = s.running.unwrap_or(false);
     let code = s.exit_code.unwrap_or(-1);
+    let exited = || {
+        let params = [
+            ("service", service.to_string()),
+            ("exit_code", code.to_string()),
+            ("oom", (s.oom_killed == Some(true)).to_string()),
+        ];
+        State::Failed(Failure::new(COMPOSE_SERVICE_EXITED, params, format!("{name} exited with code {code}")))
+    };
     if completes {
-        return Ok(match (running, code, s.status.map(|x| x.to_string())) {
+        return match (running, code, s.status.map(|x| x.to_string())) {
             (true, _, _) => State::Starting,
             (false, _, Some(st)) if st == "created" => State::Starting,
-            (false, 0, _) => State::Ready,
-            (false, code, _) => State::Failed(format!("{name} exited with code {code}")),
-        });
+            (false, 0, _) => State::Ready(true),
+            (false, _, _) => exited(),
+        };
+    }
+    if s.restarting.unwrap_or(false) {
+        return if code != 0 { exited() } else { State::Starting };
     }
     if !running {
-        let restarting = s.restarting.unwrap_or(false);
-        return Ok(match restarting {
-            true => State::Starting,
-            false => State::Failed(format!("{name} exited with code {code}")),
-        });
+        return exited();
     }
-    Ok(match s.health.and_then(|h| h.status).map(|h| h.to_string()).as_deref() {
-        None | Some("" | "none" | "healthy") => State::Ready,
-        Some("unhealthy") => State::Failed(format!("{name} is unhealthy")),
+    match s.health.as_ref().and_then(|h| h.status).map(|h| h.to_string()).as_deref() {
+        Some("healthy") => State::Ready(true),
+        None | Some("" | "none") => State::Ready(false),
+        Some("unhealthy") => State::Failed(Failure::new(
+            COMPOSE_SERVICE_UNHEALTHY,
+            [("service", service.to_string())],
+            format!("{name} is unhealthy"),
+        )),
         Some(_) => State::Starting,
-    })
+    }
 }
 
-/// Waits until every container of `ids` is ready, or one fails, or the deadline passes. `completes`: they must
-/// exit with code 0 (`service_completed_successfully`).
+/// Waits until every container of `ids` (of `service`) is ready, or one fails, or the deadline passes. `completes`:
+/// they must exit with code 0 (`service_completed_successfully`).
+#[allow(clippy::too_many_arguments)]
 async fn wait_for(
     d: &Docker,
     what: &str,
+    service: &str,
     ids: &[String],
     completes: bool,
     deadline: Instant,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     for id in ids {
         loop {
-            match state(d, id, completes).await? {
-                State::Ready => break,
-                State::Failed(m) => {
+            match state(d, id, service, completes).await? {
+                State::Ready(verified) => {
+                    if !verified {
+                        pause(Duration::from_millis(1500), cancel).await?;
+                        if let State::Failed(f) = state(d, id, service, completes).await? {
+                            tail(d, id, ev).await;
+                            return Err(f.prefixed(&format!("{what}: ")));
+                        }
+                    }
+                    break;
+                }
+                State::Failed(f) => {
                     tail(d, id, ev).await;
-                    return Err(format!("{what}: {m}"));
+                    return Err(f.prefixed(&format!("{what}: ")));
                 }
                 State::Starting if Instant::now() >= deadline => {
                     tail(d, id, ev).await;
-                    return Err(format!("{what}: not ready after {WAIT_SECS} s"));
+                    return Err(not_ready(what, service));
                 }
                 State::Starting => pause(POLL, cancel).await?,
             }
         }
     }
     Ok(())
+}
+
+fn not_ready(what: &str, service: &str) -> Failure {
+    Failure::new(
+        COMPOSE_SERVICE_NOT_READY,
+        [("service", service.to_string()), ("seconds", WAIT_SECS.to_string())],
+        format!("{what}: not ready after {WAIT_SECS} s"),
+    )
 }
 
 /// Waits for the `depends_on` conditions of `s`.
@@ -583,7 +665,7 @@ async fn wait_dependencies(
     deadline: Instant,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     for dep in &s.depends_on {
         let list = ids.get(&dep.service).map(Vec::as_slice).unwrap_or_default();
         let what = format!("{} (needed by {})", dep.service, s.name);
@@ -594,15 +676,19 @@ async fn wait_dependencies(
                     let c =
                         d.inspect_container(id, None).await.map_err(|e| format!("inspect {id}: {}", message(&e)))?;
                     if c.state.and_then(|st| st.health).is_none() {
-                        return Err(format!("{what}: the service has no health check to wait for"));
+                        return Err(Failure::new(
+                            COMPOSE_NO_HEALTHCHECK,
+                            [("service", dep.service.clone())],
+                            format!("{what}: the service has no health check to wait for"),
+                        ));
                     }
                 }
                 ev.system(format!("Waiting for {} to be healthy", dep.service)).await;
-                wait_for(d, &what, list, false, deadline, ev, cancel).await?;
+                wait_for(d, &what, &dep.service, list, false, deadline, ev, cancel).await?;
             }
             Condition::CompletedSuccessfully => {
                 ev.system(format!("Waiting for {} to complete", dep.service)).await;
-                wait_for(d, &what, list, true, deadline, ev, cancel).await?;
+                wait_for(d, &what, &dep.service, list, true, deadline, ev, cancel).await?;
             }
         }
     }
@@ -617,7 +703,7 @@ async fn wait_ready(
     deadline: Instant,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let completes: BTreeSet<&str> = plan
         .services
         .iter()
@@ -628,7 +714,7 @@ async fn wait_ready(
     for s in &plan.services {
         let list = ids.get(&s.name).map(Vec::as_slice).unwrap_or_default();
         let done = completes.contains(s.name.as_str());
-        wait_for(d, &format!("service {}", s.name), list, done, deadline, ev, cancel).await?;
+        wait_for(d, &format!("service {}", s.name), &s.name, list, done, deadline, ev, cancel).await?;
     }
     Ok(())
 }
@@ -654,4 +740,82 @@ async fn tail(d: &Docker, id: &str, ev: &Events) {
 /// Services of a Compose application by container, for logs and exec (`service` label).
 pub fn service_of(c: &bollard::models::ContainerSummary) -> Option<&str> {
     c.labels.as_ref()?.get(COMPOSE_SERVICE).map(String::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::models::{ContainerState, ContainerStateStatusEnum, Health, HealthStatusEnum};
+
+    fn failed(s: State) -> Failure {
+        match s {
+            State::Failed(f) => f,
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// A service's container: exited (with Docker's out-of-memory flag), unhealthy, or still starting.
+    #[test]
+    fn service_states_name_their_cause() {
+        let exited = ContainerState {
+            status: Some(ContainerStateStatusEnum::EXITED),
+            running: Some(false),
+            exit_code: Some(137),
+            oom_killed: Some(true),
+            ..Default::default()
+        };
+        let f = failed(classify(&exited, "owd-app_1-web-1", "web", false));
+        assert_eq!(f.message, "owd-app_1-web-1 exited with code 137");
+        let params = ["service", "exit_code", "oom"].map(|p| f.param(p));
+        assert_eq!((f.code(), params), (Some(COMPOSE_SERVICE_EXITED), [Some("web"), Some("137"), Some("true")]));
+        // A service others wait to complete: code 0 is ready, another code a failure.
+        let done = ContainerState { exit_code: Some(0), oom_killed: Some(false), ..exited.clone() };
+        assert!(matches!(classify(&done, "c", "init", true), State::Ready(_)));
+        assert_eq!(failed(classify(&exited, "c", "init", true)).code(), Some(COMPOSE_SERVICE_EXITED));
+        let restarting = ContainerState { restarting: Some(true), exit_code: Some(0), ..exited };
+        assert!(matches!(classify(&restarting, "c", "web", false), State::Starting));
+        let health = |status| ContainerState {
+            running: Some(true),
+            health: Some(Health { status: Some(status), ..Default::default() }),
+            ..Default::default()
+        };
+        let f = failed(classify(&health(HealthStatusEnum::UNHEALTHY), "c", "api", false));
+        assert_eq!((f.code(), f.param("service")), (Some(COMPOSE_SERVICE_UNHEALTHY), Some("api")));
+        assert!(matches!(classify(&health(HealthStatusEnum::STARTING), "c", "api", false), State::Starting));
+        assert!(matches!(classify(&health(HealthStatusEnum::HEALTHY), "c", "api", false), State::Ready(_)));
+        let f = not_ready("service api", "api");
+        assert_eq!((f.code(), f.param("seconds")), (Some(COMPOSE_SERVICE_NOT_READY), Some("300")));
+        assert_eq!(f.message, "service api: not ready after 300 s");
+    }
+
+    /// Networks the project declares: an existing one must be external or the project's, an external one must
+    /// exist; images with `pull_policy: never` must be on the server.
+    #[test]
+    fn networks_and_images_the_file_names_are_checked() {
+        let project = "owd-app_1";
+        let net = |external: bool| Network {
+            key: "default".into(),
+            name: "owd-app_1_default".into(),
+            external,
+            internal: false,
+            labels: Default::default(),
+            options: Default::default(),
+        };
+        let ours = std::collections::HashMap::from([(COMPOSE_PROJECT.to_string(), project.to_string())]);
+        let theirs = std::collections::HashMap::new();
+        assert_eq!(network_missing(project, &net(false), None), Ok(true));
+        assert_eq!(network_missing(project, &net(false), Some(&ours)), Ok(false));
+        assert_eq!(network_missing(project, &net(true), Some(&theirs)), Ok(false));
+        let f = network_missing(project, &net(false), Some(&theirs)).unwrap_err();
+        assert_eq!((f.code(), f.param("network")), (Some(COMPOSE_NETWORK_CONFLICT), Some("owd-app_1_default")));
+        let f = network_missing(project, &net(true), None).unwrap_err();
+        assert_eq!((f.code(), f.param("kind")), (Some(COMPOSE_EXTERNAL_MISSING), Some("network")));
+        assert_eq!(f.message, "the external network owd-app_1_default does not exist");
+
+        assert_eq!(pull_needed("web", "nginx:1", Pull::Missing, true), Ok(false));
+        assert_eq!(pull_needed("web", "nginx:1", Pull::Always, true), Ok(true));
+        assert_eq!(pull_needed("web", "nginx:1", Pull::Never, true), Ok(false));
+        let f = pull_needed("web", "nginx:1", Pull::Never, false).unwrap_err();
+        assert_eq!((f.code(), f.param("image")), (Some(COMPOSE_IMAGE_NOT_ON_SERVER), Some("nginx:1")));
+    }
 }

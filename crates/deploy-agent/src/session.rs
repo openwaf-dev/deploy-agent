@@ -246,7 +246,7 @@ impl Agent {
                                         .ok_or("command without an id")?;
                                     let outcome = match e.to_string().contains("unknown variant") {
                                         true => Outcome::Unsupported,
-                                        false => Outcome::Error { message: format!("invalid command: {e}") },
+                                        false => Outcome::Error { message: format!("invalid command: {e}"), cause: None },
                                     };
                                     out(link, &sealer.seal(&CommandResult { id, outcome }, now())).await?;
                                     continue;

@@ -217,11 +217,19 @@ pub fn anonymous_warning(service: Option<&str>, path: &str) -> String {
 /// An external volume a Compose file names (`owd-<resource>-…` or `owd-<resource>_…`, see
 /// [`crate::project`]): the application's own or one made by hand, never one labelled for another resource, such as
 /// a preview `<resource>-pr<n>`, whose volumes share the application's prefix.
-pub fn check_external(project: &str, name: &str, labels: &HashMap<String, String>) -> Result<(), String> {
+pub fn check_external(
+    project: &str,
+    name: &str,
+    labels: &HashMap<String, String>,
+) -> Result<(), crate::failure::Failure> {
     let other = labels.get(LABEL_RESOURCE).is_some_and(|r| crate::docker::app_prefix(r) != project)
         || labels.get(COMPOSE_PROJECT).is_some_and(|p| p != project);
     match other {
-        true => Err(format!("the external volume {name} belongs to another application or preview: refused")),
+        true => Err(crate::failure::Failure::new(
+            deploy_proto::msg::cause::COMPOSE_EXTERNAL_FOREIGN,
+            [("name", name.to_string())],
+            format!("the external volume {name} belongs to another application or preview: refused"),
+        )),
         false => Ok(()),
     }
 }
@@ -329,7 +337,11 @@ mod tests {
         assert!(check_external(p, "owd-app_01c_db", &labels(&[(COMPOSE_PROJECT, p)])).is_ok());
         assert!(check_external(p, "owd-app_01c-manual", &labels(&[])).is_ok(), "made by hand");
         // A preview's volumes share the application's prefix.
-        assert!(check_external(p, "owd-app_01c-pr3-data", &labels(&[(LABEL_RESOURCE, "app_01C-pr3")])).is_err());
+        let f = check_external(p, "owd-app_01c-pr3-data", &labels(&[(LABEL_RESOURCE, "app_01C-pr3")])).unwrap_err();
+        assert_eq!(
+            (f.code(), f.param("name")),
+            (Some(deploy_proto::msg::cause::COMPOSE_EXTERNAL_FOREIGN), Some("owd-app_01c-pr3-data"))
+        );
         assert!(check_external(p, "owd-app_01c-pr3_db", &labels(&[(COMPOSE_PROJECT, "owd-app_01c-pr3")])).is_err());
     }
 }

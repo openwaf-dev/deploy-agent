@@ -96,7 +96,11 @@ pub mod feature {
     pub const REGISTRY_AUTH: &str = "registry_auth";
     /// `AppDeploy::strategy` `recreate`: the previous container stops before the new one starts.
     pub const RECREATE: &str = "recreate";
-    pub const ALL: [&str; 15] = [
+    /// Typed failures: `Outcome::Error::cause` on failed deployments, `DeployOutput::warning` (the port check after a
+    /// deployment without a health check), the optional container facts of [`super::ContainerState`] and the port
+    /// probes of `AppStatus` (PROTOCOL.md §9).
+    pub const DIAGNOSTICS: &str = "diagnostics";
+    pub const ALL: [&str; 16] = [
         ROUTER,
         BUILD_PACKS,
         COMPOSE,
@@ -112,6 +116,7 @@ pub mod feature {
         BUILD_EGRESS,
         REGISTRY_AUTH,
         RECREATE,
+        DIAGNOSTICS,
     ];
 }
 kind!(Hello, "hello");
@@ -285,8 +290,13 @@ pub enum Op {
     /// Start, stop, restart or remove the containers of an application (a Compose application: all its services).
     /// Remove also drops its router routes and file mounts; named volumes stay (see `VolumeRemove`).
     AppAction { resource: String, action: AppActionKind },
-    /// State of the containers of an application (output: [`AppState`]).
-    AppStatus { resource: String },
+    /// State of the containers of an application (output: [`AppState`]). `probes`, sent only to agents with
+    /// [`feature::DIAGNOSTICS`], asks each port at its service's current container.
+    AppStatus {
+        resource: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        probes: Vec<PortProbe>,
+    },
     /// Runtime logs of an application's current container: the last `tail` lines, then new ones while `follow`
     /// (streamed as `CommandEvent::Log` until cancelled). `since` is a Unix time in seconds. `service` selects the
     /// service of a Compose application (default: its newest container).
@@ -704,6 +714,107 @@ pub struct DeployOutput {
     /// Host keys accepted on first use during an SSH clone (`known_hosts` lines), to pin for the next clones.
     #[serde(default)]
     pub known_hosts: Vec<String>,
+    /// A warning on a successful deployment (agents with [`feature::DIAGNOSTICS`]), for example nothing answering on
+    /// the application's port after a deployment without a health check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<Cause>,
+}
+
+/// Why an operation failed, or the warning of a successful deployment: a code (`unclassified`, or `family.name`)
+/// and short string parameters. The codes an agent sends are in [`cause`]; the control plane accepts any code of
+/// that format, so a newer agent's code never fails decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cause {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+}
+
+/// The cause codes an agent with [`feature::DIAGNOSTICS`] sends (PROTOCOL.md §5). Code strings only: the texts belong
+/// to the control plane.
+pub mod cause {
+    pub const REGISTRY_ANONYMOUS_REFUSED: &str = "registry.anonymous_refused";
+    pub const REGISTRY_CREDENTIAL_REJECTED: &str = "registry.credential_rejected";
+    pub const REGISTRY_ACCESS_DENIED: &str = "registry.access_denied";
+    pub const REGISTRY_RATE_LIMITED: &str = "registry.rate_limited";
+    pub const IMAGE_MISSING_ON_SERVER: &str = "image.missing_on_server";
+    pub const GIT_FETCH_FAILED: &str = "git.fetch_failed";
+    pub const GIT_AUTH_FAILED: &str = "git.auth_failed";
+    pub const GIT_DEPLOY_KEY_REFUSED: &str = "git.deploy_key_refused";
+    pub const GIT_HOST_KEY_CHANGED: &str = "git.host_key_changed";
+    pub const GIT_REPOSITORY_NOT_FOUND: &str = "git.repository_not_found";
+    pub const GIT_REF_NOT_FOUND: &str = "git.ref_not_found";
+    pub const GIT_HOST_UNREACHABLE: &str = "git.host_unreachable";
+    pub const GIT_COMMIT_MISMATCH: &str = "git.commit_mismatch";
+    pub const BUILD_PROJECT_FAILED: &str = "build.project_failed";
+    pub const BUILD_DOCKERFILE_MISSING: &str = "build.dockerfile_missing";
+    pub const BUILD_KILLED: &str = "build.killed";
+    pub const BUILD_EGRESS_DENIED: &str = "build.egress_denied";
+    pub const DISK_FULL: &str = "disk.full";
+    pub const COMPOSE_INVALID: &str = "compose.invalid";
+    pub const COMPOSE_FILE_MISSING: &str = "compose.file_missing";
+    pub const COMPOSE_NETWORK_CONFLICT: &str = "compose.network_conflict";
+    pub const COMPOSE_EXTERNAL_MISSING: &str = "compose.external_missing";
+    pub const COMPOSE_EXTERNAL_FOREIGN: &str = "compose.external_foreign";
+    pub const COMPOSE_IMAGE_NOT_ON_SERVER: &str = "compose.image_not_on_server";
+    pub const COMPOSE_SERVICE_EXITED: &str = "compose.service_exited";
+    pub const COMPOSE_SERVICE_UNHEALTHY: &str = "compose.service_unhealthy";
+    pub const COMPOSE_SERVICE_NOT_READY: &str = "compose.service_not_ready";
+    pub const COMPOSE_NO_HEALTHCHECK: &str = "compose.no_healthcheck";
+    pub const CONTAINER_EXITED: &str = "container.exited";
+    pub const CONTAINER_OOM_KILLED: &str = "container.oom_killed";
+    pub const CONTAINER_NO_ADDRESS: &str = "container.no_address";
+    pub const CONTAINER_START_FAILED: &str = "container.start_failed";
+    pub const CONTAINER_PORT_IN_USE: &str = "container.port_in_use";
+    pub const CONTAINER_STOP_FAILED: &str = "container.stop_failed";
+    pub const HEALTH_FAILED: &str = "health.failed";
+    pub const HEALTH_NO_ANSWER: &str = "health.no_answer";
+    pub const HEALTH_BAD_STATUS: &str = "health.bad_status";
+    pub const ROUTER_CONFLICT: &str = "router.conflict";
+    /// A warning only (`DeployOutput::warning`): nothing answered on the application's port.
+    pub const RUNTIME_NOT_LISTENING: &str = "runtime.not_listening";
+
+    pub const AGENT_CODES: &[&str] = &[
+        REGISTRY_ANONYMOUS_REFUSED,
+        REGISTRY_CREDENTIAL_REJECTED,
+        REGISTRY_ACCESS_DENIED,
+        REGISTRY_RATE_LIMITED,
+        IMAGE_MISSING_ON_SERVER,
+        GIT_FETCH_FAILED,
+        GIT_AUTH_FAILED,
+        GIT_DEPLOY_KEY_REFUSED,
+        GIT_HOST_KEY_CHANGED,
+        GIT_REPOSITORY_NOT_FOUND,
+        GIT_REF_NOT_FOUND,
+        GIT_HOST_UNREACHABLE,
+        GIT_COMMIT_MISMATCH,
+        BUILD_PROJECT_FAILED,
+        BUILD_DOCKERFILE_MISSING,
+        BUILD_KILLED,
+        BUILD_EGRESS_DENIED,
+        DISK_FULL,
+        COMPOSE_INVALID,
+        COMPOSE_FILE_MISSING,
+        COMPOSE_NETWORK_CONFLICT,
+        COMPOSE_EXTERNAL_MISSING,
+        COMPOSE_EXTERNAL_FOREIGN,
+        COMPOSE_IMAGE_NOT_ON_SERVER,
+        COMPOSE_SERVICE_EXITED,
+        COMPOSE_SERVICE_UNHEALTHY,
+        COMPOSE_SERVICE_NOT_READY,
+        COMPOSE_NO_HEALTHCHECK,
+        CONTAINER_EXITED,
+        CONTAINER_OOM_KILLED,
+        CONTAINER_NO_ADDRESS,
+        CONTAINER_START_FAILED,
+        CONTAINER_PORT_IN_USE,
+        CONTAINER_STOP_FAILED,
+        HEALTH_FAILED,
+        HEALTH_NO_ANSWER,
+        HEALTH_BAD_STATUS,
+        ROUTER_CONFLICT,
+        RUNTIME_NOT_LISTENING,
+    ];
 }
 
 /// Where the router sends a request. The upstream is the application's current container (by its per-deployment
@@ -916,6 +1027,27 @@ pub enum AppActionKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     pub containers: Vec<ContainerState>,
+    /// Results of `AppStatus::probes`, in their order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<PortProbeResult>,
+}
+
+/// A port to ask with `GET /` at the address the service's current container has on `network`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortProbe {
+    pub service: Option<String>,
+    pub port: u16,
+    pub network: String,
+}
+
+/// A probe's result: `status` is the HTTP status of any answer; `error` is `refused`, `timeout`, `no_address` or
+/// `other` when nothing answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortProbeResult {
+    pub service: Option<String>,
+    pub port: u16,
+    pub status: Option<u16>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -928,6 +1060,18 @@ pub struct ContainerState {
     /// Docker's health: healthy, unhealthy, starting, or None without a health check.
     pub health: Option<String>,
     pub started_at: Option<String>,
+    /// The following facts come from agents with [`feature::DIAGNOSTICS`]. The Compose service of the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_killed: Option<bool>,
+    /// Docker's restart count of this container (each deployment creates a new one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1092,6 +1236,9 @@ pub enum Outcome {
     },
     Error {
         message: String,
+        /// Why it failed, from agents with [`feature::DIAGNOSTICS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
     /// The agent does not know the operation (older agent).
     Unsupported,
@@ -1266,6 +1413,7 @@ mod tests {
             container_id: "c".into(),
             commit: None,
             known_hosts: vec![],
+            warning: None,
         };
         assert_eq!(serde_json::to_value(&out).unwrap()["container_id"], "c");
     }
@@ -1386,5 +1534,50 @@ mod tests {
         assert_eq!(v["type"], "egress");
         assert!(v.get("truncated").is_none() && v["entries"][0].get("reason").is_none());
         assert_eq!(serde_json::from_value::<Event>(v).unwrap(), e);
+    }
+
+    /// What a 0.3.2 agent sends still decodes; the new fields are omitted when empty; and a 0.3.2 control plane (its
+    /// `Outcome`, copied here) reads a result that carries a cause.
+    #[test]
+    fn diagnostics_fields_are_additive() {
+        let old: Outcome = serde_json::from_value(serde_json::json!({"status": "error", "message": "m"})).unwrap();
+        assert_eq!(old, Outcome::Error { message: "m".into(), cause: None });
+        let st: AppState = serde_json::from_value(serde_json::json!({"containers": [{"id": "c", "deployment": "d",
+            "image": "i", "state": "running", "health": null, "started_at": null}]}))
+        .unwrap();
+        assert!(st.probes.is_empty() && st.containers[0].restart_count.is_none());
+        assert_eq!(
+            serde_json::to_value(&st).unwrap(),
+            serde_json::json!({"containers": [{"id": "c", "deployment": "d", "image": "i", "state": "running",
+                "health": null, "started_at": null}]})
+        );
+        let out: DeployOutput = serde_json::from_value(serde_json::json!({"image": "i", "image_id": "s",
+            "container_id": "c", "commit": null, "known_hosts": []}))
+        .unwrap();
+        assert!(out.warning.is_none() && serde_json::to_value(&out).unwrap().get("warning").is_none());
+        let op = Op::AppStatus { resource: "app_01".into(), probes: vec![] };
+        assert_eq!(serde_json::to_value(&op).unwrap(), serde_json::json!({"op": "app_status", "resource": "app_01"}));
+        assert_eq!(
+            serde_json::to_value(Cause { code: "unclassified".into(), params: BTreeMap::new() }).unwrap(),
+            serde_json::json!({"code": "unclassified"})
+        );
+
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(tag = "status", rename_all = "snake_case")]
+        enum Outcome032 {
+            Ok { output: serde_json::Value },
+            Error { message: String },
+            Unsupported,
+        }
+        let new = Outcome::Error {
+            message: "git fetch failed (exit code 128)".into(),
+            cause: Some(Cause {
+                code: cause::GIT_DEPLOY_KEY_REFUSED.into(),
+                params: BTreeMap::from([("host".into(), "github.com".into())]),
+            }),
+        };
+        let read: Outcome032 = serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
+        assert_eq!(read, Outcome032::Error { message: "git fetch failed (exit code 128)".into() });
     }
 }

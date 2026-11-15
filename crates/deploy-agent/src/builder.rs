@@ -49,6 +49,9 @@ use bollard::query_parameters::{
     BuildImageOptionsBuilder, CreateContainerOptionsBuilder, DownloadFromContainerOptionsBuilder,
     UploadToContainerOptionsBuilder,
 };
+use deploy_proto::msg::cause::{
+    BUILD_DOCKERFILE_MISSING, BUILD_EGRESS_DENIED, BUILD_KILLED, BUILD_PROJECT_FAILED, DISK_FULL,
+};
 use deploy_proto::msg::{
     BuildEgress, BuildPack, BuildSpec, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, RegistryAuth, Step,
 };
@@ -60,6 +63,7 @@ use tokio_util::sync::CancellationToken;
 use crate::docker::{File, LABEL_HELPER, ensure_image, message, remove_container, upload};
 use crate::events::Events;
 use crate::exec;
+use crate::failure::Failure;
 use crate::git::{self, Cloned, Repo, SECRETS_TMPFS};
 use crate::oci::{self, Expect, Loaded};
 
@@ -588,7 +592,7 @@ impl Helper {
 
     /// Clones the repository into /src (the clone script of [`git::SCRIPT`], secrets through stdin). Only in a
     /// source helper: repository content reaches a build helper only through the agent's copy.
-    pub async fn clone(&self, repo: &Repo<'_>, ev: &Events, cancel: &CancellationToken) -> Result<Cloned, String> {
+    pub async fn clone(&self, repo: &Repo<'_>, ev: &Events, cancel: &CancellationToken) -> Result<Cloned, Failure> {
         if self.role != Role::Source {
             return Err("the clone runs in a source helper".into());
         }
@@ -598,8 +602,8 @@ impl Helper {
         let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), git::SCRIPT.to_string()];
         let r = exec::start(&self.d, &self.id, cmd, clone.env.clone(), Some(stdin)).await?;
         let mut cloned = Cloned::default();
-        let code = exec::pump(&self.d, r, ev, cancel, &mut |s, l| s == LogStream::Stderr || !cloned.marker(l)).await?;
-        let commit = cloned.commit(code)?;
+        let code = exec::pump(&self.d, r, ev, cancel, &mut |s, l| cloned.line(s, l)).await?;
+        let commit = cloned.commit(code, repo)?;
         ev.system(format!("Checked out commit {commit}")).await;
         for k in &cloned.known_hosts {
             ev.system(format!("Accepted the host key on first use: {k}")).await;
@@ -721,15 +725,28 @@ fn scanner_failed(line: &str) -> bool {
     line.trim_start().starts_with("> ") && line.contains("buildkit-syft-scanner")
 }
 
-/// What BuildKit's output says about a base image it could not pull: the first image it failed to resolve and the
-/// registry's status for it.
+/// Lines of a failed build kept to look for a denied destination's host name ([`BuildWatch`]).
+const WATCH_LINES: usize = 200;
+
+/// What a build's output says about why it failed (PROTOCOL.md §5): BuildKit's lines (`moby/buildkit:v0.34.2`) and
+/// Railpack's (in [`IMAGE`]). It is fed every line of the bake and read only when the bake failed.
 #[derive(Debug, Default)]
-struct PullWatch {
+struct BuildWatch {
+    /// The first base image BuildKit failed to resolve, and the registry's status for it.
     image: Option<String>,
     status: Option<u16>,
+    disk_full: bool,
+    dockerfile_missing: bool,
+    /// A step exited with 137 (SIGKILL: the builder's memory limit, nearly always).
+    killed: bool,
+    /// Node stopped at its own heap limit (`--max-old-space-size`), which is the same fix when set below the
+    /// builder's.
+    heap: bool,
+    /// The last [`WATCH_LINES`] lines, searched for a denied destination once the build egress proxy reported.
+    tail: std::collections::VecDeque<String>,
 }
 
-impl PullWatch {
+impl BuildWatch {
     fn feed(&mut self, line: &str) {
         // The resolver's own error, or the summary of the failed step BuildKit prints before its final error (with
         // registries whose token service refuses the anonymous token, such as GHCR, it is the only one naming the
@@ -754,10 +771,19 @@ impl PullWatch {
                 .find(|(_, t)| line.contains(t))
                 .map(|(s, _)| s);
         }
+        // BuildKit writes Go's lowercase text; tools in a `RUN` step strerror's capitalized one.
+        self.disk_full |= line.contains("no space left on device") || line.contains("No space left on device");
+        self.dockerfile_missing |= line.contains("failed to read dockerfile");
+        self.killed |= line.contains("did not complete successfully: exit code: 137");
+        self.heap |= line.contains("JavaScript heap out of memory");
+        if self.tail.len() == WATCH_LINES {
+            self.tail.pop_front();
+        }
+        self.tail.push_back(line.to_string());
     }
 
-    /// The agent's text for the failure, when both the image and a recognized status were seen.
-    fn message(&self, registry: &[RegistryAuth]) -> Option<String> {
+    /// The registry's refusal of a base image, when both the image and a recognized status were seen.
+    fn pull(&self, registry: &[RegistryAuth]) -> Option<Failure> {
         use crate::deploy::PullFailure;
         let image = self.image.as_deref()?;
         let with_auth = deploy_proto::registry::matching(registry, image).is_some();
@@ -767,7 +793,54 @@ impl PullWatch {
             (429, _) => PullFailure::RateLimited,
             _ => PullFailure::Anonymous,
         };
-        Some(class.message(image, with_auth))
+        Some(class.failure(image, with_auth))
+    }
+}
+
+/// A failed bake: its exit code and what its output said ([`BuildWatch`]).
+#[derive(Debug)]
+pub struct Failed {
+    pub code: i64,
+    watch: BuildWatch,
+    /// The registry's refusal of a base image, already logged in the agent's words.
+    pull: Option<Failure>,
+}
+
+impl Failed {
+    /// The build's failure: `message` with the cause the output names, in precedence order: a full disk, a base
+    /// image the registry refused, a missing Dockerfile (`dockerfile`, its path), a step killed (never for a
+    /// cancelled deployment: the agent killed it), a destination the build egress proxy denied (`denied`, from
+    /// [`crate::egress::Session::finish`]) named in the last lines; else `build.project_failed` with the build's
+    /// `pack` and the first denied destination as a hint.
+    pub fn failure(
+        self,
+        message: String,
+        pack: &str,
+        dockerfile: &str,
+        denied: &[(String, u16)],
+        cancelled: bool,
+    ) -> Failure {
+        let w = &self.watch;
+        if w.disk_full {
+            return Failure::new(DISK_FULL, [("step", "building".to_string())], message);
+        }
+        if let Some(p) = self.pull {
+            return Failure { message, ..p };
+        }
+        if w.dockerfile_missing {
+            return Failure::new(BUILD_DOCKERFILE_MISSING, [("path", dockerfile.to_string())], message);
+        }
+        if (w.killed || w.heap) && !cancelled {
+            let mut params = vec![("limit_mb", (limits().memory / (1024 * 1024)).to_string())];
+            params.extend(w.killed.then(|| ("exit_code", "137".to_string())));
+            return Failure::new(BUILD_KILLED, params, message);
+        }
+        if let Some((host, port)) = denied.iter().find(|(h, _)| w.tail.iter().any(|l| l.contains(h.as_str()))) {
+            return Failure::new(BUILD_EGRESS_DENIED, [("host", host.clone()), ("port", port.to_string())], message);
+        }
+        let mut params = vec![("exit_code", self.code.to_string()), ("pack", pack.to_string())];
+        params.extend(denied.first().map(|(h, p)| ("denied", format!("{h}:{p}"))));
+        Failure::new(BUILD_PROJECT_FAILED, params, message)
     }
 }
 
@@ -780,7 +853,7 @@ impl PullWatch {
 ///
 /// BuildKit fails a build whose SBOM generator cannot run (its image cannot be pulled, say): such a build runs
 /// again without the attestation, so an SBOM never fails a deployment. Returns whether the attestations were made,
-/// or the build's exit code when it failed.
+/// or the failed build ([`Failed`], turned into the deployment's failure once the egress proxy reported).
 #[allow(clippy::too_many_arguments)]
 pub async fn bake(
     h: &Helper,
@@ -792,7 +865,7 @@ pub async fn bake(
     egress: &crate::egress::Session,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<Result<bool, i64>, String> {
+) -> Result<Result<bool, Failed>, String> {
     let mut env = env;
     env.extend(egress.secret_env());
     env.push(format!("OWD_BUILDER={}", b.name()));
@@ -805,7 +878,7 @@ pub async fn bake(
         ))
         .await;
     }
-    let mut outcome = Err(-1);
+    let mut outcome = Ok(false);
     for sbom in [true, false] {
         for t in exported {
             export(&mut file["target"][*t], t, sbom);
@@ -813,7 +886,7 @@ pub async fn bake(
         let data = serde_json::to_vec(&file).expect("json");
         h.put(&[File { path: "bake.json", data: &data, mode: 0o600 }]).await?;
         let mut scanner = false;
-        let mut watch = PullWatch::default();
+        let mut watch = BuildWatch::default();
         let code = h
             .sh(BAKE_SCRIPT, env.clone(), ev, cancel, &mut |_, l| {
                 scanner |= scanner_failed(l);
@@ -821,13 +894,16 @@ pub async fn bake(
                 true
             })
             .await?;
-        if code != 0
-            && let Some(m) = watch.message(&h.registry)
-        {
-            ev.system(m).await;
+        if code == 0 {
+            outcome = Ok(sbom);
+            break;
         }
-        outcome = if code == 0 { Ok(sbom) } else { Err(code) };
-        if code == 0 || !sbom || !scanner {
+        let pull = watch.pull(&h.registry);
+        if let Some(p) = &pull {
+            ev.system(&p.message).await;
+        }
+        outcome = Err(Failed { code, watch, pull });
+        if !sbom || !scanner {
             break;
         }
         ev.system("BuildKit could not run its SBOM generator: building again without the SBOM attestation").await;
@@ -882,25 +958,41 @@ pub async fn build_dockerfile(
     ctx: &git::Context,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<Loaded, String> {
+) -> Result<Loaded, Failure> {
     let policy = crate::egress::policy(spec.egress.as_ref())?;
     let builder = Builder::of(spec.untrusted);
     let h = Helper::build(d, resource, builder, &spec.registry_auth, ev, cancel).await?;
-    let r = async {
+    let r: Result<Loaded, Failure> = async {
         h.put_context(&ctx.tar).await?;
         ev.system(format!("Building on the rootless BuildKit builder {}", builder.name())).await;
         let egress = crate::egress::Session::start(d, deployment, &policy, ev).await?;
         let file = dockerfile_bake(spec, &ctx.dockerfile, resource, deployment);
         let built = bake(&h, builder, file, &["image"], &["image"], Vec::new(), &egress, ev, cancel).await;
-        egress.finish(ev).await;
-        if let Err(code) = built? {
-            return Err(format!("build failed (exit code {code})"));
+        let denied = egress.finish(ev).await;
+        if let Err(failed) = built? {
+            let message = format!("build failed (exit code {})", failed.code);
+            return Err(failed.failure(
+                message,
+                pack_name(spec.pack),
+                &spec.dockerfile,
+                &denied,
+                cancel.is_cancelled(),
+            ));
         }
-        h.load("image", Expect { resource, deployment }, tag, ev, cancel).await
+        Ok(h.load("image", Expect { resource, deployment }, tag, ev, cancel).await?)
     }
     .await;
     h.remove().await;
     r
+}
+
+/// The name of a build pack, as the `pack` parameter of a build's failure.
+fn pack_name(pack: BuildPack) -> &'static str {
+    match pack {
+        BuildPack::Dockerfile => "dockerfile",
+        BuildPack::Railpack => "railpack",
+        BuildPack::Static => "static",
+    }
 }
 
 /// Railpack's plan, in the source helper: detection and overrides, from the repository, written to /owd. Build
@@ -1330,7 +1422,7 @@ pub async fn build(
     spec: &BuildSpec,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<Built, String> {
+) -> Result<Built, Failure> {
     let policy = crate::egress::policy(spec.egress.as_ref())?;
     let context = git::inside(&spec.context, "build context")?;
     let site = git::inside(spec.publish_dir.as_deref().unwrap_or("."), "publish directory")?;
@@ -1338,7 +1430,7 @@ pub async fn build(
     let mut ignored = Vec::new();
     for (k, v) in &spec.args {
         if !env_name_ok(k) || reserved(k) {
-            return Err(format!("build variable {k:?} cannot be used in a Railpack build"));
+            return Err(format!("build variable {k:?} cannot be used in a Railpack build").into());
         }
         if v.contains('\0') {
             return Err("build variable values cannot contain NUL".into());
@@ -1363,7 +1455,7 @@ pub async fn build(
     ] {
         if let Some(v) = v.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             if v.contains('\0') {
-                return Err(format!("{name} contains NUL"));
+                return Err(format!("{name} contains NUL").into());
             }
             vars.insert(name.into(), v.into());
         }
@@ -1399,7 +1491,7 @@ async fn run(
     vars: BTreeMap<String, String>,
     ev: &Events,
     cancel: &CancellationToken,
-) -> Result<Built, String> {
+) -> Result<Built, Failure> {
     let cloned = src.clone(&repo, ev, cancel).await?;
     ev.step_after_fetch(Step::Building, cloned.info()).await;
     let commit = cloned.commit.clone().unwrap_or_default();
@@ -1420,7 +1512,7 @@ async fn run(
         env.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
         let code = src.sh(PREPARE_SCRIPT, env, ev, cancel, &mut |_, _| true).await?;
         if code != 0 {
-            return Err(format!("Railpack could not plan the build (exit code {code})"));
+            return Err(format!("Railpack could not plan the build (exit code {code})").into());
         }
     }
     // Only what the source helper produced reaches the build helper.
@@ -1458,12 +1550,13 @@ async fn run(
     let env = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let egress = crate::egress::Session::start(d, deployment, policy, ev).await?;
     let built = bake(h, builder, json!({"target": targets}), &["image"], &["image"], env, &egress, ev, cancel).await;
-    egress.finish(ev).await;
-    if let Err(code) = built? {
-        return Err(match railpack {
-            true => format!("Railpack build failed (exit code {code})"),
-            false => format!("static site build failed (exit code {code})"),
-        });
+    let denied = egress.finish(ev).await;
+    if let Err(failed) = built? {
+        let message = match railpack {
+            true => format!("Railpack build failed (exit code {})", failed.code),
+            false => format!("static site build failed (exit code {})", failed.code),
+        };
+        return Err(failed.failure(message, pack_name(spec.pack), &spec.dockerfile, &denied, cancel.is_cancelled()));
     }
     let image = h.load("image", Expect { resource, deployment }, tag, ev, cancel).await?;
     Ok(Built { commit, known_hosts: cloned.known_hosts, image })
@@ -1583,49 +1676,60 @@ mod tests {
         assert!(!all.contains("auths") && !all.contains("docker-config"), "{all}");
     }
 
+    fn watch(lines: &[&str]) -> BuildWatch {
+        let mut w = BuildWatch::default();
+        for l in lines {
+            w.feed(l);
+        }
+        w
+    }
+
     #[test]
-    fn buildkit_pull_failures_get_the_agents_text() {
+    fn buildkit_pull_failures_get_the_agents_text_and_cause() {
+        use deploy_proto::msg::cause::*;
         let auth = RegistryAuth { server: "ghcr.io".into(), username: "u".into(), password: "secret-1".into() };
-        let feed = |lines: &[&str]| {
-            let mut w = PullWatch::default();
-            for l in lines {
-                w.feed(l);
-            }
-            w
-        };
+        let pull = |lines: &[&str], registry: &[RegistryAuth]| watch(lines).pull(registry);
         let one = "ERROR: failed to solve: failed to resolve source metadata for ghcr.io/acme/base:3: unexpected \
                    status from HEAD request to https://ghcr.io/v2/acme/base/manifests/3: 401 Unauthorized";
-        let w = feed(&[one]);
-        assert_eq!(w.image.as_deref(), Some("ghcr.io/acme/base:3"));
-        assert!(w.message(&[]).unwrap().starts_with("ghcr.io refused the anonymous pull of acme/base (401)"));
-        assert!(
-            w.message(std::slice::from_ref(&auth))
-                .unwrap()
-                .starts_with("ghcr.io rejected the selected credential (401)")
+        assert_eq!(watch(&[one]).image.as_deref(), Some("ghcr.io/acme/base:3"));
+        let anonymous = pull(&[one], &[]).unwrap();
+        assert!(anonymous.message.starts_with("ghcr.io refused the anonymous pull of acme/base (401)"));
+        assert_eq!(
+            (anonymous.code(), anonymous.param("host"), anonymous.param("repo")),
+            (Some(REGISTRY_ANONYMOUS_REFUSED), Some("ghcr.io"), Some("acme/base"))
         );
-        let split = feed(&[
-            "#3 failed to resolve source metadata for docker.io/library/x:1",
-            "#3 ERROR: 429 Too Many Requests",
-        ]);
-        assert!(split.message(&[]).unwrap().contains("anonymous Docker Hub pulls share this server's limit"));
-        let denied = feed(&["failed to resolve source metadata for ghcr.io/acme/base:3: 403 Forbidden"]);
-        assert!(denied.message(&[auth]).unwrap().contains("with the selected credential (403)"));
-        assert!(feed(&["#5 RUN false", "ERROR: process did not complete successfully"]).message(&[]).is_none());
-        assert!(feed(&["failed to resolve source metadata for ghcr.io/x:1: not found"]).message(&[]).is_none());
+        let rejected = pull(&[one], std::slice::from_ref(&auth)).unwrap();
+        assert!(rejected.message.starts_with("ghcr.io rejected the selected credential (401)"));
+        assert_eq!(rejected.code(), Some(REGISTRY_CREDENTIAL_REJECTED));
+        let split = pull(
+            &["#3 failed to resolve source metadata for docker.io/library/x:1", "#3 ERROR: 429 Too Many Requests"],
+            &[],
+        )
+        .unwrap();
+        assert!(split.message.contains("anonymous Docker Hub pulls share this server's limit"));
+        assert_eq!((split.code(), split.param("host")), (Some(REGISTRY_RATE_LIMITED), Some("docker.io")));
+        let denied = pull(&["failed to resolve source metadata for ghcr.io/acme/base:3: 403 Forbidden"], &[auth]);
+        let denied = denied.unwrap();
+        assert!(denied.message.contains("with the selected credential (403)"));
+        assert_eq!(denied.code(), Some(REGISTRY_ACCESS_DENIED));
+        assert!(pull(&["#5 RUN false", "ERROR: process did not complete successfully"], &[]).is_none());
+        assert!(pull(&["failed to resolve source metadata for ghcr.io/x:1: not found"], &[]).is_none());
         // GHCR refuses the anonymous token: the image is only named in the failed step's summary.
-        let ghcr = feed(&[
-            "#4 [internal] load metadata for ghcr.io/acme/base:3",
-            "#4 ERROR: failed to authorize: failed to fetch anonymous token: unexpected status from GET request to \
-             https://ghcr.io/token?scope=repository%3Aacme%2Fbase%3Apull&service=ghcr.io: 401 Unauthorized",
-            " > [internal] load metadata for ghcr.io/acme/base:3:",
-            "   1 | >>> FROM ghcr.io/acme/base:3",
-            "ERROR: failed to solve: failed to fetch anonymous token: unexpected status from GET request to \
-             https://ghcr.io/token?scope=repository%3Aacme%2Fbase%3Apull&service=ghcr.io: 401 Unauthorized",
-        ]);
-        assert!(ghcr.message(&[]).unwrap().starts_with("ghcr.io refused the anonymous pull of acme/base (401)"));
+        let ghcr = pull(
+            &[
+                "#4 [internal] load metadata for ghcr.io/acme/base:3",
+                "#4 ERROR: failed to authorize: failed to fetch anonymous token: unexpected status from GET request \
+                 to https://ghcr.io/token?scope=repository%3Aacme%2Fbase%3Apull&service=ghcr.io: 401 Unauthorized",
+                " > [internal] load metadata for ghcr.io/acme/base:3:",
+                "   1 | >>> FROM ghcr.io/acme/base:3",
+                "ERROR: failed to solve: failed to fetch anonymous token: unexpected status from GET request to \
+                 https://ghcr.io/token?scope=repository%3Aacme%2Fbase%3Apull&service=ghcr.io: 401 Unauthorized",
+            ],
+            &[],
+        );
+        assert!(ghcr.unwrap().message.starts_with("ghcr.io refused the anonymous pull of acme/base (401)"));
         // A base image that resolved is not taken for the failing one.
-        let ok_first = feed(&["#3 [internal] load metadata for docker.io/library/node:22", "#3 DONE 0.4s"]);
-        assert!(ok_first.image.is_none());
+        assert!(watch(&["#3 [internal] load metadata for docker.io/library/node:22", "#3 DONE 0.4s"]).image.is_none());
     }
 
     #[test]

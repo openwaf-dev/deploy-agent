@@ -347,7 +347,7 @@ The message structs are in `crates/deploy-proto/src/msg.rs`; the agent's session
 | `ping` / `pong` | control → agent / agent → control | `nonce` (u64) |
 | `command` | control → agent | `id`, `op` (section 7) |
 | `command_event` | agent → control | `id`, `event`: `{"type": "log", "stream": "stdout"\|"stderr"\|"system", "lines": […], "step": <step>}` (at most 200 lines of at most 16 KiB each; longer lines are cut; `step` is the step the command was in, omitted before the first one), `{"type": "step", "step": "fetching"\|"building"\|"pulling"\|"starting"\|"health_check"\|"switching"\|"cleaning", "commit": CommitInfo}` (`commit` only on the step that follows a Git fetch), `{"type": "sbom", "image_digest", "service", "part", "last", "data"}` (`sbom`, see below) or `{"type": "egress", "mode", "enforced", "entries", "truncated"}` (`build_egress`, see below) |
-| `command_result` | agent → control | `id`, `outcome`: `{"status": "ok", "output": <JSON>}`, `{"status": "error", "message": "…"}` or `{"status": "unsupported"}` |
+| `command_result` | agent → control | `id`, `outcome`: `{"status": "ok", "output": <JSON>}`, `{"status": "error", "message": "…", "cause": Cause}` (`cause` optional, below) or `{"status": "unsupported"}` |
 | `cancel` | control → agent | `id` |
 | `agent_update` | control → agent | an update offer (section 10) |
 | `update_status` | agent → control | `version`, `sha256`, `state` (section 10), `message` |
@@ -379,6 +379,14 @@ denied entries: `not_allowed`, `ip_literal`, `private_address`, `unresolved` or 
 connections first; `truncated` (omitted when false) says there were more. A control plane that does not know the
 event ignores it.
 
+A `Cause` says why an operation failed (`diagnostics`, section 9): `{"code", "params"}`, where `code` is
+`unclassified` or `family.name` (lowercase letters, digits and `_`) and `params` maps short names to short strings
+(omitted when empty). Agents send the codes listed in `deploy_proto::msg::cause`: the families `registry`, `image`,
+`git`, `build`, `disk`, `compose`, `container`, `health` and `runtime`, for example `git.ref_not_found`
+(`reference`), `container.oom_killed` or `health.no_answer` (`port`, `path`, `error`, `tries`). Registry credentials
+are removed from parameters as from the message. The message stays the human-readable error; a control plane that
+does not know `cause`, or a code, reads the message alone.
+
 ## 6. Labels and names
 
 Every container and image the agent creates carries these labels:
@@ -406,9 +414,9 @@ them in `crates/deploy-agent/src/main.rs` and `crates/deploy-agent/src/app.rs`).
 |---|---|---|---|
 | `docker_info` | — | `DockerInfo` | — |
 | `container_list` | `managed_only` | array of containers | — |
-| `deploy_app` | `AppDeploy` (below) | `DeployOutput`: `image`, `image_id`, `container_id`, `commit`, `known_hosts` | — |
+| `deploy_app` | `AppDeploy` (below) | `DeployOutput`: `image`, `image_id`, `container_id`, `commit`, `known_hosts`, `warning` (a `Cause`, `diagnostics`: `runtime.not_listening` with `port`, `path` and `error` when nothing answered `GET /` on the application's port after a deployment without a health check; omitted otherwise) | — |
 | `app_action` | `resource`, `action`: `start`\|`stop`\|`restart`\|`remove` | `AppState` | — |
-| `app_status` | `resource` | `AppState`: `containers[]` of `id`, `deployment`, `image`, `state`, `health`, `started_at` | — |
+| `app_status` | `resource`, `probes` (`diagnostics`; omitted when empty): `[{"service", "port", "network"}]` | `AppState`: `containers[]` of `id`, `deployment`, `image`, `state`, `health`, `started_at`, and with `diagnostics` `service`, `exit_code`, `oom_killed`, `restart_count`, `finished_at`; `probes[]` (`diagnostics`): `{"service", "port", "status", "error"}`, in the order asked: `status` is the HTTP status of any answer to `GET /` at the address the service's current container has on `network`, `error` one of `refused`, `timeout`, `no_address`, `other` when nothing answered | — |
 | `app_logs` | `resource`, `tail`, `follow`, `since` (Unix s or null), `service` | lines streamed as `log` events (while `follow`, until cancelled), then `{"lines": n}` | — |
 | `image_prune` | `resource`, `keep` (image tags to keep: rollback targets) | `{"removed": [images]}` | — |
 | `firewall_sync` | `allow` (CIDRs), `ports`, `deny` (CIDRs) | `{"applied": true, "backend", "ipv6", "ports", "router_ports", "denied", "egress_interfaces"}` | — |
@@ -426,6 +434,14 @@ Notes on specific operations:
   (`VOLUME`) without a mount at exactly that path gets a `system` log line: it is an anonymous volume, removed with
   the container when the next deployment replaces it (`deploy_compose` reports those of each service, and its mounts
   of type `volume` without a source).
+- **Health check timing** (from 0.4.0): one early probe 0.75 s after the start, whose miss is neither logged nor
+  counted, then `retries` tries, the first `interval_secs` after the start and each next one `interval_secs` after
+  the previous one (as earlier agents did). The container's exit is checked every second meanwhile and fails the
+  check at once.
+- **Init process** (from 0.4.0): the container of a `deploy_app` runs with the Engine's init (`--init`) as PID 1,
+  which forwards signals and reaps orphaned processes, such as those an `exec` leaves. An Engine without an init
+  binary (`docker info` reports its version as `N/A`) runs it without one, with a `system` log line. Compose
+  services keep their own `init`.
 - **`app_action`** with `remove` deletes the application's containers (with their anonymous volumes), images, router
   routes and file mounts. Named volumes stay (`volume_remove`).
 - **`volume_remove`** is refused while any container of the application exists. It also removes the application's
@@ -625,6 +641,7 @@ If a key is lost or leaked, a root user on the server can replace the pinned key
 | `build_egress` | builds only through the build egress proxy, `BuildSpec.egress`, `ComposeDeploy.egress`, `egress` events |
 | `registry_auth` | `ComposeDeploy.registry_auth`, `BuildSpec.registry_auth`, redaction of credentials from the operation's logs and errors (agent 0.3.0) |
 | `recreate` | `AppDeploy.strategy` `recreate` |
+| `diagnostics` | `Cause` on `command_result` errors, `DeployOutput.warning`, `app_status` `probes` and the container facts of `AppState` (agent 0.4.0) |
 
 ## 10. Self-update
 

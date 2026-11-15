@@ -29,7 +29,7 @@ use bollard::models::{
     ContainerCreateBody, EndpointSettings, HostConfig, NetworkConnectRequest, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{BuildImageOptionsBuilder, CreateContainerOptionsBuilder};
-use deploy_proto::msg::{BuildEgress, EgressMode, Event};
+use deploy_proto::msg::{BuildEgress, EgressDecision, EgressMode, Event};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
@@ -427,8 +427,9 @@ impl Session {
     }
 
     /// Ends the registration: sends what the proxy recorded (`Event::Egress`) and a summary line. Best effort: a
-    /// failure is a system line, never the deployment's error.
-    pub async fn finish(self, ev: &Events) {
+    /// failure is a system line, never the deployment's error. Returns the destinations the proxy denied (host,
+    /// port), most connections first, for the cause of a failed build ([`crate::builder::Failed::failure`]).
+    pub async fn finish(self, ev: &Events) -> Vec<(String, u16)> {
         let r =
             tokio::time::timeout(Duration::from_secs(30), call(&self.d, &Ctl::Finish { id: self.id.clone() })).await;
         // The watch ends with the registration; it is not waited for longer than that.
@@ -438,19 +439,25 @@ impl Session {
                 Some(Reply::Report(rep)) => rep,
                 other => {
                     ev.system(format!("Build egress: no report from the proxy ({other:?})")).await;
-                    return;
+                    return Vec::new();
                 }
             },
             Ok(Err(e)) => {
                 ev.system(format!("Build egress: no report from the proxy ({e})")).await;
-                return;
+                return Vec::new();
             }
             Err(_) => {
                 ev.system("Build egress: no report from the proxy (timed out)").await;
-                return;
+                return Vec::new();
             }
         };
         ev.system(summary(self.mode, &report)).await;
+        let denied = report
+            .entries
+            .iter()
+            .filter(|e| e.decision == EgressDecision::Denied)
+            .map(|e| (e.host.clone(), e.port))
+            .collect();
         ev.event(Event::Egress {
             mode: self.mode,
             enforced: self.enforced,
@@ -458,6 +465,7 @@ impl Session {
             truncated: report.truncated,
         })
         .await;
+        denied
     }
 }
 

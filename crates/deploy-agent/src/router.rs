@@ -278,8 +278,14 @@ pub fn normalize(routes: &[Route]) -> Result<Vec<Route>, String> {
 }
 
 /// Refuses a listener port or a preview host claimed by two resources, a port with both TLS and plain routes, a
-/// preview port that is also a listener, or a name served by two certificates.
-fn check_conflicts(s: &State) -> Result<(), String> {
+/// preview port that is also a listener, or a name served by two certificates: `router.conflict` with the reason.
+fn check_conflicts(s: &State) -> Result<(), crate::failure::Failure> {
+    conflict(s).map_err(|detail| {
+        crate::failure::Failure::new(deploy_proto::msg::cause::ROUTER_CONFLICT, [("detail", detail.clone())], detail)
+    })
+}
+
+fn conflict(s: &State) -> Result<(), String> {
     let mut owners: HashMap<(Option<u16>, bool, Option<&str>), &str> = HashMap::new();
     let mut kinds: HashMap<u16, bool> = HashMap::new();
     for (res, e) in &s.resources {
@@ -821,7 +827,7 @@ pub async fn switch(
     upstream: Upstream,
     routes: Vec<Route>,
     ev: Option<&Events>,
-) -> Result<(), String> {
+) -> Result<(), crate::failure::Failure> {
     let routes = normalize(&routes)?;
     let _g = LOCK.lock().await;
     let mut s = State::load()?;
@@ -844,7 +850,7 @@ pub async fn switch(
     } else {
         apply(d, &mut s, ev).await?;
     }
-    s.save()
+    Ok(s.save()?)
 }
 
 /// Drops a removed application's routes.
@@ -1038,7 +1044,7 @@ pub async fn sync(cfg: &RouterConfig) -> Result<RouterState, String> {
         }
         next.resources.insert(res, e);
     }
-    check_conflicts(&next)?;
+    check_conflicts(&next).map_err(|f| f.message)?;
     // The certificates go first, so a listener the reload opens serves them at once; a renewal is only this step.
     save_pems(&pems)?;
     match d.inspect_container(CONTAINER, None).await {
@@ -1112,22 +1118,29 @@ mod tests {
 
     #[test]
     fn conflicting_ports_and_preview_hosts_are_refused() {
+        // Every refusal is `router.conflict`, its reason the message and the `detail` parameter.
+        let refused = |s: &State| {
+            let f = check_conflicts(s).unwrap_err();
+            assert_eq!(f.code(), Some(deploy_proto::msg::cause::ROUTER_CONFLICT));
+            assert_eq!(f.param("detail"), Some(f.message.as_str()));
+            f.message
+        };
         let mut s = State::default();
         s.resources.insert("app_a".into(), entry(vec![route(Some(20001), &[], None, 80)], None));
         s.resources.insert("app_b".into(), entry(vec![route(Some(20002), &[], None, 80)], None));
         assert!(check_conflicts(&s).is_ok());
         s.resources.insert("app_c".into(), entry(vec![route(Some(20001), &["x.com"], None, 80)], None));
-        assert!(check_conflicts(&s).unwrap_err().contains("port 20001"));
+        assert!(refused(&s).contains("port 20001"));
         s.resources.remove("app_c");
         s.resources.insert("app_a-pr1".into(), entry(vec![route(None, &["pr-1.p.com"], None, 80)], None));
         s.resources.insert("app_a-pr2".into(), entry(vec![route(None, &["pr-1.p.com"], None, 80)], None));
-        assert!(check_conflicts(&s).unwrap_err().contains("preview host"));
+        assert!(refused(&s).contains("preview host"));
         s.resources.remove("app_a-pr2");
         s.preview_port = Some(20002);
-        assert!(check_conflicts(&s).unwrap_err().contains("preview port"));
+        assert!(refused(&s).contains("preview port"));
         s.preview_port = None;
         s.resources.insert("app_d".into(), entry(vec![tls_route(Some(20001), &[], 80)], None));
-        assert!(check_conflicts(&s).unwrap_err().contains("both TLS and plain"));
+        assert!(refused(&s).contains("both TLS and plain"));
         s.resources.remove("app_d");
         let cert = |name: &str, hosts: &[&str]| Cert {
             name: name.into(),
@@ -1139,7 +1152,7 @@ mod tests {
             client_ca: vec!["AA==".into()],
             certificates: vec![cert("a", &["x.com"]), cert("b", &["y.com", "x.com"])],
         });
-        assert!(check_conflicts(&s).unwrap_err().contains("two certificates"));
+        assert!(refused(&s).contains("two certificates"));
     }
 
     /// A new listener port never recreates a router whose ports the agent routes itself, including one created
