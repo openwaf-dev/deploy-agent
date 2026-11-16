@@ -8,7 +8,7 @@ use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::ContainerSummary;
-use deploy_proto::msg::{ExecOutput, ExecSpec, LogStream, MAX_EXEC_OUTPUT};
+use deploy_proto::msg::{ExecOutput, ExecSpec, LABEL_DEPLOYMENT, LogStream, MAX_EXEC_OUTPUT};
 use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -140,14 +140,18 @@ pub async fn pump(
 }
 
 /// Keeps the last `cap` bytes of a byte stream, on a character boundary when decoded.
-struct Tail {
+pub(crate) struct Tail {
     buf: Vec<u8>,
     cap: usize,
     dropped: bool,
 }
 
 impl Tail {
-    fn push(&mut self, chunk: &[u8]) {
+    pub(crate) fn new(cap: usize) -> Tail {
+        Tail { buf: Vec::new(), cap, dropped: false }
+    }
+
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
         if self.buf.len() > self.cap {
             let cut = self.buf.len() - self.cap;
@@ -156,27 +160,47 @@ impl Tail {
         }
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         // A cut may land inside a multi-byte character: skip its continuation bytes.
         let start = self.buf.iter().position(|b| (b & 0xC0) != 0x80).unwrap_or(self.buf.len());
         String::from_utf8_lossy(&self.buf[start..]).into_owned()
     }
+
+    /// Earlier bytes were dropped.
+    pub(crate) fn dropped(&self) -> bool {
+        self.dropped
+    }
 }
 
-/// The container a command runs in: the application's newest running container, or the newest running container
-/// of the Compose service. Only the application's own containers ([`app_containers`]): never another
-/// application's, the router, a helper or a container of someone else.
-async fn target(d: &Docker, resource: &str, service: Option<&str>) -> Result<String, String> {
-    choose(resource, &app_containers(d, resource).await?, service)
+/// The container a command runs in: the running container of `deployment` (the application's current one) when
+/// there is one, else the application's newest running container, or the newest running container of the Compose
+/// service. Only the application's own containers ([`app_containers`]): never another application's, the router, a
+/// helper or a container of someone else.
+async fn target(d: &Docker, resource: &str, service: Option<&str>, deployment: Option<&str>) -> Result<String, String> {
+    choose(resource, &app_containers(d, resource).await?, service, deployment)
 }
 
-/// [`target`] among `list` (newest first), each checked again to be one of `resource`'s containers.
-fn choose(resource: &str, list: &[ContainerSummary], service: Option<&str>) -> Result<String, String> {
-    let c = list.iter().filter(|c| is_running(c)).find(|c| match service {
-        Some(s) => c.labels.as_ref().and_then(|l| l.get(COMPOSE_SERVICE)).is_some_and(|v| v == s),
-        None => true,
-    });
-    let c = c.ok_or_else(|| match service {
+/// [`target`] among `list` (newest first), each checked again to be one of `resource`'s containers. A rolling
+/// deployment's candidate is the newest container until its health check passes; preferring `deployment` keeps a
+/// command out of a candidate that may still be removed.
+fn choose(
+    resource: &str,
+    list: &[ContainerSummary],
+    service: Option<&str>,
+    deployment: Option<&str>,
+) -> Result<String, String> {
+    let label = |c: &ContainerSummary, k: &str| c.labels.as_ref().and_then(|l| l.get(k)).cloned();
+    let candidates: Vec<&ContainerSummary> = list
+        .iter()
+        .filter(|c| is_running(c))
+        .filter(|c| match service {
+            Some(s) => label(c, COMPOSE_SERVICE).is_some_and(|v| v == s),
+            None => true,
+        })
+        .collect();
+    let current =
+        deployment.and_then(|dep| candidates.iter().find(|c| label(c, LABEL_DEPLOYMENT).as_deref() == Some(dep)));
+    let c = current.or(candidates.first()).ok_or_else(|| match service {
         Some(s) => format!("the service {s} has no running container"),
         None => "the application has no running container".to_string(),
     })?;
@@ -196,7 +220,7 @@ pub async fn exec(spec: &ExecSpec, ev: &Events, cancel: &CancellationToken) -> R
         return Err("invalid service name".into());
     }
     let d = client()?;
-    let container = target(&d, &spec.resource, spec.service.as_deref()).await?;
+    let container = target(&d, &spec.resource, spec.service.as_deref(), spec.deployment.as_deref()).await?;
     let mut r = start(&d, &container, spec.command.clone(), Vec::new(), None).await?;
     let deadline = tokio::time::sleep(Duration::from_secs(u64::from(spec.timeout_secs.max(1))));
     tokio::pin!(deadline);
@@ -283,18 +307,33 @@ mod tests {
     fn exec_enters_only_the_applications_containers() {
         use deploy_proto::msg::LABEL_RESOURCE;
         let own = container("c1", "owd-app_1-23456789", &[(LABEL_RESOURCE, "app_1")]);
-        assert_eq!(choose("app_1", std::slice::from_ref(&own), None).unwrap(), "c1");
+        assert_eq!(choose("app_1", std::slice::from_ref(&own), None, None).unwrap(), "c1");
         // Named in the command for another application: refused even though it runs.
-        assert!(choose("app_2", std::slice::from_ref(&own), None).is_err());
+        assert!(choose("app_2", std::slice::from_ref(&own), None, None).is_err());
         let forged = container("c2", "postgres", &[(LABEL_RESOURCE, "app_1")]);
-        let e = choose("app_1", &[forged, own.clone()], None).unwrap_err();
+        let e = choose("app_1", &[forged, own.clone()], None, None).unwrap_err();
         assert!(e.contains("postgres"), "{e}");
         let web = container(
             "c3",
             "owd-app_1-web-1",
             &[(LABEL_RESOURCE, "app_1"), (COMPOSE_SERVICE, "web"), (crate::docker::COMPOSE_PROJECT, "owd-app_1")],
         );
-        assert_eq!(choose("app_1", &[own.clone(), web.clone()], Some("web")).unwrap(), "c3");
-        assert!(choose("app_1", &[own, web], Some("db")).unwrap_err().contains("no running container"));
+        assert_eq!(choose("app_1", &[own.clone(), web.clone()], Some("web"), None).unwrap(), "c3");
+        assert!(choose("app_1", &[own, web], Some("db"), None).unwrap_err().contains("no running container"));
+    }
+
+    /// During a rolling deployment the candidate is the newest container: a command naming the current deployment
+    /// runs in that deployment's container instead, and in the newest one when it no longer runs.
+    #[test]
+    fn exec_prefers_the_current_deployments_container() {
+        use deploy_proto::msg::LABEL_RESOURCE;
+        let candidate = container("new", "owd-app_1-dep_2", &[(LABEL_RESOURCE, "app_1"), (LABEL_DEPLOYMENT, "dep_2")]);
+        let current = container("cur", "owd-app_1-dep_1", &[(LABEL_RESOURCE, "app_1"), (LABEL_DEPLOYMENT, "dep_1")]);
+        let both = [candidate.clone(), current.clone()];
+        assert_eq!(choose("app_1", &both, None, Some("dep_1")).unwrap(), "cur");
+        assert_eq!(choose("app_1", &both, None, None).unwrap(), "new");
+        let mut stopped = current;
+        stopped.state = Some(bollard::models::ContainerSummaryStateEnum::EXITED);
+        assert_eq!(choose("app_1", &[candidate, stopped], None, Some("dep_1")).unwrap(), "new");
     }
 }

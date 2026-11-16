@@ -65,6 +65,7 @@ mod project;
 mod proxy;
 mod relay;
 mod router;
+mod run;
 mod sbom;
 mod session;
 mod split;
@@ -216,8 +217,9 @@ async fn start(privileges: Privileges, fetcher: update::Fetcher) -> Result<Optio
             }
         }
     }
-    // After a reboot the firewall chains are gone; after a crash a Git helper may be left. Neither blocks the agent:
-    // the firewall watch below repairs the rules every 30 s and the control plane syncs them after deployments.
+    // After a reboot the firewall chains are gone; after a crash a Git helper or a one-off container may be left.
+    // Neither blocks the agent: the firewall watch below repairs the rules every 30 s and the control plane syncs them
+    // after deployments.
     if let Err(e) = firewall::reconcile().await {
         tracing::warn!("firewall: {e}");
     }
@@ -233,6 +235,11 @@ async fn start(privileges: Privileges, fetcher: update::Fetcher) -> Result<Optio
         Ok(0) => {}
         Ok(n) => tracing::info!("removed {n} leftover Git helper containers"),
         Err(e) => tracing::warn!("Git helpers: {e}"),
+    }
+    match run::remove_leftovers().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("removed {n} one-off containers of an earlier agent process"),
+        Err(e) => tracing::warn!("one-off containers: {e}"),
     }
     Agent::new(ring, up, fetched, privileges).map(Some)
 }
@@ -324,6 +331,7 @@ async fn execute(op: Op, ev: &Events, cancel: &CancellationToken) -> Outcome {
         }
         Op::DeployCompose(c) => return outcome(compose::deploy(&c, ev, cancel).await),
         Op::Exec(spec) => value(exec::exec(&spec, ev, cancel).await),
+        Op::RunOnce(spec) => value(run::run_once(&spec, ev, cancel).await),
         Op::DockerInfo => deploy::cancellable(cancel, async { value(docker::info().await) }).await,
         Op::ContainerList { managed_only } => deploy::cancellable(cancel, docker::containers(managed_only)).await,
         Op::AppAction { resource, action } => {

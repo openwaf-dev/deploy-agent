@@ -8,10 +8,12 @@ use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::models::ImageSummary;
 use bollard::query_parameters::{
-    ListImagesOptionsBuilder, LogsOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
+    EventsOptionsBuilder, ListImagesOptionsBuilder, LogsOptionsBuilder, RemoveImageOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
 use deploy_proto::msg::{
-    AppActionKind, AppState, ContainerState, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, PortProbe, PortProbeResult,
+    AppActionKind, AppState, ContainerState, LABEL_DEPLOYMENT, LABEL_RESOURCE, LogStream, OOM_EVENTS_WINDOW_SECS,
+    PortProbe, PortProbeResult,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -102,10 +104,55 @@ async fn inspect(d: &Docker, resource: &str) -> Result<(AppState, Vec<HashMap<St
             oom_killed: s.oom_killed,
             restart_count: i.restart_count,
             finished_at: time(s.finished_at),
+            oom_at: None,
             id,
         });
     }
+    if !containers.is_empty() {
+        let kills = oom_kills(d, resource).await;
+        for c in &mut containers {
+            c.oom_at = kills
+                .get(&c.id)
+                .and_then(|t| time::OffsetDateTime::from_unix_timestamp(*t).ok())
+                .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok());
+        }
+    }
     Ok((AppState { containers, probes: Vec::new() }, addresses))
+}
+
+/// How long the backlog of Docker's events is read for the out-of-memory kills.
+const OOM_EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// When each of the application's containers was last killed for its memory (Unix seconds), from Docker's `oom`
+/// events of the last [`OOM_EVENTS_WINDOW_SECS`]. Docker resets a container's `OOMKilled` when it restarts it, and
+/// keeps a bounded backlog of events: a kill older than that backlog is not reported. A failure reports none.
+async fn oom_kills(d: &Docker, resource: &str) -> HashMap<String, i64> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let label = format!("{LABEL_RESOURCE}={resource}");
+    let filters = HashMap::from([("type", vec!["container"]), ("event", vec!["oom"]), ("label", vec![label.as_str()])]);
+    let opts = EventsOptionsBuilder::default()
+        .since(&(now - OOM_EVENTS_WINDOW_SECS).to_string())
+        .until(&now.to_string())
+        .filters(&filters)
+        .build();
+    let mut out: HashMap<String, i64> = HashMap::new();
+    let mut events = d.events(Some(opts));
+    let read = async {
+        while let Some(e) = events.next().await {
+            let e = match e {
+                Ok(e) => e,
+                Err(e) => return tracing::info!("docker events: {}", message(&e)),
+            };
+            if let (Some(id), Some(t)) = (e.actor.and_then(|a| a.id), e.time) {
+                let at = out.entry(id).or_insert(t);
+                *at = (*at).max(t);
+            }
+        }
+    };
+    if tokio::time::timeout(OOM_EVENTS_TIMEOUT, read).await.is_err() {
+        tracing::info!("docker events: no end of the backlog in time");
+    }
+    out
 }
 
 pub async fn action(resource: &str, action: AppActionKind) -> Result<AppState, String> {
@@ -153,6 +200,7 @@ pub async fn action(resource: &str, action: AppActionKind) -> Result<AppState, S
             // Checked before anything goes: a network that is not the project's refuses the whole removal.
             let networks = compose_networks(&d, resource).await?;
             crate::router::forget(resource).await?;
+            crate::run::remove_all(&d, resource).await?;
             for c in &list {
                 remove_container(&d, c.id.as_deref().unwrap_or_default()).await?;
             }

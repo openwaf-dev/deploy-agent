@@ -346,7 +346,7 @@ The message structs are in `crates/deploy-proto/src/msg.rs`; the agent's session
 | `heartbeat` | agent → control | `uptime_secs`, `load1`, `mem_total_bytes`, `mem_available_bytes`, `disk_total_bytes`, `disk_avail_bytes`, `containers_running` |
 | `ping` / `pong` | control → agent / agent → control | `nonce` (u64) |
 | `command` | control → agent | `id`, `op` (section 7) |
-| `command_event` | agent → control | `id`, `event`: `{"type": "log", "stream": "stdout"\|"stderr"\|"system", "lines": […], "step": <step>}` (at most 200 lines of at most 16 KiB each; longer lines are cut; `step` is the step the command was in, omitted before the first one), `{"type": "step", "step": "fetching"\|"building"\|"pulling"\|"starting"\|"health_check"\|"switching"\|"cleaning", "commit": CommitInfo}` (`commit` only on the step that follows a Git fetch), `{"type": "sbom", "image_digest", "service", "part", "last", "data"}` (`sbom`, see below) or `{"type": "egress", "mode", "enforced", "entries", "truncated"}` (`build_egress`, see below) |
+| `command_event` | agent → control | `id`, `event`: `{"type": "log", "stream": "stdout"\|"stderr"\|"system", "lines": […], "step": <step>}` (at most 200 lines of at most 16 KiB each; longer lines are cut; `step` is the step the command was in, omitted before the first one), `{"type": "step", "step": "fetching"\|"building"\|"pulling"\|"releasing"\|"starting"\|"health_check"\|"switching"\|"cleaning", "commit": CommitInfo}` (`commit` only on the step that follows a Git fetch; `releasing` only with `AppDeploy.release`), `{"type": "sbom", "image_digest", "service", "part", "last", "data"}` (`sbom`, see below) or `{"type": "egress", "mode", "enforced", "entries", "truncated"}` (`build_egress`, see below) |
 | `command_result` | agent → control | `id`, `outcome`: `{"status": "ok", "output": <JSON>}`, `{"status": "error", "message": "…", "cause": Cause}` (`cause` optional, below) or `{"status": "unsupported"}` |
 | `cancel` | control → agent | `id` |
 | `agent_update` | control → agent | an update offer (section 10) |
@@ -382,7 +382,7 @@ event ignores it.
 A `Cause` says why an operation failed (`diagnostics`, section 9): `{"code", "params"}`, where `code` is
 `unclassified` or `family.name` (lowercase letters, digits and `_`) and `params` maps short names to short strings
 (omitted when empty). Agents send the codes listed in `deploy_proto::msg::cause`: the families `registry`, `image`,
-`git`, `build`, `disk`, `compose`, `container`, `health` and `runtime`, for example `git.ref_not_found`
+`git`, `build`, `disk`, `compose`, `container`, `health`, `runtime` and `release`, for example `git.ref_not_found`
 (`reference`), `container.oom_killed` or `health.no_answer` (`port`, `path`, `error`, `tries`). Registry credentials
 are removed from parameters as from the message. The message stays the human-readable error; a control plane that
 does not know `cause`, or a code, reads the message alone.
@@ -394,6 +394,11 @@ Every container and image the agent creates carries these labels:
 - `dev.openwaf.deploy.resource`: the application id;
 - `dev.openwaf.deploy.deployment`: the deployment id;
 - `dev.openwaf.deploy.environment`: the environment id (application containers).
+
+One-off containers (`run_once`, release commands) carry `dev.openwaf.deploy.run` (the application id) and
+`dev.openwaf.deploy.run.id` (the run id, or the deployment id for a release command) instead of the resource and
+deployment labels, and are named `owd-run-<resource lowercased>-<id lowercased>`: no operation on the application's
+containers ever picks one.
 
 The agent's own objects carry these labels or the `owd-` name prefix: its Docker networks, the `owd-router` container,
 its builders and helpers, and its iptables chains (`OWDEPLOY*`).
@@ -416,13 +421,14 @@ them in `crates/deploy-agent/src/main.rs` and `crates/deploy-agent/src/app.rs`).
 | `container_list` | `managed_only` | array of containers | — |
 | `deploy_app` | `AppDeploy` (below) | `DeployOutput`: `image`, `image_id`, `container_id`, `commit`, `known_hosts`, `warning` (a `Cause`, `diagnostics`: `runtime.not_listening` with `port`, `path` and `error` when nothing answered `GET /` on the application's port after a deployment without a health check; omitted otherwise) | — |
 | `app_action` | `resource`, `action`: `start`\|`stop`\|`restart`\|`remove` | `AppState` | — |
-| `app_status` | `resource`, `probes` (`diagnostics`; omitted when empty): `[{"service", "port", "network"}]` | `AppState`: `containers[]` of `id`, `deployment`, `image`, `state`, `health`, `started_at`, and with `diagnostics` `service`, `exit_code`, `oom_killed`, `restart_count`, `finished_at`; `probes[]` (`diagnostics`): `{"service", "port", "status", "error"}`, in the order asked: `status` is the HTTP status of any answer to `GET /` at the address the service's current container has on `network`, `error` one of `refused`, `timeout`, `no_address`, `other` when nothing answered | — |
+| `app_status` | `resource`, `probes` (`diagnostics`; omitted when empty): `[{"service", "port", "network"}]` | `AppState`: `containers[]` of `id`, `deployment`, `image`, `state`, `health`, `started_at`, and with `diagnostics` `service`, `exit_code`, `oom_killed`, `restart_count`, `finished_at`, and with `oom_events` `oom_at` (the last out-of-memory kill of the container in the last 15 minutes, from Docker's `oom` events; Docker clears `oom_killed` when it restarts a container); `probes[]` (`diagnostics`): `{"service", "port", "status", "error"}`, in the order asked: `status` is the HTTP status of any answer to `GET /` at the address the service's current container has on `network`, `error` one of `refused`, `timeout`, `no_address`, `other` when nothing answered | — |
 | `app_logs` | `resource`, `tail`, `follow`, `since` (Unix s or null), `service` | lines streamed as `log` events (while `follow`, until cancelled), then `{"lines": n}` | — |
 | `image_prune` | `resource`, `keep` (image tags to keep: rollback targets) | `{"removed": [images]}` | — |
-| `firewall_sync` | `allow` (CIDRs), `ports`, `deny` (CIDRs) | `{"applied": true, "backend", "ipv6", "ports", "router_ports", "denied", "egress_interfaces"}` | — |
+| `firewall_sync` | `allow` (CIDRs), `ports`, `deny` (CIDRs), `deny_except` (`[{"cidr", "port"}]`, `deny_exceptions`) | `{"applied": true, "backend", "ipv6", "ports", "router_ports", "denied", "denied_except", "egress_interfaces"}` | — |
 | `router_sync` | `RouterConfig` (below) | `RouterState`: `listeners`, `active`, `pending`, `tls_listeners`, `certificates` | `router` |
 | `deploy_compose` | `ComposeDeploy` (below) | `ComposeOutput`: `project`, `services[]` (`service`, `container_id`, `image`, `state`), `commit`, `known_hosts` | `compose` |
-| `exec` | `resource`, `service`, `command` (argv), `timeout_secs` | `ExecOutput`: `container_id`, `exit_code`, `timed_out`, `output` (last 64 KiB), `truncated` | `exec` |
+| `exec` | `resource`, `service`, `command` (argv), `timeout_secs`, `deployment` (`exec_deployment`; omitted when null) | `ExecOutput`: `container_id`, `exit_code`, `timed_out`, `output` (last 64 KiB), `truncated` | `exec` |
+| `run_once` | `resource`, `run`, `image` (`owd/<resource>:<tag>`, on the server), `network`, `command` (argv), `env`, `volumes`, `files`, `memory_bytes`, `cpus`, `labels`, `timeout_secs` (1-86400) | `ExecOutput` (as `exec`; `container_id` of the removed container) | `run_once` |
 | `volume_remove` | `resource`, `names` (null: all) | `{"removed": [names]}` | `volumes` |
 
 Notes on specific operations:
@@ -441,15 +447,33 @@ Notes on specific operations:
 - **Init process** (from 0.4.0): the container of a `deploy_app` runs with the Engine's init (`--init`) as PID 1,
   which forwards signals and reaps orphaned processes, such as those an `exec` leaves. An Engine without an init
   binary (`docker info` reports its version as `N/A`) runs it without one, with a `system` log line. Compose
-  services keep their own `init`.
+  services keep their own `init`. With `RunSpec.no_init` (`no_init`) the container runs without init, also with a
+  `system` log line: for images whose own process must be PID 1.
+- **`exec`** runs in the application's newest running container (or the Compose service's). With `deployment`
+  (`exec_deployment`), the running container of that deployment is preferred: the control plane names the
+  application's current deployment, so a command never runs in the candidate of a rolling deployment that is still
+  being checked and may be removed. When that container does not run, the newest running one is used.
+- **Release command** (`run_once`, from 0.5.0): with `AppDeploy.release`, after the image is ready and before the new
+  container is created (with `recreate`, before the previous one stops), a `releasing` step runs `release.command` in
+  a one-off container of the new image, with `run.env` (and `PORT`), `run.files`, `run.memory_bytes`, `run.cpus` and
+  the network, but no volume. Its output is the step's log. An exit code other than 0 or `release.timeout_secs` fails
+  the deployment with the cause `release.failed` (`exit_code` or `timeout`) and nothing else changes; a cancel kills
+  it.
+- **`run_once`** runs `command` once in a new container of `image` with the environment, files and the named volumes
+  given (none by default), Docker's init as PID 1, on `network` under its own name only (no alias), then removes it
+  (and its files) whatever happened; a cancel kills it, `timeout_secs` kills it with `timed_out`. Output lines stream
+  as `log` events. A volume must exist and be the application's. At start, the agent removes every one-off container
+  an earlier process left.
 - **`app_action`** with `remove` deletes the application's containers (with their anonymous volumes), images, router
-  routes and file mounts. Named volumes stay (`volume_remove`).
+  routes and file mounts, and its one-off containers. Named volumes stay (`volume_remove`).
 - **`volume_remove`** is refused while any container of the application exists. It also removes the application's
   file mounts.
 - **`firewall_sync`** replaces the agent's rules. Published ports become reachable only from `allow`, which is the
   OpenWAF edge. Containers are refused `deny`, on top of the ranges the agent always refuses (`firewall.rs`: "this
   network", RFC 1918, CGNAT, loopback, link-local including cloud metadata, IETF assignments, benchmarking, multicast,
-  reserved, and their NAT64 forms).
+  reserved, and their NAT64 forms). Each `deny_except` entry (feature `deny_exceptions`, agent 0.5.0) lets the
+  containers reach one TCP port of a `deny` destination again; it must lie inside a `deny` CIDR of its family and
+  outside the ranges always refused, else the whole operation is refused and the previous rules stay.
 - **`router_sync`** replaces the whole configuration of the per-server router (Caddy). A resource that is not listed
   loses its routes and listeners. This operation is never abandoned halfway.
 
@@ -461,10 +485,11 @@ Notes on specific operations:
 | `network`, `alias` | the environment's Docker network (created if missing) and the container's alias on it |
 | `source` | `{"kind": "git", "url", "reference", "auth", "ssh", "commit"}`, `{"kind": "image", "image", "auth"}` or `{"kind": "local", "image"}` |
 | `build` | `BuildSpec` (Git sources): `context`, `dockerfile`, `args`, `target`, `no_cache`, `pack` (`dockerfile`\|`railpack`\|`static`), `install_command`, `build_command`, `start_command`, `publish_dir`, `spa`, `untrusted`, `egress` (`build_egress`), `registry_auth` (`registry_auth`) |
-| `run` | `RunSpec`: `image_tag`, `env`, `port`, `publish`, `health` (`path`, `interval_secs`, `timeout_secs`, `retries`), `command`, `memory_bytes`, `cpus`, `labels`, `volumes` (`name`, `path`, `service`), `files` (`path`, `content`, `service`) |
+| `run` | `RunSpec`: `image_tag`, `env`, `port`, `publish`, `health` (`path`, `interval_secs`, `timeout_secs`, `retries`), `command`, `memory_bytes`, `cpus`, `labels`, `volumes` (`name`, `path`, `service`), `files` (`path`, `content`, `service`), `no_init` (`no_init`; omitted when false) |
 | `routes` | router routes applied when the new container takes over (null: one route on `run.publish`) |
 | `drain_secs` | seconds the previous container keeps serving requests in flight (default 10) |
 | `strategy` | `rolling` (absent: the new container starts next to the running one, the router switches once it is healthy, then the previous one drains and stops) or `recreate` (the running container stops before the new one starts, so two never use the volumes at once; if the new one fails, the previous one is started again) (`recreate`) |
+| `release` | `{"command": [argv], "timeout_secs"}`: the release command (absent: none) (`run_once`) |
 
 Notes on `AppDeploy` fields:
 
@@ -642,6 +667,11 @@ If a key is lost or leaked, a root user on the server can replace the pinned key
 | `registry_auth` | `ComposeDeploy.registry_auth`, `BuildSpec.registry_auth`, redaction of credentials from the operation's logs and errors (agent 0.3.0) |
 | `recreate` | `AppDeploy.strategy` `recreate` |
 | `diagnostics` | `Cause` on `command_result` errors, `DeployOutput.warning`, `app_status` `probes` and the container facts of `AppState` (agent 0.4.0) |
+| `deny_exceptions` | `firewall_sync` `deny_except`: TCP ports of denied destinations left reachable (agent 0.5.0) |
+| `no_init` | `RunSpec.no_init` (agent 0.5.0) |
+| `exec_deployment` | `ExecSpec.deployment` (agent 0.5.0) |
+| `oom_events` | `oom_at` in the containers of `AppState` (agent 0.5.0) |
+| `run_once` | `run_once`, `AppDeploy.release` and the `releasing` step (agent 0.5.0) |
 
 ## 10. Self-update
 

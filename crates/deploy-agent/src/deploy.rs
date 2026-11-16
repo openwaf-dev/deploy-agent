@@ -271,6 +271,15 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
 
     let env_label = d.run.labels.get(LABEL_ENVIRONMENT).map(String::as_str);
     ensure_network(&docker, &d.network, env_label).await?;
+    // The release command runs before anything of the application changes: its failure leaves the previous container
+    // serving (and, with `recreate`, running), and the new one is never created.
+    if let Some(r) = &d.release {
+        ev.step(Step::Releasing).await;
+        crate::run::release(&docker, d, r, ev, cancel).await?;
+        if cancel.is_cancelled() {
+            return Err(CANCELLED.into());
+        }
+    }
     volumes::ensure(&docker, &d.resource, &d.run.volumes).await?;
     let name = container_name(&d.resource, &d.deployment);
     let existing = app_containers(&docker, &d.resource).await?;
@@ -287,8 +296,10 @@ async fn deploy(d: &AppDeploy, ev: &Events, cancel: &CancellationToken) -> Resul
     let slot = serving.map_or(Slot::A, Slot::other);
 
     ev.step(Step::Starting).await;
-    let init = engine_has_init(&docker).await;
-    if !init {
+    let init = !d.run.no_init && engine_has_init(&docker).await;
+    if d.run.no_init {
+        ev.system("The container runs without an init process (the application's init setting is off)").await;
+    } else if !init {
         ev.system("This server's Docker has no init binary (docker-init): the container runs without an init process")
             .await;
     }
@@ -605,7 +616,7 @@ pub async fn ensure_network(d: &Docker, network: &str, environment: Option<&str>
 /// Whether the Engine can run containers with its init process (`--init`): it reports the init binary's version,
 /// or `N/A` when it has none (some distribution packages ship it apart). Asked once per agent process; a failed
 /// question is asked again next time.
-async fn engine_has_init(d: &Docker) -> bool {
+pub(crate) async fn engine_has_init(d: &Docker) -> bool {
     static HAS_INIT: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
     let ask = || async {
         let info = d.info().await.map_err(|e| message(&e))?;
@@ -1053,10 +1064,12 @@ mod tests {
                 labels: Default::default(),
                 volumes: vec![],
                 files: vec![],
+                no_init: false,
             },
             routes: None,
             drain_secs: None,
             strategy: None,
+            release: None,
         }
     }
 
