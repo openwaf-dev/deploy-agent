@@ -107,10 +107,18 @@ pub async fn ensure(d: &Docker, resource: &str, volumes: &[VolumeMount]) -> Resu
 
 /// Directory of an application's file mounts.
 fn files_root(resource: &str) -> Result<PathBuf, String> {
+    Ok(state_root()?.join("files").join(resource.to_ascii_lowercase()))
+}
+
+/// Directory of the file mounts of one-off containers (`run`): kept apart, so no deployment prunes them.
+fn run_files_root() -> Result<PathBuf, String> {
+    Ok(state_root()?.join("run-files"))
+}
+
+fn state_root() -> Result<PathBuf, String> {
     let state = crate::state_dir();
     // Bind mounts need an absolute host path.
-    let state = std::path::absolute(&state).map_err(|e| format!("{}: {e}", state.display()))?;
-    Ok(state.join("files").join(resource.to_ascii_lowercase()))
+    std::path::absolute(&state).map_err(|e| format!("{}: {e}", state.display()))
 }
 
 fn private_dir(p: &std::path::Path) -> Result<(), String> {
@@ -127,14 +135,43 @@ pub fn write_files<'a>(
     deployment: &str,
     files: &'a [FileMount],
 ) -> Result<Vec<(PathBuf, &'a FileMount)>, String> {
+    write_into(&files_root(resource)?, deployment, files)
+}
+
+/// Writes the files of the one-off container `id` of `resource` (removed by [`remove_run_files`]).
+pub fn write_run_files<'a>(
+    resource: &str,
+    id: &str,
+    files: &'a [FileMount],
+) -> Result<Vec<(PathBuf, &'a FileMount)>, String> {
+    write_into(&run_files_root()?.join(resource.to_ascii_lowercase()), id, files)
+}
+
+pub fn remove_run_files(resource: &str, id: &str) {
+    if let Ok(root) = run_files_root() {
+        let _ = std::fs::remove_dir_all(root.join(resource.to_ascii_lowercase()).join(id.to_ascii_lowercase()));
+    }
+}
+
+/// Every one-off container's files (at start, none of them runs: [`crate::run::remove_leftovers`]).
+pub fn remove_all_run_files() {
+    if let Ok(root) = run_files_root() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+fn write_into<'a>(
+    root: &std::path::Path,
+    sub: &str,
+    files: &'a [FileMount],
+) -> Result<Vec<(PathBuf, &'a FileMount)>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let root = files_root(resource)?;
-    let dir = root.join(deployment.to_ascii_lowercase());
+    let dir = root.join(sub.to_ascii_lowercase());
     // 0700 directories keep the content from other users of the server. The files themselves are 0644: a bind
     // mount exposes the file's own mode in the container, whose process may run as any user.
-    private_dir(&root)?;
+    private_dir(root)?;
     let _ = std::fs::remove_dir_all(&dir);
     private_dir(&dir)?;
     let mut out = Vec::with_capacity(files.len());
@@ -164,11 +201,15 @@ pub fn prune_files(resource: &str, keep: Option<&str>) {
     }
 }
 
-/// Removes every file mount of an application (it has no container left: `AppAction` remove, `VolumeRemove`). File
-/// contents may be secret: they do not outlive the application on the server.
+/// Removes every file mount of an application, its one-off containers' included (it has no container left:
+/// `AppAction` remove, `VolumeRemove`). File contents may be secret: they do not outlive the application on the
+/// server.
 pub fn remove_files(resource: &str) {
     if let Ok(root) = files_root(resource) {
         let _ = std::fs::remove_dir_all(root);
+    }
+    if let Ok(root) = run_files_root() {
+        let _ = std::fs::remove_dir_all(root.join(resource.to_ascii_lowercase()));
     }
 }
 

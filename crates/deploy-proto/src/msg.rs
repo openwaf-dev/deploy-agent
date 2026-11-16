@@ -100,7 +100,17 @@ pub mod feature {
     /// deployment without a health check), the optional container facts of [`super::ContainerState`] and the port
     /// probes of `AppStatus` (PROTOCOL.md §9).
     pub const DIAGNOSTICS: &str = "diagnostics";
-    pub const ALL: [&str; 16] = [
+    /// `FirewallRules::deny_except`: TCP ports of protected destinations the containers may still reach.
+    pub const DENY_EXCEPTIONS: &str = "deny_exceptions";
+    /// `RunSpec::no_init`: the container runs without Docker's init process.
+    pub const NO_INIT: &str = "no_init";
+    /// `ExecSpec::deployment`: the command runs in that deployment's container when it runs.
+    pub const EXEC_DEPLOYMENT: &str = "exec_deployment";
+    /// `ContainerState::oom_at`: out-of-memory kills from Docker's events.
+    pub const OOM_EVENTS: &str = "oom_events";
+    /// One-off containers: `AppDeploy::release` (the `releasing` step), `Op::RunOnce` and [`super::Step::Releasing`].
+    pub const RUN_ONCE: &str = "run_once";
+    pub const ALL: [&str; 21] = [
         ROUTER,
         BUILD_PACKS,
         COMPOSE,
@@ -117,6 +127,11 @@ pub mod feature {
         REGISTRY_AUTH,
         RECREATE,
         DIAGNOSTICS,
+        DENY_EXCEPTIONS,
+        NO_INIT,
+        EXEC_DEPLOYMENT,
+        OOM_EVENTS,
+        RUN_ONCE,
     ];
 }
 kind!(Hello, "hello");
@@ -323,6 +338,12 @@ pub enum Op {
     /// tasks). Output lines are streamed as `CommandEvent::Log`; result: [`ExecOutput`]. Cancellable (the command is
     /// killed).
     Exec(ExecSpec),
+    /// Runs a command once in a new container of an application's image, with its environment and network (a
+    /// manual run, or a scheduled task in its own container), then removes the container. The container is never one
+    /// of the application's ([`LABEL_RUN`], not [`LABEL_RESOURCE`]): it takes no traffic and no deployment, status or
+    /// exec counts it. Output lines are streamed as `CommandEvent::Log`; result: [`ExecOutput`]. Cancellable (the
+    /// container is killed). Only to agents with [`feature::RUN_ONCE`].
+    RunOnce(RunOnceSpec),
     /// Removes the named volumes of an application (all of them when `names` is None) and, with them all, its file
     /// mounts. Output: `{"removed": [volume names]}`. Refused while a container of the application exists.
     VolumeRemove {
@@ -360,6 +381,20 @@ pub struct AppDeploy {
     /// [`feature::RECREATE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<UpdateStrategy>,
+    /// The release command: run once in a new container of the new image before the new container starts (and,
+    /// with `recreate`, before the previous one stops), in the `releasing` step. A failure fails the deployment
+    /// (`release.failed`) with nothing else changed. Sent only to agents with [`feature::RUN_ONCE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
+}
+
+/// A deployment's release command ([`AppDeploy::release`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    /// Arguments after the image's entrypoint, as `RunSpec::command` (no shell unless it names one).
+    pub command: Vec<String>,
+    /// The container is killed after this long, and the deployment fails.
+    pub timeout_secs: u32,
 }
 
 pub const DEFAULT_DRAIN_SECS: u32 = 10;
@@ -659,6 +694,10 @@ pub struct RunSpec {
     /// Files written by the agent under its state directory and mounted read-only.
     #[serde(default)]
     pub files: Vec<FileMount>,
+    /// The container runs without Docker's init process as PID 1 (an image whose own process must be PID 1). Sent
+    /// only to agents with [`feature::NO_INIT`]; off: the agent runs it under init when the Engine has one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_init: bool,
 }
 
 /// A named volume `owd-<resource lowercased>-<name>` mounted at `path`.
@@ -773,6 +812,8 @@ pub mod cause {
     pub const ROUTER_CONFLICT: &str = "router.conflict";
     /// A warning only (`DeployOutput::warning`): nothing answered on the application's port.
     pub const RUNTIME_NOT_LISTENING: &str = "runtime.not_listening";
+    /// The release command exited with another code than 0 (`exit_code`) or ran out of time (`timeout`, seconds).
+    pub const RELEASE_FAILED: &str = "release.failed";
 
     pub const AGENT_CODES: &[&str] = &[
         REGISTRY_ANONYMOUS_REFUSED,
@@ -814,6 +855,7 @@ pub mod cause {
         HEALTH_BAD_STATUS,
         ROUTER_CONFLICT,
         RUNTIME_NOT_LISTENING,
+        RELEASE_FAILED,
     ];
 }
 
@@ -994,8 +1036,57 @@ pub struct ExecSpec {
     #[serde(default)]
     pub service: Option<String>,
     pub command: Vec<String>,
+    /// The application's current deployment: its running container is preferred over a newer one (the candidate of
+    /// a deployment still being checked). Sent only to agents with [`feature::EXEC_DEPLOYMENT`]; None or not
+    /// running: the newest running container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<String>,
     /// The command is killed after this long (and reported `timed_out`).
     pub timeout_secs: u32,
+}
+
+/// A command run once in a new container of an application's image ([`Op::RunOnce`]).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunOnceSpec {
+    /// The application: the value of [`LABEL_RUN`] on the container.
+    pub resource: String,
+    /// The run's id: the value of [`LABEL_RUN_ID`], and the end of the container's name.
+    pub run: String,
+    /// One of the application's images (`owd/<resource>:<deployment>`), already on the server.
+    pub image: String,
+    /// The environment's network; the container joins it under its own name only (no alias of the application).
+    pub network: String,
+    /// Arguments after the image's entrypoint (no shell unless it names one).
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// Named volumes of the application to mount (none by default: the application uses them at the same time).
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
+    #[serde(default)]
+    pub files: Vec<FileMount>,
+    pub memory_bytes: Option<u64>,
+    pub cpus: Option<f64>,
+    /// Extra labels (the environment's).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// The container is killed after this long (and reported `timed_out`).
+    pub timeout_secs: u32,
+}
+
+impl std::fmt::Debug for RunOnceSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOnceSpec")
+            .field("resource", &self.resource)
+            .field("run", &self.run)
+            .field("image", &self.image)
+            .field("network", &self.network)
+            .field("command", &self.command)
+            .field("env", &format_args!("<{} variables>", self.env.len()))
+            .field("volumes", &self.volumes)
+            .field("files", &self.files)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Output of `Exec`.
@@ -1072,7 +1163,15 @@ pub struct ContainerState {
     pub restart_count: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// When the kernel last killed a process of this container for its memory limit (RFC 3339), from Docker's
+    /// `oom` events of the last [`OOM_EVENTS_WINDOW_SECS`] (agents with [`feature::OOM_EVENTS`]). Docker clears
+    /// `oom_killed` when it restarts the container, so this is what still tells an out-of-memory kill afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_at: Option<String>,
 }
+
+/// How far back `AppStatus` looks for the out-of-memory kills of [`ContainerState::oom_at`].
+pub const OOM_EVENTS_WINDOW_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FirewallRules {
@@ -1084,6 +1183,18 @@ pub struct FirewallRules {
     /// the private, link-local (cloud metadata) and special ranges the agent always refuses. Older agents ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// TCP ports of `deny` destinations the containers may still reach (a mail server's 587 on a protected host).
+    /// Each lies inside a `deny` CIDR and outside the ranges the agent always refuses, else the rules are refused.
+    /// Sent only to agents with [`feature::DENY_EXCEPTIONS`]; older agents ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_except: Vec<PortException>,
+}
+
+/// A destination (a CIDR, usually one address) and TCP port excepted from [`FirewallRules::deny`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortException {
+    pub cidr: String,
+    pub port: u16,
 }
 
 /// Progress of a running command (agent → control), sent before its `CommandResult`.
@@ -1204,6 +1315,8 @@ pub enum Step {
     Fetching,
     Building,
     Pulling,
+    /// The release command runs ([`AppDeploy::release`]).
+    Releasing,
     Starting,
     HealthCheck,
     Switching,
@@ -1250,6 +1363,11 @@ pub const LABEL_RESOURCE: &str = "dev.openwaf.deploy.resource";
 pub const LABEL_DEPLOYMENT: &str = "dev.openwaf.deploy.deployment";
 /// Label with the environment id of a container.
 pub const LABEL_ENVIRONMENT: &str = "dev.openwaf.deploy.environment";
+/// Label on one-off containers ([`Op::RunOnce`], release commands) with the application they run for. Kept apart from
+/// [`LABEL_RESOURCE`] so they never count as the application's containers.
+pub const LABEL_RUN: &str = "dev.openwaf.deploy.run";
+/// Label with the run (or, for a release command, the deployment) of a one-off container.
+pub const LABEL_RUN_ID: &str = "dev.openwaf.deploy.run.id";
 
 #[cfg(test)]
 mod tests {
@@ -1324,6 +1442,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 volumes: vec![VolumeMount { name: "data".into(), path: "/data".into(), service: None }],
                 files: vec![FileMount { path: "/etc/app.conf".into(), content: "secret-file".into(), service: None }],
+                no_init: false,
             },
             routes: Some(vec![Route {
                 listen: None,
@@ -1334,6 +1453,7 @@ mod tests {
             }]),
             drain_secs: Some(5),
             strategy: Some(UpdateStrategy::Recreate),
+            release: Some(Release { command: vec!["npx".into(), "prisma".into()], timeout_secs: 300 }),
         });
         let v = serde_json::to_value(&op).unwrap();
         assert_eq!(v["op"], "deploy_app");
@@ -1343,9 +1463,34 @@ mod tests {
         assert_eq!(v["build"]["untrusted"], true);
         assert_eq!(v["source"]["commit"], "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(v["strategy"], "recreate");
+        assert_eq!(v["release"]["command"][1], "prisma");
         assert_eq!(serde_json::from_value::<Op>(v).unwrap(), op);
         let debug = format!("{op:?}");
         assert!(!debug.contains("secret"), "credentials must not reach logs through Debug: {debug}");
+    }
+
+    /// A one-off run carries the application's variables: its `Debug` (logs) never shows their values.
+    #[test]
+    fn run_once_round_trips_without_leaking_its_environment() {
+        let op = Op::RunOnce(RunOnceSpec {
+            resource: "app_01".into(),
+            run: "run_01".into(),
+            image: "owd/app_01:dep_01".into(),
+            network: "owd-env".into(),
+            command: vec!["sh".into(), "-c".into(), "env".into()],
+            env: BTreeMap::from([("DATABASE_URL".into(), "postgres://u:secret@db/x".into())]),
+            volumes: vec![],
+            files: vec![FileMount { path: "/etc/app.conf".into(), content: "secret-file".into(), service: None }],
+            memory_bytes: None,
+            cpus: None,
+            labels: BTreeMap::new(),
+            timeout_secs: 60,
+        });
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!((v["op"].as_str(), v["run"].as_str()), (Some("run_once"), Some("run_01")));
+        assert_eq!(serde_json::from_value::<Op>(v).unwrap(), op);
+        let debug = format!("{op:?}");
+        assert!(!debug.contains("secret"), "{debug}");
     }
 
     /// `registry_auth` is new in agent 0.3.0: an older control plane's `ComposeDeploy` without it reads as an empty
@@ -1382,7 +1527,7 @@ mod tests {
         let Op::DeployApp(d) = serde_json::from_value::<Op>(v).unwrap() else { panic!("not a deployment") };
         assert_eq!(d.build.unwrap().pack, BuildPack::Dockerfile);
         assert!(matches!(d.source, Source::Git { ssh: None, .. }));
-        assert_eq!((d.routes, d.drain_secs, d.strategy), (None, None, None));
+        assert_eq!((d.routes, d.drain_secs, d.strategy, d.release), (None, None, None, None));
         assert!(d.run.volumes.is_empty() && d.run.files.is_empty());
         let logs: Op = serde_json::from_value(serde_json::json!({
             "op": "app_logs", "resource": "app_01", "tail": 10, "follow": false, "since": null

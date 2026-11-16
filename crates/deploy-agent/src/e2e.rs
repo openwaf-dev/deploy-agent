@@ -63,8 +63,8 @@ use std::time::Duration;
 use deploy_proto::msg::{
     AppActionKind, AppDeploy, AppState, BuildEgress, BuildPack, BuildSpec, ComposeDeploy, ComposeOutput, ComposeSource,
     DeployOutput, EgressDecision, EgressMode, Event, ExecOutput, ExecSpec, FileMount, FirewallRules, HealthCheck,
-    LABEL_ENVIRONMENT, LogStream, Op, Outcome, PortProbe, RegistryAuth, ResourceRoutes, Route, RouterConfig,
-    RouterState, RunSpec, Source, SshAuth, Step, UpdateStrategy, VolumeMount, cause,
+    LABEL_ENVIRONMENT, LogStream, Op, Outcome, PortException, PortProbe, RegistryAuth, Release, ResourceRoutes, Route,
+    RouterConfig, RouterState, RunOnceSpec, RunSpec, Source, SshAuth, Step, UpdateStrategy, VolumeMount, cause,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -201,11 +201,13 @@ fn app_deploy(
             labels: [(LABEL_ENVIRONMENT.to_string(), "e2e-env".to_string())].into(),
             volumes: vec![],
             files: vec![],
+            no_init: false,
         },
         // A phase-2 control plane's command: routed by `publish`.
         routes: None,
         drain_secs: Some(1),
         strategy: None,
+        release: None,
     }
 }
 
@@ -1602,6 +1604,7 @@ async fn compose_app_routes_one_of_two_services() {
         resource: app.into(),
         service: Some("api".into()),
         command: vec!["cat".into(), "/uid_map".into()],
+        deployment: None,
         timeout_secs: 10,
     }))
     .await
@@ -1621,6 +1624,7 @@ async fn compose_app_routes_one_of_two_services() {
         resource: app.into(),
         service: Some("api".into()),
         command: vec!["sh".into(), "-c".into(), "echo kept > /data/f && printenv GREETING".into()],
+        deployment: None,
         timeout_secs: 10,
     }))
     .await
@@ -1635,6 +1639,7 @@ async fn compose_app_routes_one_of_two_services() {
         resource: app.into(),
         service: Some("api".into()),
         command: vec!["cat".into(), "/data/f".into()],
+        deployment: None,
         timeout_secs: 10,
     }))
     .await
@@ -1763,6 +1768,7 @@ async fn volumes_survive_redeploys_and_exec_reports_exit_codes() {
             resource: app.into(),
             service: None,
             command: vec!["sh".into(), "-c".into(), cmd.into()],
+            deployment: None,
             timeout_secs,
         })
     };
@@ -1809,6 +1815,7 @@ async fn exec_in(resource: &str, cmd: &str) -> String {
         resource: resource.into(),
         service: None,
         command: vec!["sh".into(), "-c".into(), cmd.into()],
+        deployment: None,
         timeout_secs: 10,
     };
     let e: ExecOutput = run(Op::Exec(spec)).await.ok();
@@ -2017,6 +2024,51 @@ async fn the_health_check_starts_early_and_init_reaps_exec_orphans() {
     remove_app(app).await;
 }
 
+/// `RunSpec::no_init` runs the application's own process as PID 1; a command naming the current deployment runs in
+/// its container while a rolling deployment's candidate (the newest container) fails its health check, and is not
+/// killed when the candidate is removed.
+#[tokio::test]
+async fn no_init_and_exec_in_the_current_deployment_during_a_rolling_update() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2enoinit";
+    remove_app(app).await;
+    let mut d = app_spec(app, "dep_E2EN0001", 8080, Some(28147));
+    d.run.no_init = true;
+    let r = run(Op::DeployApp(d)).await;
+    let current: DeployOutput = r.ok();
+    assert!(r.log().iter().any(|l| l.contains("without an init process")), "{:?}", r.log());
+    assert_ne!(exec_in(app, "cat /proc/1/comm").await, "docker-init");
+
+    // The candidate serves 404 on its health path: it runs for its 5 tries, then is removed.
+    let mut bad = app_spec(app, "dep_E2EN0002", 8080, Some(28147));
+    bad.run.health = Some(HealthCheck { path: "/missing".into(), interval_secs: 1, timeout_secs: 1, retries: 5 });
+    let task = async {
+        within(30, async || {
+            let s = status(app).await;
+            s.containers
+                .iter()
+                .any(|c| c.deployment.as_deref() == Some("dep_E2EN0002") && c.state == "running")
+                .then_some(())
+        })
+        .await;
+        let spec = ExecSpec {
+            resource: app.into(),
+            service: None,
+            command: vec!["sh".into(), "-c".into(), "sleep 8; echo done".into()],
+            deployment: Some("dep_E2EN0001".into()),
+            timeout_secs: 30,
+        };
+        run(Op::Exec(spec)).await.ok::<ExecOutput>()
+    };
+    let (failed, e) = tokio::join!(run(Op::DeployApp(bad)), task);
+    assert!(failed.err().contains("health check"), "{}", failed.err());
+    assert_eq!(e.container_id, current.container_id, "{e:?}");
+    assert_eq!((e.exit_code, e.output.trim()), (Some(0), "done"), "{e:?}");
+    remove_app(app).await;
+}
+
 fn app_spec(resource: &str, deployment: &str, port: u16, publish: Option<u16>) -> AppDeploy {
     let mut d = app_deploy(resource, deployment, image("busybox:1.37"), port, publish, Some("/"));
     // The image source is retagged per deployment; busybox has no web server of its own running.
@@ -2192,7 +2244,7 @@ async fn container_and_health_failures_name_their_cause() {
 }
 
 /// What `AppStatus` reports of containers Docker restarts after a good deployment: one exiting at once on every
-/// restart (a crash loop), and one crashing after 15 s, running between its restarts.
+/// restart (a crash loop), one crashing after 15 s, running between its restarts, and one killed for its memory.
 #[tokio::test]
 async fn restarting_containers_report_their_restarts() {
     if !enabled("OWDEPLOY_TEST_DOCKER") {
@@ -2228,7 +2280,21 @@ async fn restarting_containers_report_their_restarts() {
         })
         .await;
         assert_eq!((c.state.as_str(), c.restart_count), ("running", Some(n)), "{c:?}");
+        assert_eq!(c.oom_at, None, "{c:?}");
     }
+
+    // Killed for its memory after its health check, then restarted: Docker clears `OOMKilled`, its events tell it.
+    let mut d = app_deploy(app, "dep_E2EK0003", Source::Local { image: base.into() }, 8080, Some(28152), Some("/"));
+    d.run.command = Some(vec!["sh".into(), "-c".into(), format!("{site} && sleep 2; tail /dev/zero")]);
+    d.run.memory_bytes = Some(16 << 20);
+    run(Op::DeployApp(d)).await.ok::<DeployOutput>();
+    let c = within(60, async || {
+        let c = status(app).await.containers.into_iter().find(|c| c.deployment.as_deref() == Some("dep_E2EK0003"))?;
+        (c.restart_count >= Some(1) && c.oom_at.is_some()).then_some(c)
+    })
+    .await;
+    let at = c.oom_at.as_deref().unwrap();
+    assert!(time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).is_ok(), "{c:?}");
     remove_app(app).await;
     docker_cli(&["rmi", base]);
 }
@@ -2384,6 +2450,254 @@ async fn compose_failures_name_their_cause() {
     remove_app(app).await;
 }
 
+/// One-off containers of `resource` (`RunOnce`, release commands) still on the Engine.
+fn run_containers(resource: &str) -> Vec<String> {
+    let filter = format!("label={}={resource}", deploy_proto::msg::LABEL_RUN);
+    docker_cli(&["ps", "-aq", "--filter", &filter]).lines().map(str::to_string).collect()
+}
+
+fn release(command: &str, timeout_secs: u32) -> Option<Release> {
+    Some(Release { command: vec!["sh".into(), "-c".into(), command.into()], timeout_secs })
+}
+
+/// The release command runs once in a container of its own, with the new image, the application's variables, files
+/// and network, before anything of the application changes: while it runs the previous container keeps serving and
+/// the one-off container is no container of the application (no status, no exec, no alias); a failure, its timeout
+/// or a cancel leaves the previous container serving (and, with recreate, never stopped) and creates no new one.
+#[tokio::test]
+async fn release_command_runs_before_anything_changes() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2erelease";
+    remove_app(app).await;
+    let base = "http://127.0.0.1:28160/";
+    let first: DeployOutput = run(Op::DeployApp(app_spec(app, "dep_E2ER0001", 8080, Some(28160)))).await.ok();
+    let body = || async { http(base).await.map(|(_, b)| b.trim().to_string()).unwrap_or_default() };
+    assert_eq!(body().await, app);
+
+    // A release that succeeds, watched while it runs.
+    let mut d = app_spec(app, "dep_E2ER0002", 8080, Some(28160));
+    d.run.command = busybox_site("second");
+    d.run.files = vec![FileMount { path: "/etc/release.conf".into(), content: "from-file\n".into(), service: None }];
+    d.release = release(
+        "echo \"migrating $GREETING on $PORT\"; cat /etc/release.conf; echo to-stderr >&2; sleep 4; echo migrated",
+        60,
+    );
+    let during = tokio::spawn(async move {
+        // The image is pulled first: watch until the release's container exists.
+        let mut runs = Vec::new();
+        for _ in 0..200 {
+            runs = run_containers("app_e2erelease");
+            if !runs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let aliases = runs.first().map(|id| {
+            docker_cli(&["inspect", "-f", "{{range .NetworkSettings.Networks}}{{json .Aliases}}{{end}}", id])
+        });
+        let labels = runs.first().map(|id| docker_cli(&["inspect", "-f", "{{json .Config.Labels}}", id]));
+        let init = runs.first().map(|id| docker_cli(&["inspect", "-f", "{{.HostConfig.Init}}", id]));
+        let served = http("http://127.0.0.1:28160/").await.map(|(_, b)| b.trim().to_string()).unwrap_or_default();
+        let st = status("app_e2erelease").await;
+        let entered = exec_in("app_e2erelease", "cat /www/index.html").await;
+        (runs, aliases, labels, init, served, st, entered)
+    });
+    let r = run(Op::DeployApp(d)).await;
+    let out: DeployOutput = r.ok();
+    let (runs, aliases, labels, init, served, st, entered) = during.await.unwrap();
+    assert_eq!(runs.len(), 1, "one one-off container while the release runs");
+    let aliases = aliases.unwrap();
+    assert!(aliases == "null" || !aliases.contains("web"), "no alias of the application: {aliases}");
+    let labels = labels.unwrap();
+    assert!(labels.contains("dev.openwaf.deploy.run") && !labels.contains("dev.openwaf.deploy.resource"), "{labels}");
+    assert_eq!(init.as_deref(), Some("true"));
+    assert_eq!(served, "app_e2erelease", "the previous container serves during the release");
+    assert_eq!(st.containers.len(), 1, "the one-off container is not one of the application's: {st:?}");
+    assert_eq!(st.containers[0].id, first.container_id);
+    assert_eq!(entered, "app_e2erelease", "exec goes to the application's container");
+    assert_eq!(
+        r.steps(),
+        [Step::Pulling, Step::Releasing, Step::Starting, Step::HealthCheck, Step::Switching, Step::Cleaning]
+    );
+    let released: Vec<&String> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Log { lines, step: Some(Step::Releasing), .. } => Some(lines),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for want in ["migrating hello on 8080", "from-file", "to-stderr", "migrated", "The release command succeeded"] {
+        assert!(released.iter().any(|l| *l == want), "{want:?} in the releasing step: {released:?}");
+    }
+    let log = r.log();
+    let at = |s: &str| log.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s:?} in {log:?}"));
+    assert!(at("migrated") < at("Started "), "the release ends before the new container starts");
+    assert_eq!(body().await, "second");
+    assert!(run_containers(app).is_empty(), "the one-off container is removed");
+
+    // A release that fails: nothing changes, no container of the deployment is created.
+    let mut d = app_spec(app, "dep_E2ER0003", 8080, Some(28160));
+    d.run.command = busybox_site("third");
+    d.release = release("echo cannot migrate >&2; exit 3", 60);
+    let failed = run(Op::DeployApp(d)).await;
+    failed.assert_cause(cause::RELEASE_FAILED);
+    assert_eq!(failed.param("exit_code").as_deref(), Some("3"));
+    assert!(failed.lines(Some(LogStream::Stderr)).contains(&"cannot migrate".to_string()));
+    assert_eq!(*failed.steps().last().unwrap(), Step::Releasing);
+    assert_eq!(docker_cli(&["ps", "-aq", "--filter", "name=owd-app_e2erelease-e2er0003"]), "");
+    let st = status(app).await;
+    assert_eq!((st.containers.len(), st.containers[0].id.as_str()), (1, out.container_id.as_str()));
+    assert_eq!(body().await, "second");
+
+    // Its timeout: killed, the deployment fails.
+    let mut d = app_spec(app, "dep_E2ER0004", 8080, Some(28160));
+    d.release = release("sleep 60", 2);
+    let started = std::time::Instant::now();
+    let slow = run(Op::DeployApp(d)).await;
+    slow.assert_cause(cause::RELEASE_FAILED);
+    assert_eq!(slow.param("timeout").as_deref(), Some("2"));
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+
+    // Recreate: a failed release never stops the running container.
+    let started_at = docker_cli(&["inspect", "-f", "{{.State.StartedAt}}", &out.container_id]);
+    let mut d = app_spec(app, "dep_E2ER0005", 8080, Some(28160));
+    d.strategy = Some(UpdateStrategy::Recreate);
+    d.release = release("exit 1", 60);
+    run(Op::DeployApp(d)).await.assert_cause(cause::RELEASE_FAILED);
+    assert_eq!(docker_cli(&["inspect", "-f", "{{.State.StartedAt}}", &out.container_id]), started_at);
+    assert_eq!(body().await, "second");
+
+    // A cancel during the release kills it.
+    let mut d = app_spec(app, "dep_E2ER0006", 8080, Some(28160));
+    d.release = release("sleep 60", 120);
+    let cancel = CancellationToken::new();
+    let pending = tokio::spawn(exec(Op::DeployApp(d), cancel.clone()));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    cancel.cancel();
+    let cancelled = tokio::time::timeout(Duration::from_secs(15), pending).await.expect("cancel stops it").unwrap();
+    assert_eq!(cancelled.err(), "cancelled");
+    assert!(run_containers(app).is_empty());
+    assert_eq!(body().await, "second");
+    remove_app(app).await;
+}
+
+fn run_once(app: &str, run: &str, image: &str, command: &str, timeout_secs: u32) -> RunOnceSpec {
+    RunOnceSpec {
+        resource: app.into(),
+        run: run.into(),
+        image: image.into(),
+        network: NETWORK.into(),
+        command: vec!["sh".into(), "-c".into(), command.into()],
+        env: [("GREETING".to_string(), "from-run".to_string())].into(),
+        volumes: vec![],
+        files: vec![],
+        memory_bytes: Some(128 << 20),
+        cpus: None,
+        labels: [(LABEL_ENVIRONMENT.to_string(), "e2e-env".to_string())].into(),
+        timeout_secs,
+    }
+}
+
+/// `RunOnce`: a command in a new container of the application's image, with the variables given and the volumes
+/// asked for; a deployment meanwhile does not stop it; its timeout and a cancel kill it; removing the application
+/// removes its runs; 100 runs leave no container, no file and no zombie behind.
+#[tokio::test]
+async fn one_off_runs_are_apart_from_the_application() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let app = "app_e2erunonce";
+    remove_app(app).await;
+    run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok::<serde_json::Value>();
+    let mut d = app_spec(app, "dep_E2EO0001", 8080, Some(28161));
+    d.run.volumes = vec![VolumeMount { name: "data".into(), path: "/data".into(), service: None }];
+    let first: DeployOutput = run(Op::DeployApp(d.clone())).await.ok();
+
+    // Output streamed and returned, its exit code, its variables and files; the volume only when asked.
+    let mut spec =
+        run_once(app, "run_E2E0000000000000000000001", &first.image, "echo $GREETING; cat /etc/x; exit 4", 30);
+    spec.files = vec![FileMount { path: "/etc/x".into(), content: "file-content".into(), service: None }];
+    let r = run(Op::RunOnce(spec)).await;
+    let out: ExecOutput = r.ok();
+    assert_eq!((out.exit_code, out.timed_out), (Some(4), false));
+    assert!(out.output.contains("from-run") && out.output.contains("file-content"), "{}", out.output);
+    assert!(r.lines(Some(LogStream::Stdout)).contains(&"from-run".to_string()), "{:?}", r.log());
+    let state = std::env::var("OWDEPLOY_AGENT_STATE").unwrap();
+    let files = std::path::Path::new(&state).join("run-files").join(app);
+    assert!(std::fs::read_dir(&files).map_or(true, |mut d| d.next().is_none()), "the run's files are removed");
+    let no_volume = run_once(app, "run_E2E0000000000000000000002", &first.image, "test ! -e /data/x", 30);
+    assert_eq!(run(Op::RunOnce(no_volume)).await.ok::<ExecOutput>().exit_code, Some(0));
+    let mut with = run_once(app, "run_E2E0000000000000000000003", &first.image, "echo restored > /data/x", 30);
+    with.volumes = d.run.volumes.clone();
+    assert_eq!(run(Op::RunOnce(with)).await.ok::<ExecOutput>().exit_code, Some(0));
+    assert_eq!(exec_in(app, "cat /data/x").await, "restored");
+
+    // A deployment while it runs does not touch it; status and exec never see it.
+    let long = run_once(app, "run_E2E0000000000000000000004", &first.image, "sleep 4; echo survived", 60);
+    let pending = tokio::spawn(run(Op::RunOnce(long)));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let st = status(app).await;
+    assert_eq!(st.containers.len(), 1, "{st:?}");
+    d.deployment = "dep_E2EO0002".into();
+    d.run.image_tag = "owd/app_e2erunonce:dep_e2eo0002".into();
+    d.source = Source::Local { image: first.image.clone() };
+    run(Op::DeployApp(d)).await.ok::<DeployOutput>();
+    let survived: ExecOutput = pending.await.unwrap().ok();
+    assert_eq!(survived.exit_code, Some(0));
+    assert!(survived.output.contains("survived"));
+
+    // Timeout and cancel kill it; the container goes either way.
+    let t: ExecOutput =
+        run(Op::RunOnce(run_once(app, "run_E2E0000000000000000000005", &first.image, "sleep 60", 2))).await.ok();
+    assert!(t.timed_out);
+    let cancel = CancellationToken::new();
+    let spec = run_once(app, "run_E2E0000000000000000000006", &first.image, "sleep 60", 120);
+    let pending = tokio::spawn(exec(Op::RunOnce(spec), cancel.clone()));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    cancel.cancel();
+    assert_eq!(pending.await.unwrap().err(), "cancelled");
+    assert!(run_containers(app).is_empty());
+    // Another application's image is refused.
+    let foreign = run_once(app, "run_E2E0000000000000000000007", "busybox:1.37", "true", 10);
+    assert!(run(Op::RunOnce(foreign)).await.err().contains("not in the repository"));
+
+    // 100 runs whose commands leave orphans: nothing stays behind, no zombie on the host (the tests run in the host's
+    // PID namespace).
+    let zombies = || {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("status")).ok())
+            .filter(|s| s.lines().any(|l| l.starts_with("State:") && l.contains('Z')))
+            .count()
+    };
+    let before = zombies();
+    for i in 0..100 {
+        let id = format!("run_E2E1{i:025}");
+        let spec = run_once(app, &id, &first.image, "(sleep 1 &); echo ok", 30);
+        let o: ExecOutput = run(Op::RunOnce(spec)).await.ok();
+        assert_eq!(o.exit_code, Some(0), "run {i}");
+    }
+    assert!(run_containers(app).is_empty());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = zombies();
+    assert!(after <= before, "zombies on the host: {before} before, {after} after");
+
+    // Removing the application removes a run still going.
+    let spec = run_once(app, "run_E2E0000000000000000000008", &first.image, "sleep 60", 120);
+    let pending = tokio::spawn(run(Op::RunOnce(spec)));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    remove_app(app).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), pending).await.expect("the run ends with its container");
+    assert!(run_containers(app).is_empty());
+    run(Op::VolumeRemove { resource: app.into(), names: None }).await.ok::<serde_json::Value>();
+}
+
 /// Every code an agent sends (`AGENT_CODES`) is produced by one of the diagnosis cases above with real Docker, or
 /// is listed here with the reason it is not.
 #[test]
@@ -2417,6 +2731,7 @@ fn every_agent_code_has_an_end_to_end_case_or_a_reason() {
         (HEALTH_NO_ANSWER, "container_and_health_failures_name_their_cause"),
         (HEALTH_BAD_STATUS, "image_deploy_switch_rollback_and_logs"),
         (RUNTIME_NOT_LISTENING, "container_and_health_failures_name_their_cause"),
+        (RELEASE_FAILED, "release_command_runs_before_anything_changes"),
     ];
     let reasons: &[(&str, &str)] = &[
         (DISK_FULL, "filling the Engine's disk is not safe on a shared host; Git, BuildKit and Engine unit tests"),
@@ -2479,6 +2794,7 @@ fn rules(allow: &str, ports: &[u16], deny: &[&str]) -> FirewallRules {
         allow: vec![allow.into()],
         ports: ports.to_vec(),
         deny: deny.iter().map(|d| d.to_string()).collect(),
+        deny_except: Vec::new(),
     }
 }
 
@@ -2631,6 +2947,7 @@ async fn wget_in(app: &str, url: &str) -> bool {
         resource: app.into(),
         service: None,
         command: vec!["sh".into(), "-c".into(), cmd],
+        deployment: None,
         timeout_secs: 10,
     };
     let out = run(Op::Exec(spec)).await.ok::<ExecOutput>();
@@ -2757,6 +3074,17 @@ async fn firewall_guards_container_egress() {
         run(Op::FirewallSync(rules("10.231.0.0/24", &[28092, 28093], &["198.51.100.7"]))).await.ok();
     eprintln!("firewall sync: {v}");
     assert!(!wget_in(app, control).await, "a denied control-plane host is reachable");
+    // One TCP port of it excepted (a mail server's submission port on a protected host): reachable again, through a
+    // rule for that port alone.
+    let mut excepted = rules("10.231.0.0/24", &[28092, 28093], &["198.51.100.7"]);
+    excepted.deny_except = vec![PortException { cidr: "198.51.100.7".into(), port: 80 }];
+    run(Op::FirewallSync(excepted)).await.ok::<serde_json::Value>();
+    assert!(wget_in(app, control).await, "the excepted port of a denied host is not reachable");
+    let egress = tables("iptables", &["-S", "OWDEPLOY-EGRESS"]);
+    let rule = "-A OWDEPLOY-EGRESS -d 198.51.100.7/32 -p tcp -m tcp --dport 80 -j RETURN";
+    assert!(egress.lines().any(|l| l == rule), "{egress}");
+    run(Op::FirewallSync(rules("10.231.0.0/24", &[28092, 28093], &["198.51.100.7"]))).await.ok::<serde_json::Value>();
+    assert!(!wget_in(app, control).await, "the exception outlived the rules that carried it");
     assert!(wget_in(app, "http://owd-router:28092/").await);
     for (bin, chain) in [
         ("iptables", "DOCKER-USER"),
@@ -2818,7 +3146,13 @@ async fn firewall_guards_container_egress() {
         "sleep",
         "600",
     ]);
-    let spec = ExecSpec { resource: app.into(), service: None, command: vec!["true".into()], timeout_secs: 10 };
+    let spec = ExecSpec {
+        resource: app.into(),
+        service: None,
+        command: vec!["true".into()],
+        deployment: None,
+        timeout_secs: 10,
+    };
     let e = run(Op::Exec(spec)).await.err();
     assert!(e.contains(impostor) && e.contains("refusing"), "{e}");
     let e = run(Op::AppAction { resource: app.into(), action: AppActionKind::Stop }).await.err();

@@ -1105,10 +1105,12 @@ mod tests {
                 labels: Default::default(),
                 volumes: vec![],
                 files: vec![FileMount { path: "/etc/app.conf".into(), content: secret.into(), service: None }],
+                no_init: false,
             },
             routes: None,
             drain_secs: None,
             strategy: None,
+            release: None,
         });
         Command { id: "cmd_1".into(), op }
     }

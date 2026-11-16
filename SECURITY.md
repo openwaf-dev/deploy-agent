@@ -109,7 +109,8 @@ What the agent never does:
 
 - open a listening port of its own (the broker's UNIX socket is local to the server, for the relay only);
 - accept unsigned or shell-string commands. Every operation is a typed message ([PROTOCOL.md §7](PROTOCOL.md#7-operations)),
-  and `exec` runs an argv in an application's container, not on the host;
+  and `exec` runs an argv in an application's container, `run_once` an argv in a new container of one of the
+  application's own images (`owd/<resource>:…`) on its network without an alias, with Docker's init, never on the host;
 - edit firewall rules or containers it did not create;
 - run Compose services that are privileged or that use host namespaces, devices, extra capabilities, bind mounts of
   the server's files, security options other than `no-new-privileges`, or logging drivers that send logs from the

@@ -236,10 +236,32 @@ pub struct Plan {
     pub ports: Vec<u16>,
     pub deny_v4: Vec<String>,
     pub deny_v6: Vec<String>,
+    /// TCP ports of denied destinations still reachable ([`FirewallRules::deny_except`]), per family.
+    pub except_v4: Vec<(String, u16)>,
+    pub except_v6: Vec<(String, u16)>,
+}
+
+/// A normalized `address/prefix` ([`cidr`]) as its address and prefix length.
+fn net(c: &str) -> (IpAddr, u8) {
+    let (a, l) = c.split_once('/').expect("normalized cidr");
+    (a.parse().expect("normalized address"), l.parse().expect("normalized prefix"))
+}
+
+/// Whether the normalized range `outer` holds every address of the normalized range `inner`.
+fn holds(outer: &str, inner: &str) -> bool {
+    let ((o, ol), (i, il)) = (net(outer), net(inner));
+    o.is_ipv4() == i.is_ipv4() && ol <= il && cidr(&format!("{i}/{ol}")).is_ok_and(|(_, n)| n == outer)
+}
+
+/// Whether two normalized ranges share an address.
+fn overlaps(a: &str, b: &str) -> bool {
+    holds(a, b) || holds(b, a)
 }
 
 /// Normalizes the sources and denied destinations (address/prefix, network address, deduplicated) and ports.
-/// Anything else is refused: the values end up in an `iptables-restore` script.
+/// Anything else is refused: the values end up in an `iptables-restore` script. An exception must lie inside a
+/// denied destination of its family and outside the ranges always refused: it can only reopen one port of what the
+/// control plane itself closed.
 pub fn plan(r: &FirewallRules) -> Result<Plan, String> {
     let split = |list: &[String], what: &str| -> Result<(Vec<String>, Vec<String>), String> {
         let (mut v4, mut v6) = (Vec::new(), Vec::new());
@@ -257,13 +279,32 @@ pub fn plan(r: &FirewallRules) -> Result<Plan, String> {
     };
     let (v4, v6) = split(&r.allow, "source")?;
     let (deny_v4, deny_v6) = split(&r.deny, "denied destination")?;
+    let (mut except_v4, mut except_v6) = (Vec::new(), Vec::new());
+    for e in &r.deny_except {
+        let (family, n) = cidr(&e.cidr).map_err(|err| format!("deny exception: {err}"))?;
+        if e.port == 0 {
+            return Err(format!("deny exception {n}: invalid port 0"));
+        }
+        let deny = if family == Family::V4 { &deny_v4 } else { &deny_v6 };
+        if !deny.iter().any(|d| holds(d, &n)) {
+            return Err(format!("deny exception {n}:{}: not inside a denied destination", e.port));
+        }
+        if blocked(family).iter().any(|b| overlaps(b, &n)) {
+            return Err(format!("deny exception {n}:{}: inside the private and special ranges always refused", e.port));
+        }
+        if family == Family::V4 { &mut except_v4 } else { &mut except_v6 }.push((n, e.port));
+    }
+    for v in [&mut except_v4, &mut except_v6] {
+        v.sort();
+        v.dedup();
+    }
     let mut ports = r.ports.clone();
     if ports.contains(&0) {
         return Err("invalid port 0".into());
     }
     ports.sort_unstable();
     ports.dedup();
-    Ok(Plan { v4, v6, ports, deny_v4, deny_v6 })
+    Ok(Plan { v4, v6, ports, deny_v4, deny_v6, except_v4, except_v6 })
 }
 
 /// What the egress guard covers besides the control plane's rules.
@@ -364,7 +405,8 @@ async fn guard() -> Result<Guard, String> {
 /// The filter table input for `iptables-restore --noflush` (or ip6tables'). Declaring the chains flushes them (or
 /// creates them), so the whole set is replaced in one transaction. `sources` None: published ports are not managed
 /// (no `FirewallSync` yet), nothing is guarded on them and only the router's listeners are let through. The router's
-/// listeners are guarded like the published ports. `deny`: the control plane's refused destinations, of `family`.
+/// listeners are guarded like the published ports. `deny`: the control plane's refused destinations, of `family`;
+/// `except`: their TCP ports still reachable, let through before any refusal.
 pub fn filter_script(
     family: Family,
     sources: Option<&[String]>,
@@ -372,6 +414,7 @@ pub fn filter_script(
     ingress: Option<&Ingress>,
     guard: &Guard,
     deny: &[String],
+    except: &[(String, u16)],
 ) -> String {
     let mut s = format!("*filter\n:{CHAIN} - [0:0]\n:{SOURCES} - [0:0]\n:{EGRESS} - [0:0]\n:{INPUT} - [0:0]\n");
     s.push_str(&format!(":{HOST} - [0:0]\n"));
@@ -416,6 +459,9 @@ pub fn filter_script(
         for proto in ["udp", "tcp"] {
             add(EGRESS, &format!("-d {ns} -p {proto} --dport 53 -j RETURN"));
         }
+    }
+    for (c, p) in except {
+        add(EGRESS, &format!("-d {c} -p tcp --dport {p} -j RETURN"));
     }
     for c in deny.iter().cloned().chain(blocked(family)) {
         add(EGRESS, &format!("-d {c} {}", family.reject()));
@@ -949,8 +995,10 @@ pub(crate) async fn apply_locked(rules: Option<&FirewallRules>, ingress: Option<
     let wanted = plan.is_some() || ingress.is_some() || guard.networks;
     let ports = plan.as_ref().map(|p| p.ports.as_slice()).unwrap_or_default();
     let (deny_v4, deny_v6) = plan.as_ref().map(|p| (p.deny_v4.as_slice(), p.deny_v6.as_slice())).unwrap_or_default();
-    let script = filter_script(Family::V4, plan.as_ref().map(|p| p.v4.as_slice()), ports, ingress, &guard, deny_v4)
-        + &nat_script(ingress);
+    let (except_v4, except_v6) =
+        plan.as_ref().map(|p| (p.except_v4.as_slice(), p.except_v6.as_slice())).unwrap_or_default();
+    let sources = plan.as_ref().map(|p| p.v4.as_slice());
+    let script = filter_script(Family::V4, sources, ports, ingress, &guard, deny_v4, except_v4) + &nat_script(ingress);
     let mut wants = vec![Want { family: Family::V4, list: v4.0, restore: v4.1, script, jumps: jumps(Family::V4) }];
     let v6 = backend_v6(v4.0).await;
     if let Some((list, restore)) = v6 {
@@ -959,7 +1007,7 @@ pub(crate) async fn apply_locked(rules: Option<&FirewallRules>, ingress: Option<
         guarded.sort_unstable();
         guarded.dedup();
         let sources = plan.as_ref().map(|p| p.v6.as_slice());
-        let script = filter_script(Family::V6, sources, &guarded, None, &guard, deny_v6);
+        let script = filter_script(Family::V6, sources, &guarded, None, &guard, deny_v6, except_v6);
         wants.push(Want { family: Family::V6, list, restore, script, jumps: jumps(Family::V6) });
     }
     let repaired = transaction(&Host, &wants, wanted).await?;
@@ -977,6 +1025,7 @@ pub async fn sync(r: &FirewallRules) -> Result<Value, String> {
     Ok(json!({
         "applied": true, "backend": report.backend, "ipv6": report.ipv6, "ports": p.ports.len(),
         "router_ports": ingress.map_or(0, |i| i.ports.len()), "denied": p.deny_v4.len() + p.deny_v6.len(),
+        "denied_except": p.except_v4.len() + p.except_v6.len(),
         "egress_interfaces": report.guard.interfaces(),
     }))
 }
@@ -1109,6 +1158,7 @@ mod tests {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             ports: ports.to_vec(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
+            deny_except: Vec::new(),
         }
     }
 
@@ -1127,6 +1177,8 @@ mod tests {
                 ports: vec![20001, 20002],
                 deny_v4: vec!["203.0.113.9/32".into()],
                 deny_v6: vec!["2001:db8:5::/48".into()],
+                except_v4: vec![],
+                except_v6: vec![],
             }
         );
         for bad in ["10.0.0.0/33", "10.0.0.0/8 -j ACCEPT", "1.2.3.4\n-A INPUT -j ACCEPT", "example.com", ""] {
@@ -1137,6 +1189,47 @@ mod tests {
         // An older control plane sends no `deny`.
         let old: FirewallRules = serde_json::from_str(r#"{"allow": ["192.0.2.0/24"], "ports": [20001]}"#).unwrap();
         assert!(plan(&old).unwrap().deny_v4.is_empty());
+    }
+
+    /// An exception reopens one TCP port of a denied destination, and nothing the control plane did not close.
+    #[test]
+    fn deny_exceptions_stay_inside_the_denied_destinations() {
+        let with = |deny: &[&str], except: &[(&str, u16)]| {
+            let mut r = rules(&[], &[], deny);
+            r.deny_except = except
+                .iter()
+                .map(|(c, p)| deploy_proto::msg::PortException { cidr: c.to_string(), port: *p })
+                .collect();
+            plan(&r)
+        };
+        // Documentation ranges (RFC 5737, RFC 9637), outside those always refused.
+        let p = with(
+            &["203.0.113.176/28", "3fff:0:a::/48"],
+            &[("203.0.113.189", 587), ("203.0.113.189/32", 587), ("203.0.113.189", 465), ("3fff:0:a::25", 587)],
+        )
+        .unwrap();
+        assert_eq!(p.except_v4, [("203.0.113.189/32".to_string(), 465), ("203.0.113.189/32".to_string(), 587)]);
+        assert_eq!(p.except_v6, [("3fff:0:a::25/128".to_string(), 587)]);
+        // Outside every denied destination (or of the other family): it would open nothing the control plane closed.
+        assert!(with(&["203.0.113.176/28"], &[("203.0.113.200", 587)]).is_err());
+        assert!(with(&["203.0.113.176/28"], &[("203.0.113.0/24", 587)]).is_err(), "wider than the denied range");
+        assert!(with(&["203.0.113.176/28"], &[("3fff:0:a::25", 587)]).is_err());
+        // Inside the ranges always refused: never reopened, even when the control plane also lists them.
+        assert!(with(&["10.0.0.0/8"], &[("10.1.2.3", 5432)]).is_err());
+        assert!(with(&["169.254.0.0/16"], &[("169.254.169.254", 80)]).is_err());
+        assert!(with(&["203.0.113.189"], &[("203.0.113.189", 0)]).is_err());
+        for bad in ["203.0.113.189 -j ACCEPT", "203.0.113.189\n-A INPUT -j ACCEPT", "mail.example.com", ""] {
+            assert!(with(&["203.0.113.176/28"], &[(bad, 587)]).is_err(), "{bad:?}");
+        }
+        // The rule comes before every refusal, for TCP and that port only.
+        let s = filter_script(Family::V4, None, &[], None, &guard(), &p.deny_v4, &p.except_v4);
+        let egress = chain(&s, EGRESS);
+        let pos = |r: &str| egress.iter().position(|x| x == r).unwrap_or_else(|| panic!("{r} missing: {egress:#?}"));
+        let open = pos("-d 203.0.113.189/32 -p tcp --dport 587 -j RETURN");
+        assert!(open < pos("-d 203.0.113.176/28 -j REJECT --reject-with icmp-admin-prohibited"));
+        assert!(open < pos("-d 10.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited"));
+        let returns: Vec<&String> = egress.iter().filter(|r| r.contains("203.0.113.189")).collect();
+        assert_eq!(returns.len(), 2, "{returns:?}");
     }
 
     fn ingress() -> Ingress {
@@ -1159,7 +1252,8 @@ mod tests {
     #[test]
     fn scripts_guard_published_ports_and_route_the_router_listeners() {
         let sources = ["198.51.100.0/24".to_string()];
-        let s = filter_script(Family::V4, Some(&sources), &[20001, 20002], Some(&ingress()), &Guard::default(), &[]);
+        let s =
+            filter_script(Family::V4, Some(&sources), &[20001, 20002], Some(&ingress()), &Guard::default(), &[], &[]);
         assert!(s.starts_with(
             "*filter\n:OWDEPLOY - [0:0]\n:OWDEPLOY-SRC - [0:0]\n:OWDEPLOY-EGRESS - [0:0]\n:OWDEPLOY-IN - [0:0]\n\
              :OWDEPLOY-HOST - [0:0]\n"
@@ -1192,11 +1286,11 @@ mod tests {
         );
         // No sources: published ports are closed to everyone rather than open.
         assert!(
-            filter_script(Family::V4, Some(&[]), &[20001], None, &Guard::default(), &[])
+            filter_script(Family::V4, Some(&[]), &[20001], None, &Guard::default(), &[], &[])
                 .ends_with("-A OWDEPLOY-SRC -j DROP\nCOMMIT\n")
         );
         // Not managed: nothing guarded, the listeners let through.
-        let open = filter_script(Family::V4, None, &[], Some(&ingress()), &Guard::default(), &[]);
+        let open = filter_script(Family::V4, None, &[], Some(&ingress()), &Guard::default(), &[], &[]);
         assert!(!open.contains("-j OWDEPLOY-SRC") && open.contains("--ctorigdstport 20003 -j ACCEPT"));
         assert_eq!(
             nat_script(Some(&ingress())),
@@ -1211,7 +1305,7 @@ mod tests {
     #[test]
     fn egress_guard_refuses_metadata_private_ranges_and_the_host() {
         let deny = ["203.0.113.9/32".to_string()];
-        let s = filter_script(Family::V4, None, &[], None, &guard(), &deny);
+        let s = filter_script(Family::V4, None, &[], None, &guard(), &deny, &[]);
         let main = chain(&s, CHAIN);
         assert!(main.contains(&"-i owd+ -j OWDEPLOY-EGRESS".into()));
         assert!(main.contains(&"-i br-0123456789ab -j OWDEPLOY-EGRESS".into()), "an older Deploy network");
@@ -1257,8 +1351,8 @@ mod tests {
     fn ipv6_rules_match_ipv4() {
         let sources = ["2001:db8:e::/48".to_string()];
         let deny = ["2001:db8:c::/48".to_string()];
-        let s = filter_script(Family::V6, Some(&sources), &[20001, 20003], None, &guard(), &deny);
-        let v4 = filter_script(Family::V4, Some(&[]), &[20001, 20003], None, &guard(), &[]);
+        let s = filter_script(Family::V6, Some(&sources), &[20001, 20003], None, &guard(), &deny, &[]);
+        let v4 = filter_script(Family::V4, Some(&[]), &[20001, 20003], None, &guard(), &[], &[]);
         assert_eq!(declared(&s), declared(&v4), "same chains in both families");
         assert!(
             chain(&s, CHAIN)
@@ -1388,7 +1482,7 @@ mod tests {
     #[test]
     fn repair_detects_flushed_chains_and_lost_jumps_only() {
         let sources = ["198.51.100.0/24".to_string()];
-        let script = filter_script(Family::V4, Some(&sources), &[20001], Some(&ingress()), &guard(), &[])
+        let script = filter_script(Family::V4, Some(&sources), &[20001], Some(&ingress()), &guard(), &[], &[])
             + &nat_script(Some(&ingress()));
         let j = jumps(Family::V4);
         let healthy = listed(&script, &j);
@@ -1417,13 +1511,13 @@ mod tests {
         assert_eq!(problems(&no_input, &script, &j), ["jump INPUT → OWDEPLOY-IN missing"]);
 
         let moved = Ingress { ip: Ipv4Addr::new(172, 18, 0, 3), ..ingress() };
-        let now = filter_script(Family::V4, Some(&sources), &[20001], Some(&moved), &guard(), &[])
+        let now = filter_script(Family::V4, Some(&sources), &[20001], Some(&moved), &guard(), &[], &[])
             + &nat_script(Some(&moved));
         assert_eq!(problems(&healthy, &now, &j), ["rules of OWDEPLOY differ", "rules of OWDEPLOY-NAT differ"]);
 
         let mut more = guard();
         more.bridges.push("br-fedcba987654".into());
-        let now = filter_script(Family::V4, Some(&sources), &[20001], Some(&ingress()), &more, &[])
+        let now = filter_script(Family::V4, Some(&sources), &[20001], Some(&ingress()), &more, &[], &[])
             + &nat_script(Some(&ingress()));
         assert_eq!(
             problems(&healthy, &now, &j),
@@ -1436,7 +1530,7 @@ mod tests {
             healthy.replace("-A OWDEPLOY-EGRESS -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited\n", "");
         assert_eq!(problems(&open, &script, &j), ["rules of OWDEPLOY-EGRESS differ"], "metadata reopened");
 
-        let s6 = filter_script(Family::V6, Some(&[]), &[20001], None, &guard(), &[]);
+        let s6 = filter_script(Family::V6, Some(&[]), &[20001], None, &guard(), &[], &[]);
         let j6 = jumps(Family::V6);
         assert_eq!(problems(&listed(&s6, &j6), &s6, &j6), Vec::<String>::new());
         assert_eq!(
@@ -1506,12 +1600,12 @@ mod tests {
 
     fn v4_script(ports: &[u16]) -> String {
         let sources = ["198.51.100.0/24".to_string()];
-        filter_script(Family::V4, Some(&sources), ports, Some(&ingress()), &guard(), &[])
+        filter_script(Family::V4, Some(&sources), ports, Some(&ingress()), &guard(), &[], &[])
             + &nat_script(Some(&ingress()))
     }
 
     fn v6_script(ports: &[u16]) -> String {
-        filter_script(Family::V6, Some(&["2001:db8:e::/48".to_string()]), ports, None, &guard(), &[])
+        filter_script(Family::V6, Some(&["2001:db8:e::/48".to_string()]), ports, None, &guard(), &[], &[])
     }
 
     /// After a flush, the one restore input recreates `DOCKER-USER` and every jump, each in its table's commit;
