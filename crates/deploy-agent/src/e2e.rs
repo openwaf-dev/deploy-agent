@@ -2299,6 +2299,147 @@ async fn restarting_containers_report_their_restarts() {
     docker_cli(&["rmi", base]);
 }
 
+/// A UNIX socket in front of the Engine's: aborting the task cuts every stream through it.
+fn engine_proxy(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path).expect("proxy socket");
+    tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        while let Ok((mut c, _)) = listener.accept().await {
+            conns.spawn(async move {
+                if let Ok(mut e) = tokio::net::UnixStream::connect("/var/run/docker.sock").await {
+                    let _ = tokio::io::copy_bidirectional(&mut c, &mut e).await;
+                }
+            });
+        }
+    })
+}
+
+/// The resident memory of this process, in KiB.
+fn rss_kib() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+    s.lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .expect("VmRSS")
+}
+
+/// The agent's subscription to Docker's events (`oom`): a kill of the main process while the stream is cut is read
+/// from Docker's backlog when it reconnects, and `AppStatus` still reports it after Docker's backlog dropped it, more
+/// than 60 s and thousands of health check events later, without those events (nor the exits and removals of
+/// short-lived containers of Deploy) growing the agent's store.
+#[tokio::test]
+async fn oom_kills_outlive_dockers_event_backlog() {
+    if !enabled("OWDEPLOY_TEST_DOCKER") {
+        return;
+    }
+    let (app, flood) = ("app_e2eoom", "owd-e2e-oomflood");
+    remove_app(app).await;
+    docker_cli(&["rm", "-f", flood]);
+    let base = "owd/app_e2eoom:dep_base";
+    docker_ok(&["tag", "busybox:1.37", base]);
+    let sock = std::env::temp_dir().join("owd-e2e-engine.sock");
+    let mut proxy = engine_proxy(&sock);
+    let path = sock.to_string_lossy().into_owned();
+    let kills = &crate::oom::KILLS;
+    let follow = tokio::spawn(async move {
+        let connect =
+            || bollard::Docker::connect_with_unix(&path, 600, bollard::API_DEFAULT_VERSION).map_err(|e| e.to_string());
+        crate::oom::follow(&crate::oom::KILLS, connect).await
+    });
+    within(20, async || kills.following().then_some(())).await;
+
+    // The stream cut: the main process is killed for its memory once, then Docker restarts it and it serves.
+    proxy.abort();
+    within(20, async || (!kills.following()).then_some(())).await;
+    let site = "mkdir -p /www && echo ok > /www/index.html && httpd -p 8080 -h /www";
+    let script = format!(
+        "if [ -e /tmp/killed ]; then {site} && exec sleep 3600; fi; touch /tmp/killed; {site} && sleep 2; exec tail /dev/zero"
+    );
+    let mut d = app_deploy(app, "dep_E2EO0001", Source::Local { image: base.into() }, 8080, Some(28154), Some("/"));
+    d.run.command = Some(vec!["sh".into(), "-c".into(), script]);
+    d.run.memory_bytes = Some(16 << 20);
+    run(Op::DeployApp(d)).await.ok::<DeployOutput>();
+    let id = within(60, async || {
+        let c = status(app).await.containers.into_iter().find(|c| c.deployment.as_deref() == Some("dep_E2EO0001"))?;
+        (c.restart_count >= Some(1) && c.state == "running").then_some(c.id)
+    })
+    .await;
+    assert!(!kills.following());
+    assert_eq!(kills.kill_of(&id), None, "seen while the stream was cut");
+
+    // Restored: the reconnection reads Docker's backlog from the last event seen.
+    proxy = engine_proxy(&sock);
+    within(30, async || kills.following().then_some(())).await;
+    let kill = kills.kill_of(&id).expect("the kill, read from Docker's backlog");
+    assert_eq!((kill.count, kill.exit_code), (1, Some(137)), "{kill:?}");
+
+    // Thousands of health check events, and short-lived containers of Deploy, for more than 60 s.
+    let (entries, rss) = (kills.containers(), rss_kib());
+    let seen = Arc::new(AtomicU64::new(0));
+    let counter = tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            use futures_util::StreamExt;
+            let d = crate::docker::client().unwrap();
+            let filters = std::collections::HashMap::from([("container", vec![flood])]);
+            let opts = bollard::query_parameters::EventsOptionsBuilder::default().filters(&filters).build();
+            let mut events = d.events(Some(opts));
+            while let Some(Ok(_)) = events.next().await {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+    docker_ok(&[
+        "run",
+        "-d",
+        "--name",
+        flood,
+        "--health-cmd",
+        "true",
+        "--health-interval",
+        "20ms",
+        "busybox:1.37",
+        "sleep",
+        "600",
+    ]);
+    let label = format!("{}=app_e2eoomflood", deploy_proto::msg::LABEL_RESOURCE);
+    for _ in 0..40 {
+        docker_ok(&["run", "--rm", "--label", &label, "busybox:1.37", "true"]);
+    }
+    let killed_at = kill.at / 1_000_000_000;
+    while time::OffsetDateTime::now_utc().unix_timestamp() - killed_at <= 70 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let flooded = seen.load(Ordering::Relaxed);
+    assert!(flooded >= 2000, "{flooded} health check events");
+    let d = crate::docker::client().unwrap();
+    assert_eq!(crate::app::oom_kills(&d, app).await.get(&id), None, "Docker's backlog still has the kill");
+    let c = status(app).await.containers.into_iter().find(|c| c.id == id).unwrap();
+    let at = time::OffsetDateTime::parse(
+        c.oom_at.as_deref().expect("oom_at"),
+        &time::format_description::well_known::Rfc3339,
+    );
+    assert_eq!(at.unwrap().unix_timestamp(), killed_at, "{c:?}");
+    assert!(kills.containers() <= entries, "{} containers remembered, {entries} before", kills.containers());
+    let grown = rss_kib().saturating_sub(rss);
+    assert!(grown < 16 << 10, "{grown} KiB more resident memory");
+    eprintln!(
+        "{flooded} health check events; {} containers remembered; resident memory {grown} KiB more",
+        kills.containers()
+    );
+
+    counter.abort();
+    follow.abort();
+    let _ = follow.await;
+    proxy.abort();
+    assert!(!kills.following());
+    docker_cli(&["rm", "-f", flood]);
+    remove_app(app).await;
+    docker_cli(&["rmi", base]);
+    let _ = std::fs::remove_file(&sock);
+}
+
 /// Typed failures of builds and Git fetches (`BuildWatch`, `GitWatch`), and of a Compose file missing from its
 /// repository.
 #[tokio::test]
