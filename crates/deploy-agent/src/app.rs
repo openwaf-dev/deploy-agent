@@ -109,7 +109,13 @@ async fn inspect(d: &Docker, resource: &str) -> Result<(AppState, Vec<HashMap<St
         });
     }
     if !containers.is_empty() {
-        let kills = oom_kills(d, resource).await;
+        let (mut kills, following) = crate::oom::KILLS.last_kills(containers.iter().map(|c| c.id.as_str()));
+        if !following {
+            for (id, t) in oom_kills(d, resource).await {
+                let at = kills.entry(id).or_insert(t);
+                *at = (*at).max(t);
+            }
+        }
         for c in &mut containers {
             c.oom_at = kills
                 .get(&c.id)
@@ -120,13 +126,12 @@ async fn inspect(d: &Docker, resource: &str) -> Result<(AppState, Vec<HashMap<St
     Ok((AppState { containers, probes: Vec::new() }, addresses))
 }
 
-/// How long the backlog of Docker's events is read for the out-of-memory kills.
-const OOM_EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// When each of the application's containers was last killed for its memory (Unix seconds), from Docker's `oom`
-/// events of the last [`OOM_EVENTS_WINDOW_SECS`]. Docker resets a container's `OOMKilled` when it restarts it, and
-/// keeps a bounded backlog of events: a kill older than that backlog is not reported. A failure reports none.
-async fn oom_kills(d: &Docker, resource: &str) -> HashMap<String, i64> {
+/// events of the last [`OOM_EVENTS_WINDOW_SECS`] still in its backlog: what `AppStatus` reads while the agent's
+/// subscription ([`crate::oom`]) is not following Docker's events. Docker resets a container's `OOMKilled` when it
+/// restarts it, and keeps a bounded backlog of events: a kill older than that backlog is not reported. A failure
+/// reports none.
+pub(crate) async fn oom_kills(d: &Docker, resource: &str) -> HashMap<String, i64> {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let label = format!("{LABEL_RESOURCE}={resource}");
     let filters = HashMap::from([("type", vec!["container"]), ("event", vec!["oom"]), ("label", vec![label.as_str()])]);
@@ -149,7 +154,7 @@ async fn oom_kills(d: &Docker, resource: &str) -> HashMap<String, i64> {
             }
         }
     };
-    if tokio::time::timeout(OOM_EVENTS_TIMEOUT, read).await.is_err() {
+    if tokio::time::timeout(crate::oom::BACKLOG_TIMEOUT, read).await.is_err() {
         tracing::info!("docker events: no end of the backlog in time");
     }
     out

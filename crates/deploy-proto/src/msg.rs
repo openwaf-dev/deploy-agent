@@ -1164,7 +1164,8 @@ pub struct ContainerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
     /// When the kernel last killed a process of this container for its memory limit (RFC 3339), from Docker's
-    /// `oom` events of the last [`OOM_EVENTS_WINDOW_SECS`] (agents with [`feature::OOM_EVENTS`]). Docker clears
+    /// `oom` events of the last [`OOM_EVENTS_WINDOW_SECS`] (agents with [`feature::OOM_EVENTS`]; from 0.5.1 the
+    /// agent follows those events as they happen, so a kill outlives Docker's short backlog). Docker clears
     /// `oom_killed` when it restarts the container, so this is what still tells an out-of-memory kill afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oom_at: Option<String>,

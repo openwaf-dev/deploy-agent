@@ -61,6 +61,7 @@ mod host;
 mod ipc;
 mod keys;
 mod oci;
+mod oom;
 mod project;
 mod proxy;
 mod relay;
@@ -231,6 +232,7 @@ async fn start(privileges: Privileges, fetcher: update::Fetcher) -> Result<Optio
         }
     }
     tokio::spawn(firewall::watch());
+    tokio::spawn(oom::watch());
     match git::remove_leftover_helpers().await {
         Ok(0) => {}
         Ok(n) => tracing::info!("removed {n} leftover Git helper containers"),

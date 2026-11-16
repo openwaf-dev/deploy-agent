@@ -2,7 +2,8 @@
 //! (manual runs, scheduled tasks in their own container). Each runs a command once in a new container of one of the
 //! application's images, with its environment and network, then is removed.
 //!
-//! The container is never one of the application's: it carries [`LABEL_RUN`] instead of [`LABEL_RESOURCE`] and is
+//! The container is never one of the application's: it carries [`LABEL_RUN`] instead of [`LABEL_RESOURCE`] (blanked,
+//! with [`LABEL_DEPLOYMENT`], over the ones a built image carries: [`run_labels`]) and is
 //! named `owd-run-<resource>-<id>`, so no deployment stops or removes it, no status, exec or log stream picks it, and
 //! it joins the network under its own name only (no alias of the application or its router slot: it never takes
 //! traffic). It runs with Docker's init process, so the orphans of its command are reaped, and without volumes unless
@@ -19,7 +20,8 @@ use bollard::models::{
 use bollard::query_parameters::{CreateContainerOptionsBuilder, KillContainerOptionsBuilder, LogsOptionsBuilder};
 use deploy_proto::msg::cause::RELEASE_FAILED;
 use deploy_proto::msg::{
-    AppDeploy, ExecOutput, LABEL_ENVIRONMENT, LABEL_RUN, LABEL_RUN_ID, LogStream, MAX_EXEC_OUTPUT, Release, RunOnceSpec,
+    AppDeploy, ExecOutput, LABEL_DEPLOYMENT, LABEL_ENVIRONMENT, LABEL_RESOURCE, LABEL_RUN, LABEL_RUN_ID, LogStream,
+    MAX_EXEC_OUTPUT, Release, RunOnceSpec,
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -132,12 +134,26 @@ async fn one_off(d: &Docker, o: OneOff<'_>, ev: &Events, cancel: &CancellationTo
     r
 }
 
-async fn create(d: &Docker, o: &OneOff<'_>, name: &str) -> Result<String, String> {
-    let mut labels =
-        HashMap::from([(LABEL_RUN.to_string(), o.resource.to_string()), (LABEL_RUN_ID.into(), o.id.into())]);
-    if let Some(env) = o.environment {
+/// The labels of a one-off container. A container inherits its image's labels, and images built by Deploy carry the
+/// application's [`LABEL_RESOURCE`] and [`LABEL_DEPLOYMENT`] (builder.rs): Docker cannot drop an inherited label, so
+/// both are overridden with an empty value, which no `label=<key>=<value>` filter of the application matches.
+/// Otherwise a run of a built image would be listed as the application's container, and every deployment, status or
+/// exec of the application would refuse it while it runs.
+fn run_labels(resource: &str, id: &str, environment: Option<&str>) -> HashMap<String, String> {
+    let mut labels = HashMap::from([
+        (LABEL_RUN.to_string(), resource.to_string()),
+        (LABEL_RUN_ID.to_string(), id.to_string()),
+        (LABEL_RESOURCE.to_string(), String::new()),
+        (LABEL_DEPLOYMENT.to_string(), String::new()),
+    ]);
+    if let Some(env) = environment {
         labels.insert(LABEL_ENVIRONMENT.into(), env.into());
     }
+    labels
+}
+
+async fn create(d: &Docker, o: &OneOff<'_>, name: &str) -> Result<String, String> {
+    let labels = run_labels(o.resource, o.id, o.environment);
     let init = engine_has_init(d).await;
     let body = ContainerCreateBody {
         image: Some(o.image.to_string()),
@@ -407,6 +423,22 @@ mod tests {
         assert_eq!(name, "owd-run-app_01jabc-run_01jxyz");
         let labels = HashMap::from([(LABEL_RUN.to_string(), "app_01JABC".to_string())]);
         assert!(crate::docker::check_container("app_01JABC", &[format!("/{name}")], Some(&labels)).is_err());
+    }
+
+    #[test]
+    fn one_off_containers_drop_the_labels_of_a_built_image() {
+        // Docker merges a container's labels over its image's: what a run of an image built by Deploy ends up with.
+        let mut labels = HashMap::from([
+            (LABEL_RESOURCE.to_string(), "app_01JABC".to_string()),
+            (LABEL_DEPLOYMENT.to_string(), "dep_01JDEF".to_string()),
+            ("org.opencontainers.image.title".to_string(), "hello".to_string()),
+        ]);
+        labels.extend(run_labels("app_01JABC", "run_01JXYZ", Some("production")));
+        assert_eq!(labels.get(LABEL_RESOURCE).map(String::as_str), Some(""));
+        assert_eq!(labels.get(LABEL_DEPLOYMENT).map(String::as_str), Some(""));
+        assert_eq!(labels.get(LABEL_RUN).map(String::as_str), Some("app_01JABC"));
+        assert_eq!(labels.get(LABEL_RUN_ID).map(String::as_str), Some("run_01JXYZ"));
+        assert_eq!(labels.get(LABEL_ENVIRONMENT).map(String::as_str), Some("production"));
     }
 
     #[test]

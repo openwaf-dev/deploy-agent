@@ -421,7 +421,7 @@ them in `crates/deploy-agent/src/main.rs` and `crates/deploy-agent/src/app.rs`).
 | `container_list` | `managed_only` | array of containers | — |
 | `deploy_app` | `AppDeploy` (below) | `DeployOutput`: `image`, `image_id`, `container_id`, `commit`, `known_hosts`, `warning` (a `Cause`, `diagnostics`: `runtime.not_listening` with `port`, `path` and `error` when nothing answered `GET /` on the application's port after a deployment without a health check; omitted otherwise) | — |
 | `app_action` | `resource`, `action`: `start`\|`stop`\|`restart`\|`remove` | `AppState` | — |
-| `app_status` | `resource`, `probes` (`diagnostics`; omitted when empty): `[{"service", "port", "network"}]` | `AppState`: `containers[]` of `id`, `deployment`, `image`, `state`, `health`, `started_at`, and with `diagnostics` `service`, `exit_code`, `oom_killed`, `restart_count`, `finished_at`, and with `oom_events` `oom_at` (the last out-of-memory kill of the container in the last 15 minutes, from Docker's `oom` events; Docker clears `oom_killed` when it restarts a container); `probes[]` (`diagnostics`): `{"service", "port", "status", "error"}`, in the order asked: `status` is the HTTP status of any answer to `GET /` at the address the service's current container has on `network`, `error` one of `refused`, `timeout`, `no_address`, `other` when nothing answered | — |
+| `app_status` | `resource`, `probes` (`diagnostics`; omitted when empty): `[{"service", "port", "network"}]` | `AppState`: `containers[]` of `id`, `deployment`, `image`, `state`, `health`, `started_at`, and with `diagnostics` `service`, `exit_code`, `oom_killed`, `restart_count`, `finished_at`, and with `oom_events` `oom_at` (the last out-of-memory kill of the container in the last 15 minutes, from Docker's `oom` events, see below; Docker clears `oom_killed` when it restarts a container); `probes[]` (`diagnostics`): `{"service", "port", "status", "error"}`, in the order asked: `status` is the HTTP status of any answer to `GET /` at the address the service's current container has on `network`, `error` one of `refused`, `timeout`, `no_address`, `other` when nothing answered | — |
 | `app_logs` | `resource`, `tail`, `follow`, `since` (Unix s or null), `service` | lines streamed as `log` events (while `follow`, until cancelled), then `{"lines": n}` | — |
 | `image_prune` | `resource`, `keep` (image tags to keep: rollback targets) | `{"removed": [images]}` | — |
 | `firewall_sync` | `allow` (CIDRs), `ports`, `deny` (CIDRs), `deny_except` (`[{"cidr", "port"}]`, `deny_exceptions`) | `{"applied": true, "backend", "ipv6", "ports", "router_ports", "denied", "denied_except", "egress_interfaces"}` | — |
@@ -476,6 +476,12 @@ Notes on specific operations:
   outside the ranges always refused, else the whole operation is refused and the previous rules stay.
 - **`router_sync`** replaces the whole configuration of the per-server router (Caddy). A resource that is not listed
   loses its routes and listeners. This operation is never abandoned halfway.
+- **`oom_at`** (`oom_events`). Agent 0.5.0 read Docker's backlog of events at each `app_status`; Docker keeps only
+  its last 256 events, which a server's health checks can fill within 30 s. From 0.5.1 the agent subscribes to the
+  `oom`, `die` and `destroy` events of Deploy's containers for as long as it runs and keeps each container's last
+  kill of the window in memory (at most 4096 containers; a removed container is forgotten). When the subscription
+  breaks (Docker restarted, the stream cut), it reconnects within 8 s and first reads Docker's backlog from the last
+  event it saw; meanwhile `app_status` reads that backlog itself, as 0.5.0 did.
 
 ### `AppDeploy`
 
